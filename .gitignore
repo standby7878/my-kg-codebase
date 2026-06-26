@@ -5,4 +5,5 @@ __pycache__/
 *.py[cod]
 sources/
 third_party/
+AGENTS.md
 project_export*.txt
