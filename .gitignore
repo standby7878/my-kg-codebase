@@ -1,0 +1,8 @@
+.venv/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+sources/
+third_party/
+project_export*.txt

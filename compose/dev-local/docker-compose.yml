@@ -1,0 +1,110 @@
+name: codekg-dev-local
+
+services:
+  app-image-build:
+    build:
+      context: ../..
+      dockerfile: docker/app.Dockerfile
+    image: codekg-app:local
+
+  neo4j:
+    container_name: codekg-neo4j
+    image: neo4j:5.26-community
+    environment:
+      NEO4J_AUTH: ${NEO4J_AUTH:-neo4j/change-me-123}
+      NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP_INITIAL:-512m}
+      NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP_MAX:-1g}
+      NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-512m}
+    ports:
+      - "127.0.0.1:${NEO4J_HTTP_PORT:-7474}:7474"
+      - "127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    networks:
+      backend:
+        aliases:
+          - neo4j
+      host_access:
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "cypher-shell -u ${NEO4J_USERNAME:-neo4j} -p ${NEO4J_PASSWORD:-change-me-123} 'RETURN 1' >/dev/null",
+        ]
+      interval: 5s
+      timeout: 15s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  schema_bootstrap:
+    container_name: codekg-schema-bootstrap
+    image: codekg-app:local
+    pull_policy: never
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    environment:
+      NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
+      NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-change-me-123}
+      NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
+    networks:
+      - backend
+    command: ["codekg", "bootstrap"]
+
+  ingestion:
+    container_name: codekg-ingestion
+    image: codekg-app:local
+    pull_policy: never
+    depends_on:
+      schema_bootstrap:
+        condition: service_completed_successfully
+    volumes:
+      - ${CODEKG_PGHOARD_PATH:-../../../pghoard}:/repos/pghoard:ro
+      - ${CODEKG_PGBACKREST_PATH:-../../../pgbackrest}:/repos/pgbackrest:ro
+      - ${CODEKG_PGLOOKOUT_PATH:-../../../pglookout}:/repos/pglookout:ro
+      - ${CODEKG_PATRONI_PATH:-../../../patroni}:/repos/patroni:ro
+    environment:
+      NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
+      NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-change-me-123}
+      NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
+    networks:
+      - backend
+    command: ["codekg", "list"]
+
+  mcp:
+    container_name: codekg-mcp
+    image: codekg-app:local
+    pull_policy: never
+    depends_on:
+      schema_bootstrap:
+        condition: service_completed_successfully
+    environment:
+      NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
+      NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-change-me-123}
+      NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
+      MCP_TRANSPORT: ${MCP_TRANSPORT:-http}
+      MCP_HOST: ${MCP_HOST:-0.0.0.0}
+      MCP_PORT: ${MCP_PORT:-8765}
+    ports:
+      - "127.0.0.1:${MCP_PORT:-8765}:${MCP_PORT:-8765}"
+    networks:
+      - backend
+      - host_access
+    command: ["python", "-m", "codekg.mcp.server"]
+    restart: unless-stopped
+
+networks:
+  backend:
+    driver: bridge
+    internal: true
+  host_access:
+    driver: bridge
+
+volumes:
+  neo4j_data:
+  neo4j_logs:

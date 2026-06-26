@@ -1,0 +1,1 @@
+codex continue --search --dangerously-bypass-approvals-and-sandbox --add-dir ../srbackend-20260306-standby7878/ --add-dir ../bc-unify-knowledge-graph --add-dir /media/alex/MYSSD/BACKUP/workspace/mcp-agents/unify/kg-mcp --add-dir ./third_party/CodeGraphContext --add-dir ../pglookout --add-dir ../rohmu/ --add-dir ../patroni/ --add-dir ../pgbackrest --add-dir ../pghoard

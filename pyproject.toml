@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codekg"
+version = "0.1.0"
+description = "Offline code knowledge graph and MCP query server."
+readme = "code-kg-mcp-plan.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "CodeKG Maintainers" }]
+dependencies = [
+  "fastmcp>=2,<3",
+  "neo4j>=5.26,<6",
+  "pydantic>=2",
+  "rich",
+  "typer",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "pytest-asyncio",
+  "ruff",
+  "testcontainers[neo4j]",
+]
+
+[project.scripts]
+codekg = "codekg.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codekg"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "unit: fast tests that do not require external services",
+  "integration: tests that require Neo4j or containers",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+exclude = ["third_party"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
