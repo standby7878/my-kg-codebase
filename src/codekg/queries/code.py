@@ -119,14 +119,24 @@ def find_callers(
     db = client or get_client()
     return db.execute_read(
         f"""
-        MATCH (callee {{qname: $qname}})
-        WHERE callee:Function OR callee:Method
-        MATCH path = (caller)-[:CALLS*1..{_depth(depth)}]->(callee)
-        WHERE caller:Function OR caller:Method
-        RETURN DISTINCT caller.key AS key,
-               caller.qname AS qname,
-               caller.signature AS signature,
-               length(path) AS depth
+        CALL {{
+          MATCH (callee:Function {{qname: $qname}})
+          MATCH path = (caller)-[:CALLS*1..{_depth(depth)}]->(callee)
+          WHERE caller:Function OR caller:Method
+          RETURN caller.key AS key,
+                 caller.qname AS qname,
+                 caller.signature AS signature,
+                 length(path) AS depth
+          UNION
+          MATCH (callee:Method {{qname: $qname}})
+          MATCH path = (caller)-[:CALLS*1..{_depth(depth)}]->(callee)
+          WHERE caller:Function OR caller:Method
+          RETURN caller.key AS key,
+                 caller.qname AS qname,
+                 caller.signature AS signature,
+                 length(path) AS depth
+        }}
+        RETURN DISTINCT key, qname, signature, depth
         ORDER BY depth, qname
         LIMIT $limit
         """,
@@ -145,14 +155,24 @@ def find_callees(
     db = client or get_client()
     return db.execute_read(
         f"""
-        MATCH (caller {{qname: $qname}})
-        WHERE caller:Function OR caller:Method
-        MATCH path = (caller)-[:CALLS*1..{_depth(depth)}]->(callee)
-        WHERE callee:Function OR callee:Method
-        RETURN DISTINCT callee.key AS key,
-               callee.qname AS qname,
-               callee.signature AS signature,
-               length(path) AS depth
+        CALL {{
+          MATCH (caller:Function {{qname: $qname}})
+          MATCH path = (caller)-[:CALLS*1..{_depth(depth)}]->(callee)
+          WHERE callee:Function OR callee:Method
+          RETURN callee.key AS key,
+                 callee.qname AS qname,
+                 callee.signature AS signature,
+                 length(path) AS depth
+          UNION
+          MATCH (caller:Method {{qname: $qname}})
+          MATCH path = (caller)-[:CALLS*1..{_depth(depth)}]->(callee)
+          WHERE callee:Function OR callee:Method
+          RETURN callee.key AS key,
+                 callee.qname AS qname,
+                 callee.signature AS signature,
+                 length(path) AS depth
+        }}
+        RETURN DISTINCT key, qname, signature, depth
         ORDER BY depth, qname
         LIMIT $limit
         """,
@@ -172,13 +192,33 @@ def trace_call_path(
     db = client or get_client()
     return db.execute_read(
         f"""
-        MATCH (source {{qname: $from_qname}})
-        MATCH (target {{qname: $to_qname}})
-        WHERE (source:Function OR source:Method)
-          AND (target:Function OR target:Method)
-        MATCH path = shortestPath((source)-[:CALLS*1..{_depth(max_depth)}]->(target))
-        RETURN [node IN nodes(path) | node.qname] AS path,
-               length(path) AS depth
+        CALL {{
+          MATCH (source:Function {{qname: $from_qname}})
+          MATCH (target:Function {{qname: $to_qname}})
+          MATCH path = shortestPath((source)-[:CALLS*1..{_depth(max_depth)}]->(target))
+          RETURN [node IN nodes(path) | node.qname] AS path,
+                 length(path) AS depth
+          UNION
+          MATCH (source:Function {{qname: $from_qname}})
+          MATCH (target:Method {{qname: $to_qname}})
+          MATCH path = shortestPath((source)-[:CALLS*1..{_depth(max_depth)}]->(target))
+          RETURN [node IN nodes(path) | node.qname] AS path,
+                 length(path) AS depth
+          UNION
+          MATCH (source:Method {{qname: $from_qname}})
+          MATCH (target:Function {{qname: $to_qname}})
+          MATCH path = shortestPath((source)-[:CALLS*1..{_depth(max_depth)}]->(target))
+          RETURN [node IN nodes(path) | node.qname] AS path,
+                 length(path) AS depth
+          UNION
+          MATCH (source:Method {{qname: $from_qname}})
+          MATCH (target:Method {{qname: $to_qname}})
+          MATCH path = shortestPath((source)-[:CALLS*1..{_depth(max_depth)}]->(target))
+          RETURN [node IN nodes(path) | node.qname] AS path,
+                 length(path) AS depth
+        }}
+        RETURN DISTINCT path, depth
+        ORDER BY depth
         LIMIT $limit
         """,
         {"from_qname": from_qname, "to_qname": to_qname, "limit": _limit(limit, 10)},
@@ -229,6 +269,8 @@ def find_dead_code(
         """
         MATCH (r:Repository {repo_name: $repo})-[:CONTAINS]->(f:File)-[:CONTAINS]->(s)
         WHERE (s:Function OR s:Method)
+          AND s.name <> '<module>'
+          AND NOT s.qname ENDS WITH '.__module__'
           AND NOT (()-[:CALLS]->(s))
         RETURN s.key AS key,
                labels(s) AS labels,

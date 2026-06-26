@@ -3,14 +3,15 @@ from __future__ import annotations
 import pytest
 
 from codekg.ir import CallIR, FileIR, InheritanceIR, RepositoryIR, SymbolIR
-from codekg.loader import load_repository
+from codekg.loader import delete_repository_by_name, load_repository
 
 pytestmark = pytest.mark.unit
 
 
 class FakeClient:
-    def __init__(self) -> None:
+    def __init__(self, write_results: list[list[dict[str, int]]] | None = None) -> None:
         self.writes: list[tuple[str, dict[str, object]]] = []
+        self.write_results = list(write_results or [])
 
     def execute_write(
         self,
@@ -18,6 +19,8 @@ class FakeClient:
         params: dict[str, object] | None = None,
     ) -> list[dict[str, int]]:
         self.writes.append((query, params or {}))
+        if self.write_results:
+            return self.write_results.pop(0)
         return [{"deleted": 0}]
 
 
@@ -178,3 +181,39 @@ def test_self_calls_resolve_only_within_callers_class() -> None:
     assert result["calls"] == 0
     call_params = client.writes[-1][1]
     assert call_params["rows"] == []  # type: ignore[index]
+
+
+def test_delete_repository_by_name_uses_key_prefix_delete() -> None:
+    client = FakeClient(write_results=[[{"deleted": 7}]])
+
+    deleted = delete_repository_by_name("sample", client=client)  # type: ignore[arg-type]
+
+    assert deleted == 7
+    query, params = client.writes[0]
+    assert "CONTAINS*0..2" not in query
+    assert "n.key STARTS WITH prefix" in query
+    assert params == {"repo_name": "sample"}
+
+
+def test_replace_load_deletes_before_reindexing() -> None:
+    repo = RepositoryIR(
+        repo_name="sample",
+        commit="abc123",
+        root_path="/repos/sample",
+        files=(
+            FileIR(
+                path="worker.py",
+                language="python",
+                loc=1,
+                module_qname="worker",
+                symbols=(),
+            ),
+        ),
+    )
+    client = FakeClient(write_results=[[{"deleted": 1}]])
+
+    result = load_repository(repo, replace=True, client=client)  # type: ignore[arg-type]
+
+    assert result["nodes"] == 2
+    assert "n.key STARTS WITH prefix" in client.writes[0][0]
+    assert "MERGE (r:Repository" in client.writes[1][0]

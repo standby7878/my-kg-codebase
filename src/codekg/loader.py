@@ -178,12 +178,13 @@ def delete_repository_by_name(repo_name: str, client: Neo4jClient | None = None)
     rows = db.execute_write(
         """
         MATCH (r:Repository {repo_name: $repo_name})
-        OPTIONAL MATCH (r)-[:CONTAINS*0..2]->(n)
-        WITH collect(DISTINCT r) + collect(DISTINCT n) AS nodes
-        UNWIND nodes AS node
-        WITH DISTINCT node WHERE node IS NOT NULL
-        DETACH DELETE node
-        RETURN count(node) AS deleted
+        WITH r, $repo_name + '@' AS prefix
+        OPTIONAL MATCH (n)
+        WHERE n.key STARTS WITH prefix
+        WITH r, collect(DISTINCT n) AS nodes, count(n) AS deleted_nodes
+        FOREACH (node IN nodes | DETACH DELETE node)
+        DETACH DELETE r
+        RETURN deleted_nodes + 1 AS deleted
         """,
         {"repo_name": repo_name},
     )
