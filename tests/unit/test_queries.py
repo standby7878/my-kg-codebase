@@ -45,9 +45,22 @@ def test_search_symbols_caps_limit_and_filters_kind() -> None:
     search_symbols("backup", kind="method", repo="patroni", limit=999, client=client)  # type: ignore[arg-type]
 
     query, params, max_rows = client.calls[0]
+    assert 'db.index.fulltext.queryNodes("code_symbol_search", $fulltext_query)' in query
     assert "s:Method" in query
+    assert params["fulltext_query"] == "backup"
+    assert params["repo"] == "patroni"
     assert params["limit"] == 500
     assert max_rows == 500
+
+
+def test_search_symbols_sanitizes_simple_fulltext_input() -> None:
+    client = FakeClient()
+
+    search_symbols("pkg.mod.run", client=client)  # type: ignore[arg-type]
+
+    query, params, _ = client.calls[0]
+    assert 'db.index.fulltext.queryNodes("code_symbol_search", $fulltext_query)' in query
+    assert params["fulltext_query"] == "pkg AND mod AND run"
 
 
 def test_variable_depth_queries_inline_bounded_depth() -> None:

@@ -6,7 +6,13 @@ from testcontainers.neo4j import Neo4jContainer
 from codekg.ir import CallIR, FileIR, InheritanceIR, RepositoryIR, SymbolIR
 from codekg.loader import load_repository
 from codekg.neo4j_client import Neo4jClient
-from codekg.queries.code import find_callees, find_callers, find_dead_code, trace_call_path
+from codekg.queries.code import (
+    find_callees,
+    find_callers,
+    find_dead_code,
+    search_symbols,
+    trace_call_path,
+)
 from codekg.schema.bootstrap import bootstrap_schema
 
 pytestmark = pytest.mark.integration
@@ -125,6 +131,7 @@ def test_loader_writes_python_relationships_to_neo4j() -> None:
             callers = find_callers("worker.build", client=client)
             callees = find_callees("worker.__module__", client=client)
             call_path = trace_call_path("worker.__module__", "worker.build", client=client)
+            symbol_search = search_symbols("build", repo="sample", client=client)
             replaced = load_repository(
                 _sample_repo(commit="def456", module_qname="worker.v2"),
                 replace=True,
@@ -181,6 +188,7 @@ def test_loader_writes_python_relationships_to_neo4j() -> None:
         }
     ]
     assert call_path == [{"path": ["worker.__module__", "worker.build"], "depth": 1}]
+    assert [row["qname"] for row in symbol_search] == ["worker.build"]
     assert replaced["calls"] == 1
     assert after_rows == [
         {

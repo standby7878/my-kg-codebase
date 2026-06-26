@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from codekg.neo4j_client import Neo4jClient, get_client
@@ -18,15 +19,14 @@ def search_symbols(
 ) -> list[dict[str, object]]:
     db = client or get_client()
     label_filter = _label_filter(kind)
-    repo_filter = "AND ($repo IS NULL OR exists((r)-[:CONTAINS]->(f)))"
+    fulltext_query = _fulltext_query(q)
     query = f"""
+    CALL db.index.fulltext.queryNodes("code_symbol_search", $fulltext_query)
+    YIELD node AS s, score
     MATCH (f:File)-[:CONTAINS]->(s)
     MATCH (r:Repository)-[:CONTAINS]->(f)
     WHERE (s:Function OR s:Method OR s:Type)
-      AND toLower(coalesce(s.name, '') + ' ' + coalesce(s.qname, ''))
-          CONTAINS toLower($q)
       {label_filter}
-      {repo_filter}
       AND ($repo IS NULL OR r.repo_name = $repo)
     RETURN s.key AS key,
            labels(s) AS labels,
@@ -38,12 +38,12 @@ def search_symbols(
            f.path AS file,
            r.repo_name AS repo,
            r.commit AS commit
-    ORDER BY s.qname
+    ORDER BY score DESC, s.qname
     LIMIT $limit
     """
     return db.execute_read(
         query,
-        {"q": q, "repo": repo, "limit": _limit(limit)},
+        {"fulltext_query": fulltext_query, "repo": repo, "limit": _limit(limit)},
         max_rows=_limit(limit),
     )
 
@@ -343,6 +343,13 @@ def _label_filter(kind: SymbolKind | None) -> str:
     if kind == "type":
         return "AND s:Type"
     return ""
+
+
+def _fulltext_query(query: str) -> str:
+    terms = re.findall(r"\w+", query, flags=re.UNICODE)
+    if not terms:
+        return "*:*"
+    return " AND ".join(terms)
 
 
 def _limit(value: int, max_value: int = 500) -> int:

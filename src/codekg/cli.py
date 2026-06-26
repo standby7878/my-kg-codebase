@@ -26,11 +26,11 @@ def bootstrap() -> None:
 
 @app.command("index")
 def index_repo(path: Path) -> None:
-    """Index a mounted repository path."""
+    """Replace the current snapshot for a mounted repository path."""
 
     from codekg.ingest import index_repository
 
-    result = index_repository(path, replace=False)
+    result = index_repository(path, replace=True)
     console.print(result)
 
 
