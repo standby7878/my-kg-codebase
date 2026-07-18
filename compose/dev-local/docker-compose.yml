@@ -8,7 +8,6 @@ services:
     image: codekg-app:local
 
   neo4j:
-    container_name: codekg-neo4j
     image: neo4j:5.26-community
     init: true
     environment:
@@ -26,7 +25,6 @@ services:
       backend:
         aliases:
           - neo4j
-      host_access:
     healthcheck:
       test:
         [
@@ -40,7 +38,6 @@ services:
     restart: unless-stopped
 
   schema_bootstrap:
-    container_name: codekg-schema-bootstrap
     image: codekg-app:local
     pull_policy: never
     init: true
@@ -64,7 +61,6 @@ services:
     command: ["codekg", "bootstrap"]
 
   ingestion:
-    container_name: codekg-ingestion
     image: codekg-app:local
     pull_policy: never
     init: true
@@ -90,7 +86,6 @@ services:
     command: ["codekg", "list"]
 
   mcp:
-    container_name: codekg-mcp
     image: codekg-app:local
     pull_policy: never
     init: true
@@ -111,7 +106,6 @@ services:
       - zvec_data:/data/zvec:ro
     networks:
       - backend
-      - host_access
     read_only: true
     cap_drop:
       - ALL
@@ -126,10 +120,6 @@ networks:
   backend:
     driver: bridge
     internal: true
-  host_access:
-    driver: bridge
-    driver_opts:
-      com.docker.network.bridge.enable_ip_masquerade: "false"
 
 volumes:
   neo4j_data:

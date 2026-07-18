@@ -176,6 +176,67 @@ def test_scan_repository_resolves_relative_imports_and_nested_function_qnames(
     ]
 
 
+def test_scan_repository_excludes_nested_scopes_from_cyclomatic_complexity(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "complexity_repo"
+    repo_root.mkdir()
+    (repo_root / "flows.py").write_text(
+        "def outer(value):\n"
+        "    if value and value > 0:\n"
+        "        return value\n"
+        "    def helper(item):\n"
+        "        if item:\n"
+        "            return item\n"
+        "        return 0\n"
+        "    class Local:\n"
+        "        if True:\n"
+        "            pass\n"
+        "    transform = lambda item: item if item else 0\n"
+        "    return helper(transform(value))\n",
+        encoding="utf-8",
+    )
+
+    repo = scan_repository(repo_root)
+
+    flows_file = next(file for file in repo.files if file.path == "flows.py")
+    assert [(symbol.qname, symbol.cyclomatic) for symbol in flows_file.symbols] == [
+        ("flows.outer", 3),
+        ("flows.outer.<locals>.helper", 2),
+        ("flows.outer.<locals>.Local", 1),
+    ]
+
+
+def test_scan_repository_uses_repository_name_for_root_init_qnames(tmp_path: Path) -> None:
+    repo_root = tmp_path / "package_repo"
+    repo_root.mkdir()
+    (repo_root / "__init__.py").write_text(
+        "def function(value):\n    if value:\n        return value\n    return None\n",
+        encoding="utf-8",
+    )
+    nested = repo_root / "pkg"
+    nested.mkdir()
+    (nested / "__init__.py").write_text("def nested():\n    return 1\n", encoding="utf-8")
+
+    repo = scan_repository(repo_root)
+
+    root_file = next(file for file in repo.files if file.path == "__init__.py")
+    nested_file = next(file for file in repo.files if file.path == "pkg/__init__.py")
+    assert root_file.module_qname == "package_repo"
+    assert root_file.module_init is not None
+    assert root_file.module_init.qname == "package_repo.__module__"
+    assert [symbol.qname for symbol in root_file.symbols] == ["package_repo.function"]
+    assert root_file.symbols[0].qname != ".function"
+    assert root_file.module_init.qname != ".__module__"
+    assert nested_file.module_qname == "pkg"
+    assert nested_file.module_init is not None
+    assert nested_file.module_init.qname == "pkg.__module__"
+    assert [symbol.qname for symbol in nested_file.symbols] == ["pkg.nested"]
+    for file in repo.files:
+        assert all(not symbol.qname.startswith(".") for symbol in file.symbols)
+        assert file.module_init is None or not file.module_init.qname.startswith(".")
+
+
 def test_scan_repository_retains_all_call_sites_and_syntax_diagnostics(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()

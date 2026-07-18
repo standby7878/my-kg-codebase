@@ -1,0 +1,288 @@
+{
+  "version": 1,
+  "call_sites": [
+    {
+      "owner_qname": "call_forms.factory",
+      "start_line": 6,
+      "start_column": 11,
+      "ordinal": 1,
+      "raw_callee": "object",
+      "status": "unresolved",
+      "target_qname": null,
+      "projection": "none"
+    },
+    {
+      "owner_qname": "call_forms.Child.via_cls",
+      "start_line": 24,
+      "start_column": 8,
+      "ordinal": 2,
+      "raw_callee": "cls.class_action",
+      "status": "cls_direct",
+      "target_qname": "call_forms.Child.class_action",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "call_forms.Child.run",
+      "start_line": 27,
+      "start_column": 8,
+      "ordinal": 3,
+      "raw_callee": "bare_target",
+      "status": "exact_local",
+      "target_qname": "call_forms.bare_target",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "call_forms.Child.run",
+      "start_line": 28,
+      "start_column": 8,
+      "ordinal": 4,
+      "raw_callee": "self.instance",
+      "status": "self_direct",
+      "target_qname": "call_forms.Child.instance",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "call_forms.Child.run",
+      "start_line": 29,
+      "start_column": 8,
+      "ordinal": 5,
+      "raw_callee": "super().save",
+      "status": "super_method",
+      "target_qname": "call_forms.Base.save",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "call_forms.Child.run",
+      "start_line": 29,
+      "start_column": 8,
+      "ordinal": 6,
+      "raw_callee": "super",
+      "status": "unresolved",
+      "target_qname": null,
+      "projection": "none"
+    },
+    {
+      "owner_qname": "call_forms.Child.run",
+      "start_line": 30,
+      "start_column": 8,
+      "ordinal": 7,
+      "raw_callee": "client.send",
+      "status": "dynamic",
+      "target_qname": null,
+      "projection": "none"
+    },
+    {
+      "owner_qname": "call_forms.Child.run",
+      "start_line": 31,
+      "start_column": 8,
+      "ordinal": 8,
+      "raw_callee": "factory().run",
+      "status": "dynamic",
+      "target_qname": null,
+      "projection": "none"
+    },
+    {
+      "owner_qname": "call_forms.Child.run",
+      "start_line": 31,
+      "start_column": 8,
+      "ordinal": 9,
+      "raw_callee": "factory",
+      "status": "exact_local",
+      "target_qname": "call_forms.factory",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "module_init.__module__",
+      "start_line": 5,
+      "start_column": 0,
+      "ordinal": 1,
+      "raw_callee": "bootstrap",
+      "status": "exact_local",
+      "target_qname": "module_init.bootstrap",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "same_line_calls.run",
+      "start_line": 10,
+      "start_column": 4,
+      "ordinal": 1,
+      "raw_callee": "first",
+      "status": "exact_local",
+      "target_qname": "same_line_calls.first",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "same_line_calls.run",
+      "start_line": 10,
+      "start_column": 13,
+      "ordinal": 2,
+      "raw_callee": "second",
+      "status": "exact_local",
+      "target_qname": "same_line_calls.second",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.helper",
+      "start_line": 2,
+      "start_column": 11,
+      "ordinal": 1,
+      "raw_callee": "object",
+      "status": "unresolved",
+      "target_qname": null,
+      "projection": "none"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.__module__",
+      "start_line": 9,
+      "start_column": 1,
+      "ordinal": 2,
+      "raw_callee": "decorate",
+      "status": "exact_local",
+      "target_qname": "scopes_and_definition_time.decorate",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.__module__",
+      "start_line": 9,
+      "start_column": 10,
+      "ordinal": 3,
+      "raw_callee": "helper",
+      "status": "exact_local",
+      "target_qname": "scopes_and_definition_time.helper",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.__module__",
+      "start_line": 10,
+      "start_column": 26,
+      "ordinal": 4,
+      "raw_callee": "helper",
+      "status": "exact_local",
+      "target_qname": "scopes_and_definition_time.helper",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.__module__",
+      "start_line": 10,
+      "start_column": 51,
+      "ordinal": 5,
+      "raw_callee": "helper",
+      "status": "exact_local",
+      "target_qname": "scopes_and_definition_time.helper",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.outer.<locals>.middle.<locals>.Inner.method",
+      "start_line": 14,
+      "start_column": 23,
+      "ordinal": 6,
+      "raw_callee": "helper",
+      "status": "exact_local",
+      "target_qname": "scopes_and_definition_time.helper",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.outer.<locals>.middle.<locals>.deepest",
+      "start_line": 17,
+      "start_column": 19,
+      "ordinal": 7,
+      "raw_callee": "helper",
+      "status": "exact_local",
+      "target_qname": "scopes_and_definition_time.helper",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.outer.<locals>.middle",
+      "start_line": 19,
+      "start_column": 15,
+      "ordinal": 8,
+      "raw_callee": "Inner().method",
+      "status": "dynamic",
+      "target_qname": null,
+      "projection": "none"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.outer.<locals>.middle",
+      "start_line": 19,
+      "start_column": 15,
+      "ordinal": 9,
+      "raw_callee": "Inner",
+      "status": "unresolved",
+      "target_qname": null,
+      "projection": "none"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.outer.<locals>.middle",
+      "start_line": 19,
+      "start_column": 33,
+      "ordinal": 10,
+      "raw_callee": "deepest",
+      "status": "exact_local",
+      "target_qname": "scopes_and_definition_time.outer.<locals>.middle.<locals>.deepest",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.outer",
+      "start_line": 21,
+      "start_column": 11,
+      "ordinal": 11,
+      "raw_callee": "middle",
+      "status": "exact_local",
+      "target_qname": "scopes_and_definition_time.outer.<locals>.middle",
+      "projection": "exact"
+    }
+  ],
+  "has_method_edges": [
+    {
+      "type_qname": "call_forms.Base",
+      "method_qname": "call_forms.Base.save"
+    },
+    {
+      "type_qname": "call_forms.Child",
+      "method_qname": "call_forms.Child.class_action"
+    },
+    {
+      "type_qname": "call_forms.Child",
+      "method_qname": "call_forms.Child.instance"
+    },
+    {
+      "type_qname": "call_forms.Child",
+      "method_qname": "call_forms.Child.run"
+    },
+    {
+      "type_qname": "call_forms.Child",
+      "method_qname": "call_forms.Child.via_cls"
+    },
+    {
+      "type_qname": "scopes_and_definition_time.outer.<locals>.middle.<locals>.Inner",
+      "method_qname": "scopes_and_definition_time.outer.<locals>.middle.<locals>.Inner.method"
+    }
+  ],
+  "internal_inherits": [
+    {
+      "child_qname": "call_forms.Child",
+      "parent_qname": "call_forms.Base"
+    }
+  ],
+  "call_site_summary": {
+    "total": 23,
+    "statuses": {
+      "cls_direct": 1,
+      "dynamic": 3,
+      "exact_local": 13,
+      "self_direct": 1,
+      "super_method": 1,
+      "unresolved": 4
+    },
+    "resolves_to": 16,
+    "calls": 16,
+    "exact_calls": 16,
+    "projection_complete": true
+  },
+  "lexical_queries": [
+    {
+      "query": "still indexed",
+      "target_qname": "valid_neighbor.still_indexed"
+    }
+  ]
+}

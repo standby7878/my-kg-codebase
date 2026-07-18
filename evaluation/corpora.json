@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "corpora": [
+    {
+      "id": "synthetic-phase1",
+      "kind": "synthetic",
+      "path": "tests/fixtures/structural_phase1",
+      "required": true,
+      "pin": {
+        "content_sha256": "b96918abaaae5808ebb9a2876e49f589de04a94c2ca9fdd95679f4553d776423"
+      },
+      "ground_truth": "evaluation/truth/synthetic-phase1.json"
+    },
+    {
+      "id": "codekg-dogfood",
+      "kind": "dogfood",
+      "path": ".",
+      "required": true,
+      "pin": {
+        "working_tree": "report"
+      }
+    },
+    {
+      "id": "optional-external",
+      "kind": "external",
+      "path_env": "CODEKG_EVAL_EXTERNAL_PATH",
+      "required": false,
+      "pin": {
+        "git_commit_env": "CODEKG_EVAL_EXTERNAL_COMMIT"
+      }
+    }
+  ]
+}

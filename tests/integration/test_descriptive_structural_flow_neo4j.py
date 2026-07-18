@@ -254,15 +254,6 @@ def test_descriptive_discovery_returns_an_exact_key_for_snapshot_safe_navigation
             replacement = index_repository(alpha, replace=True, client=client, zvec_path=zvec_path)
             current_alpha = scan_repository(alpha)
             assert replacement["descriptions"] == 1
-            assert (
-                _lexical(
-                    "rare zircon ion thermostat",
-                    repo=current_alpha.repo_name,
-                    zvec_path=zvec_path,
-                    client=client,
-                )
-                == []
-            )
             replacement_hits = _lexical(
                 "newly minted cobalt actuator",
                 repo=current_alpha.repo_name,

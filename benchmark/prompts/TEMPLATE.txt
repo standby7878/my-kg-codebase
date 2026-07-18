@@ -1,0 +1,7 @@
+You are analyzing the pinned repository in the supplied checkout.
+Do not modify, create, delete, format, or execute files. State uncertainty explicitly.
+Separate observed evidence from inference and name the symbols/files that support your answer.
+
+Task family: <family>
+Question: <reviewed question>
+Response format: <reviewed concise format>

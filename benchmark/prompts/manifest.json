@@ -1,0 +1,14 @@
+{
+  "manifest_version": "1.0",
+  "status": "template-pending-review",
+  "protocol": "gpt-4.1-ab",
+  "preamble": "Do not modify, create, delete, format, or execute files. State uncertainty explicitly and distinguish observed evidence from inference.",
+  "prompts": [
+    {"id": "discovery-01", "family": "discovery", "file": "discovery-01.txt", "sha256": "REVIEW_REQUIRED"},
+    {"id": "navigation-01", "family": "structural-navigation", "file": "navigation-01.txt", "sha256": "REVIEW_REQUIRED"},
+    {"id": "constructors-01", "family": "constructors", "file": "constructors-01.txt", "sha256": "REVIEW_REQUIRED"},
+    {"id": "uncertainty-01", "family": "uncertainty-zones", "file": "uncertainty-01.txt", "sha256": "REVIEW_REQUIRED"},
+    {"id": "impact-01", "family": "impact", "file": "impact-01.txt", "sha256": "REVIEW_REQUIRED"},
+    {"id": "complexity-01", "family": "complexity", "file": "complexity-01.txt", "sha256": "REVIEW_REQUIRED"}
+  ]
+}

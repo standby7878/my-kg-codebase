@@ -25,6 +25,13 @@ EXACT_RESOLUTION_STATUSES = frozenset(
         "super_method",
     }
 )
+CONSTRUCTOR_RESOLUTION_STATUSES = frozenset(
+    {
+        "constructor_exact_local",
+        "constructor_exact_import",
+        "constructor_ambiguous",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -48,10 +55,22 @@ class CallResolution:
     status: str
     candidate_keys: tuple[str, ...]
     target_key: str | None = None
+    construction_target_key: str | None = None
+    initializer_candidate_keys: tuple[str, ...] = ()
+    initializer_target_key: str | None = None
+    initializer_status: str | None = None
 
     @property
     def is_exact(self) -> bool:
         return self.status in EXACT_RESOLUTION_STATUSES and self.target_key is not None
+
+    @property
+    def is_constructor(self) -> bool:
+        return self.status in CONSTRUCTOR_RESOLUTION_STATUSES
+
+    @property
+    def is_construction_exact(self) -> bool:
+        return self.status in {"constructor_exact_local", "constructor_exact_import"}
 
 
 def resolve_call_sites(
@@ -115,6 +134,32 @@ class _Resolver:
 
     def _resolve_direct(self, file: FileIR, call: CallIR, owner: SymbolRef) -> CallResolution:
         candidates, import_candidate = self._direct_candidates(file, call, owner)
+        if call.receiver_kind in {"none", "name"}:
+            type_refs = self._type_candidates(candidates)
+            if len(type_refs) == 1:
+                type_ref = type_refs[0]
+                initializer = self._initializer_for_type(type_ref.qname)
+                return CallResolution(
+                    call,
+                    file.path,
+                    owner.key,
+                    "constructor_exact_import"
+                    if type_ref.qname in import_candidate
+                    else "constructor_exact_local",
+                    tuple(ref.key for ref in type_refs),
+                    construction_target_key=type_ref.key,
+                    initializer_candidate_keys=tuple(ref.key for ref in initializer[0]),
+                    initializer_target_key=initializer[1],
+                    initializer_status=initializer[2],
+                )
+            if len(type_refs) > 1:
+                return CallResolution(
+                    call,
+                    file.path,
+                    owner.key,
+                    "constructor_ambiguous",
+                    tuple(ref.key for ref in type_refs),
+                )
         candidate_refs = self._callable_candidates(candidates)
         candidate_keys = tuple(ref.key for ref in candidate_refs)
         if len(candidate_refs) == 1:
@@ -132,6 +177,32 @@ class _Resolver:
         if self._is_import_reference(file, call):
             return CallResolution(call, file.path, owner.key, "external", ())
         return CallResolution(call, file.path, owner.key, "unresolved", ())
+
+    def _type_candidates(self, qnames: Iterable[str]) -> tuple[SymbolRef, ...]:
+        candidates = {
+            ref.key: ref for qname in qnames for ref in self.types_by_qname.get(qname, ())
+        }
+        return tuple(sorted(candidates.values(), key=lambda ref: ref.key))
+
+    def _initializer_for_type(
+        self, type_qname: str
+    ) -> tuple[tuple[SymbolRef, ...], str | None, str | None]:
+        direct = self._methods_for_type(type_qname, "__init__")
+        if len(direct) == 1:
+            return direct, direct[0].key, "exact_local"
+        if len(direct) > 1:
+            return direct, None, None
+
+        mro = self._mro(type_qname)
+        if mro is None:
+            return (), None, None
+        for inherited_type in mro[1:]:
+            methods = self._methods_for_type(inherited_type, "__init__")
+            if len(methods) == 1:
+                return methods, methods[0].key, "inherited_method"
+            if len(methods) > 1:
+                return methods, None, None
+        return (), None, None
 
     def _resolve_receiver_method(
         self,

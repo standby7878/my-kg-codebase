@@ -394,7 +394,7 @@ def _scan_file(root: Path, path: Path) -> FileIR:
     language = LANGUAGES_BY_SUFFIX[path.suffix.lower()]
     text = path.read_text(encoding="utf-8", errors="replace")
     loc = len(text.splitlines())
-    module_qname = _module_qname(rel_path)
+    module_qname = _module_qname(rel_path, repository_name=root.name)
     if language != "python":
         return FileIR(path=rel_path, language=language, loc=loc, module_qname=module_qname)
 
@@ -439,13 +439,13 @@ def _scan_file(root: Path, path: Path) -> FileIR:
     )
 
 
-def _module_qname(rel_path: str) -> str:
+def _module_qname(rel_path: str, *, repository_name: str | None = None) -> str:
     path = Path(rel_path)
     if path.suffix == ".py":
         parts = list(path.with_suffix("").parts)
         if parts[-1] == "__init__":
             parts.pop()
-        return ".".join(parts) if parts else path.parent.name
+        return ".".join(parts) if parts else (repository_name or path.parent.name)
     return path.as_posix()
 
 
@@ -479,18 +479,37 @@ def _is_super_call(node: ast.expr) -> bool:
 
 
 def _cyclomatic(node: ast.AST) -> int:
-    decision_nodes = (
-        ast.If,
-        ast.For,
-        ast.AsyncFor,
-        ast.While,
-        ast.ExceptHandler,
-        ast.IfExp,
-        ast.BoolOp,
-        ast.Try,
-        ast.Match,
-    )
-    return 1 + sum(isinstance(child, decision_nodes) for child in ast.walk(node))
+    class _DecisionCounter(ast.NodeVisitor):
+        decision_nodes = (
+            ast.If,
+            ast.For,
+            ast.AsyncFor,
+            ast.While,
+            ast.ExceptHandler,
+            ast.IfExp,
+            ast.BoolOp,
+            ast.Try,
+            ast.Match,
+        )
+
+        def __init__(self) -> None:
+            self.count = 0
+
+        def visit(self, current: ast.AST) -> None:
+            if isinstance(current, self.decision_nodes):
+                self.count += 1
+            if isinstance(
+                current,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef),
+            ):
+                return
+            super().visit(current)
+
+    counter = _DecisionCounter()
+    body = getattr(node, "body", ())
+    for statement in body:
+        counter.visit(statement)
+    return 1 + counter.count
 
 
 def _git_commit(root: Path) -> str | None:

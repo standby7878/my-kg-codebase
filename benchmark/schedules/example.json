@@ -1,0 +1,13 @@
+{
+  "schedule_version": "1.0",
+  "status": "pattern-only-pending-review",
+  "random_seed": "REVIEW_REQUIRED",
+  "blocks": [
+    {"block_id": "block-001", "corpus_id": "CORPUS_REVIEW_REQUIRED", "commit": "COMMIT_REVIEW_REQUIRED", "prompt_id": "PROMPT_REVIEW_REQUIRED", "trials": [
+      {"run_id": "RUN_REVIEW_REQUIRED_B", "condition": "B"},
+      {"run_id": "RUN_REVIEW_REQUIRED_M", "condition": "M"},
+      {"run_id": "RUN_REVIEW_REQUIRED_MF", "condition": "MF"}
+    ]}
+  ],
+  "run_fields": ["run_id", "condition", "corpus_id", "commit", "prompt_id", "prompt_sha256", "schedule_seed", "cli_version", "model", "started_at", "finished_at", "status", "log_path"]
+}

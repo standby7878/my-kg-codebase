@@ -259,7 +259,7 @@ def load_repository(
     # are removed and rebuilt.
     db.execute_write(
         """
-        MATCH ()-[rel:RESOLVES_TO|CALLS|EXACT_CALLS]->()
+        MATCH ()-[rel:RESOLVES_TO|CALLS|EXACT_CALLS|CONSTRUCTS]->()
         WHERE rel.key STARTS WITH $prefix
         DELETE rel
         """,
@@ -287,7 +287,9 @@ def load_repository(
             site.status = row.status,
             site.resolution_strategy = row.resolution_strategy,
             site.candidate_count = row.candidate_count,
-            site.candidate_keys = row.candidate_keys
+            site.candidate_keys = row.candidate_keys,
+            site.initializer_candidate_count = row.initializer_candidate_count,
+            site.initializer_candidate_keys = row.initializer_candidate_keys
         """,
         callsite_rows,
         batch_size,
@@ -351,6 +353,38 @@ def load_repository(
         resolved_rows,
         batch_size,
         operation="link resolved call sites",
+    )
+
+    construction_rows = _construction_rows(callsite_rows, resolutions)
+    batch_count += _write_batched(
+        db,
+        """
+        UNWIND $rows AS row
+        MATCH (site:CallSite {key: row.callsite_key})
+        MATCH (type:Type {key: row.type_key})
+        MERGE (site)-[rel:CONSTRUCTS {key: row.callsite_key}]->(type)
+        SET rel.resolution = row.resolution,
+            rel.line = row.line,
+            rel.column = row.column
+        """,
+        construction_rows,
+        batch_size,
+        operation="link resolved constructions",
+    )
+    batch_count += _write_batched(
+        db,
+        """
+        UNWIND $rows AS row
+        MATCH (owner {key: row.owner_key})
+        MATCH (type:Type {key: row.type_key})
+        MERGE (owner)-[rel:CONSTRUCTS {key: row.callsite_key}]->(type)
+        SET rel.resolution = row.resolution,
+            rel.line = row.line,
+            rel.column = row.column
+        """,
+        construction_rows,
+        batch_size,
+        operation="load construction owner projections",
     )
 
     status_counts = dict(sorted(Counter(str(row["status"]) for row in callsite_rows).items()))
@@ -573,6 +607,8 @@ def _callsite_rows(
                 "resolution_strategy": resolution.status,
                 "candidate_count": len(resolution.candidate_keys),
                 "candidate_keys": list(resolution.candidate_keys),
+                "initializer_candidate_count": len(resolution.initializer_candidate_keys),
+                "initializer_candidate_keys": list(resolution.initializer_candidate_keys),
             }
         )
     return callsite_rows, resolutions
@@ -584,13 +620,43 @@ def _resolved_call_rows(
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for callsite, resolution in zip(callsite_rows, resolutions, strict=True):
-        if not resolution.is_exact or resolution.target_key is None or resolution.owner_key is None:
+        target_key = resolution.target_key
+        resolution_status = resolution.status
+        if resolution.is_constructor:
+            target_key = resolution.initializer_target_key
+            resolution_status = resolution.initializer_status
+        if target_key is None or resolution.owner_key is None:
             continue
         rows.append(
             {
                 "callsite_key": callsite["key"],
                 "caller_key": resolution.owner_key,
-                "callee_key": resolution.target_key,
+                "callee_key": target_key,
+                "resolution": resolution_status,
+                "line": resolution.call.start_line,
+                "column": resolution.call.start_column,
+            }
+        )
+    return rows
+
+
+def _construction_rows(
+    callsite_rows: list[dict[str, object]],
+    resolutions: tuple[CallResolution, ...],
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for callsite, resolution in zip(callsite_rows, resolutions, strict=True):
+        if (
+            not resolution.is_constructor
+            or resolution.owner_key is None
+            or resolution.construction_target_key is None
+        ):
+            continue
+        rows.append(
+            {
+                "callsite_key": callsite["key"],
+                "owner_key": resolution.owner_key,
+                "type_key": resolution.construction_target_key,
                 "resolution": resolution.status,
                 "line": resolution.call.start_line,
                 "column": resolution.call.start_column,

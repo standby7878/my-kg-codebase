@@ -1,0 +1,1 @@
+run_id,blind_id,truth_id,required_points_total,required_points_met,forbidden_claim_violations,unsupported_claims,latency_ms,input_tokens,output_tokens,cost,validity,scorer_notes

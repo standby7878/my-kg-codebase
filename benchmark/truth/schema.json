@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CodeKG benchmark truth record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["truth_id", "repo", "commit", "prompt_id", "expected_symbols", "expected_edges", "required_points", "forbidden_claims"],
+  "properties": {
+    "truth_id": {"type": "string", "minLength": 1},
+    "repo": {"type": "string", "minLength": 1},
+    "commit": {"type": "string", "pattern": "^[0-9a-fA-F]{7,64}$"},
+    "prompt_id": {"type": "string", "minLength": 1},
+    "expected_symbols": {"type": "array", "items": {"type": "string"}},
+    "expected_edges": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["from", "to", "kind"], "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "kind": {"type": "string"}}}},
+    "required_points": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "forbidden_claims": {"type": "array", "items": {"type": "string"}},
+    "notes": {"type": "string"}
+  }
+}
