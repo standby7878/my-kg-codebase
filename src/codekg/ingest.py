@@ -6,11 +6,24 @@ import subprocess
 from collections.abc import Iterable
 from pathlib import Path
 
-from codekg.ir import CallIR, FileIR, ImportIR, InheritanceIR, RepositoryIR, SymbolIR
+from codekg.docs import chunk_docs
+from codekg.ir import (
+    CallIR,
+    DocChunkIR,
+    DocFileIR,
+    FileIR,
+    ImportIR,
+    InheritanceIR,
+    RepositoryIR,
+    SymbolIR,
+)
 from codekg.loader import load_repository
 
 LANGUAGES_BY_SUFFIX = {
     ".py": "python",
+}
+DOC_TYPES_BY_SUFFIX = {
+    ".md": "markdown",
 }
 
 SKIP_DIRS = {
@@ -136,6 +149,7 @@ class _PythonExtractor(ast.NodeVisitor):
                 end_line=getattr(node, "end_lineno", node.lineno),
                 cyclomatic=_cyclomatic(node),
                 parent_qname=parent_qname,
+                docstring=ast.get_docstring(node, clean=True),
             )
         )
         self._function_stack.append(node.name)
@@ -214,7 +228,10 @@ def scan_repository(path: Path) -> RepositoryIR:
     repo_name = root.name
     commit = _git_commit(root) or _content_hash(root)
     files = tuple(_scan_file(root, file_path) for file_path in _iter_source_files(root))
-    return RepositoryIR(repo_name=repo_name, commit=commit, root_path=str(root), files=files)
+    docs = tuple(_scan_doc_file(root, file_path) for file_path in iter_doc_files(root))
+    return RepositoryIR(
+        repo_name=repo_name, commit=commit, root_path=str(root), files=files, docs=docs
+    )
 
 
 def _iter_source_files(root: Path) -> Iterable[Path]:
@@ -222,6 +239,14 @@ def _iter_source_files(root: Path) -> Iterable[Path]:
         if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
             continue
         if path.is_file() and path.suffix.lower() in LANGUAGES_BY_SUFFIX:
+            yield path
+
+
+def iter_doc_files(root: Path) -> Iterable[Path]:
+    for path in sorted(root.rglob("*")):
+        if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
+            continue
+        if path.is_file() and path.suffix.lower() in DOC_TYPES_BY_SUFFIX:
             yield path
 
 
@@ -250,6 +275,26 @@ def _scan_file(root: Path, path: Path) -> FileIR:
         symbols=tuple(extractor.symbols),
         inheritance=tuple(extractor.inheritance),
         calls=tuple(extractor.calls),
+    )
+
+
+def _scan_doc_file(root: Path, path: Path) -> DocFileIR:
+    rel_path = path.relative_to(root).as_posix()
+    chunks = tuple(
+        DocChunkIR(
+            heading_path=chunk.heading_path,
+            start_line=chunk.start_line,
+            end_line=chunk.end_line,
+            text=chunk.text,
+            mentions=chunk.mentions,
+            chunk_index=chunk.chunk_index,
+        )
+        for chunk in chunk_docs([path], [])
+    )
+    return DocFileIR(
+        path=rel_path,
+        doc_type=DOC_TYPES_BY_SUFFIX[path.suffix.lower()],
+        chunks=chunks,
     )
 
 
@@ -358,7 +403,7 @@ def _looks_like_commit(value: str) -> bool:
 
 def _content_hash(root: Path) -> str:
     digest = hashlib.sha256()
-    for path in _iter_source_files(root):
+    for path in sorted([*_iter_source_files(root), *iter_doc_files(root)]):
         digest.update(path.relative_to(root).as_posix().encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()[:12]

@@ -79,12 +79,13 @@ for command in "$@"; do
         bootstrap)
             dc run --rm schema_bootstrap
             ;;
-        index-sources)
-            dc run --rm ingestion codekg reindex /repos/pghoard
-            dc run --rm ingestion codekg reindex /repos/pgbackrest
-            dc run --rm ingestion codekg reindex /repos/pglookout
-            dc run --rm ingestion codekg reindex /repos/patroni
-            ;;
+	        index-sources)
+	            dc run --rm ingestion codekg reindex /repos/pghoard
+	            dc run --rm ingestion codekg reindex /repos/pgbackrest
+	            dc run --rm ingestion codekg reindex /repos/pglookout
+	            dc run --rm ingestion codekg reindex /repos/patroni
+	            dc run --rm ingestion codekg index-search
+	            ;;
         help|--help|-h)
             show_usage
             ;;

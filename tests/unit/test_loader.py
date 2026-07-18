@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from codekg.ir import CallIR, FileIR, InheritanceIR, RepositoryIR, SymbolIR
+from codekg.ir import CallIR, DocChunkIR, DocFileIR, FileIR, InheritanceIR, RepositoryIR, SymbolIR
 from codekg.loader import delete_repository_by_name, load_repository
 
 pytestmark = pytest.mark.unit
@@ -217,3 +217,69 @@ def test_replace_load_deletes_before_reindexing() -> None:
     assert result["nodes"] == 2
     assert "n.key STARTS WITH prefix" in client.writes[0][0]
     assert "MERGE (r:Repository" in client.writes[1][0]
+
+
+def test_load_repository_writes_doc_chunks_and_mentions() -> None:
+    repo = RepositoryIR(
+        repo_name="sample",
+        commit="abc123",
+        root_path="/repos/sample",
+        files=(
+            FileIR(
+                path="worker.py",
+                language="python",
+                loc=2,
+                module_qname="worker",
+                symbols=(
+                    SymbolIR(
+                        kind="function",
+                        name="build",
+                        qname="worker.build",
+                        signature="def build()",
+                        start_line=1,
+                        end_line=2,
+                    ),
+                ),
+            ),
+        ),
+        docs=(
+            DocFileIR(
+                path="README.md",
+                doc_type="markdown",
+                chunks=(
+                    DocChunkIR(
+                        heading_path="Usage",
+                        start_line=1,
+                        end_line=3,
+                        mentions=("worker.build", "missing.symbol"),
+                    ),
+                ),
+            ),
+        ),
+    )
+    client = FakeClient()
+
+    result = load_repository(repo, replace=False, client=client)  # type: ignore[arg-type]
+
+    assert result["docs"] == 1
+    assert result["doc_chunks"] == 1
+    assert result["mentions"] == 1
+    assert result["nodes"] == 5
+    doc_params = client.writes[-4][1]
+    chunk_params = client.writes[-3][1]
+    mention_params = client.writes[-2][1]
+    assert doc_params["rows"] == [  # type: ignore[index]
+        {
+            "key": "sample@abc123:doc:README.md",
+            "repo_key": "sample",
+            "path": "README.md",
+            "doc_type": "markdown",
+        }
+    ]
+    assert chunk_params["rows"][0]["key"] == "sample@abc123:doc:README.md:1"  # type: ignore[index]
+    assert mention_params["rows"] == [  # type: ignore[index]
+        {
+            "chunk_key": "sample@abc123:doc:README.md:1",
+            "symbol_key": "sample@abc123:worker.py:worker.build:1",
+        }
+    ]

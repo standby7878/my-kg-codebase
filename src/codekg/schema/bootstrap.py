@@ -11,6 +11,8 @@ BOOTSTRAP_CYPHER = [
     "CREATE CONSTRAINT method_key IF NOT EXISTS FOR (n:Method) REQUIRE n.key IS UNIQUE",
     "CREATE CONSTRAINT type_key IF NOT EXISTS FOR (n:Type) REQUIRE n.key IS UNIQUE",
     "CREATE CONSTRAINT module_key IF NOT EXISTS FOR (n:Module) REQUIRE n.key IS UNIQUE",
+    "CREATE CONSTRAINT document_key IF NOT EXISTS FOR (n:Document) REQUIRE n.key IS UNIQUE",
+    "CREATE CONSTRAINT doc_chunk_key IF NOT EXISTS FOR (n:DocChunk) REQUIRE n.key IS UNIQUE",
     "CREATE CONSTRAINT reference_key IF NOT EXISTS FOR (n:Reference) REQUIRE n.key IS UNIQUE",
     "CREATE INDEX repository_name IF NOT EXISTS FOR (n:Repository) ON (n.repo_name)",
     "CREATE INDEX file_path IF NOT EXISTS FOR (n:File) ON (n.path)",

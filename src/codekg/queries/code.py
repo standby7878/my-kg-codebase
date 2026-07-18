@@ -4,9 +4,15 @@ import re
 from typing import Literal
 
 from codekg.neo4j_client import Neo4jClient, get_client
+from codekg.zvec_store import ZvecUnavailableError
+from codekg.zvec_store import open_read as open_zvec_read
+from codekg.zvec_store import search_docs as zvec_search_docs
+from codekg.zvec_store import search_symbols as zvec_search_symbols
 
 SymbolKind = Literal["function", "method", "type"]
 HierarchyDirection = Literal["ancestors", "descendants"]
+SearchMode = Literal["graph", "lexical"]
+SearchSource = Literal["symbols", "docs"]
 
 
 def search_symbols(
@@ -15,8 +21,22 @@ def search_symbols(
     kind: SymbolKind | None = None,
     repo: str | None = None,
     limit: int = 25,
+    mode: SearchMode = "graph",
+    sources: list[SearchSource] | None = None,
+    zvec_path: str | None = None,
     client: Neo4jClient | None = None,
 ) -> list[dict[str, object]]:
+    if mode == "lexical":
+        return _search_symbols_lexical(
+            q,
+            kind=kind,
+            repo=repo,
+            limit=limit,
+            sources=sources,
+            zvec_path=zvec_path,
+            client=client,
+        )
+
     db = client or get_client()
     label_filter = _label_filter(kind)
     fulltext_query = _fulltext_query(q)
@@ -46,6 +66,125 @@ def search_symbols(
         {"fulltext_query": fulltext_query, "repo": repo, "limit": _limit(limit)},
         max_rows=_limit(limit),
     )
+
+
+def _search_symbols_lexical(
+    q: str,
+    *,
+    kind: SymbolKind | None,
+    repo: str | None,
+    limit: int,
+    sources: list[SearchSource] | None,
+    zvec_path: str | None,
+    client: Neo4jClient | None,
+) -> list[dict[str, object]]:
+    try:
+        collection = open_zvec_read(zvec_path)
+        selected_sources = sources or ["symbols"]
+        hits = []
+        if "symbols" in selected_sources:
+            hits.extend(
+                zvec_search_symbols(collection, q, repo=repo, kind=kind, limit=_limit(limit))
+            )
+        if "docs" in selected_sources:
+            hits.extend(zvec_search_docs(collection, q, repo=repo, limit=_limit(limit)))
+    except ZvecUnavailableError as exc:
+        raise ZvecUnavailableError(
+            "zvec lexical search is unavailable; rebuild the index with `codekg index-search`."
+        ) from exc
+
+    if not hits:
+        return []
+    hits = sorted(hits, key=lambda hit: float(hit.get("score") or 0), reverse=True)[: _limit(limit)]
+
+    ids = [str(hit["id"]) for hit in hits if _hit_source(hit) == "symbol"]
+    rows = _symbol_rows_by_key(client or get_client(), ids, limit) if ids else []
+    rows_by_key = {str(row["key"]): row for row in rows}
+    merged = []
+    for hit in hits:
+        if _hit_source(hit) == "doc":
+            merged.append(_doc_hit_row(hit))
+        elif str(hit["id"]) in rows_by_key:
+            merged.append(_merge_zvec_hit(hit, rows_by_key))
+    return merged
+
+
+def _symbol_rows_by_key(
+    db: Neo4jClient,
+    ids: list[str],
+    limit: int,
+) -> list[dict[str, object]]:
+    return db.execute_read(
+        """
+        MATCH (f:File)-[:CONTAINS]->(s)
+        MATCH (r:Repository)-[:CONTAINS]->(f)
+        WHERE (s:Function OR s:Method OR s:Type)
+          AND s.key IN $keys
+        RETURN s.key AS key,
+               labels(s) AS labels,
+               s.name AS name,
+               s.qname AS qname,
+               s.signature AS signature,
+               s.start_line AS start_line,
+               s.end_line AS end_line,
+               f.path AS file,
+               r.repo_name AS repo,
+               r.commit AS commit
+        """,
+        {"keys": ids},
+        max_rows=_limit(limit),
+    )
+
+
+def _hit_source(hit: dict[str, object]) -> str:
+    fields = hit.get("fields")
+    if isinstance(fields, dict):
+        return str(fields.get("source") or "")
+    return ""
+
+
+def _merge_zvec_hit(
+    hit: dict[str, object],
+    rows_by_key: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    key = str(hit["id"])
+    row = dict(rows_by_key[key])
+    fields = hit.get("fields")
+    if isinstance(fields, dict):
+        row["source"] = fields.get("source")
+        row["snippet"] = _snippet(str(fields.get("text") or ""))
+    row["score"] = hit.get("score")
+    return row
+
+
+def _doc_hit_row(hit: dict[str, object]) -> dict[str, object]:
+    fields = hit.get("fields")
+    if not isinstance(fields, dict):
+        fields = {}
+    path = str(fields.get("path") or "")
+    heading = str(fields.get("qname") or path)
+    return {
+        "key": hit.get("id"),
+        "labels": ["DocChunk"],
+        "name": heading.rsplit(" > ", maxsplit=1)[-1],
+        "qname": heading,
+        "signature": fields.get("signature"),
+        "start_line": fields.get("start_line"),
+        "end_line": fields.get("end_line"),
+        "file": path,
+        "repo": fields.get("repo"),
+        "commit": fields.get("commit"),
+        "source": fields.get("source"),
+        "snippet": _snippet(str(fields.get("text") or "")),
+        "score": hit.get("score"),
+    }
+
+
+def _snippet(text: str, *, max_len: int = 240) -> str:
+    collapsed = re.sub(r"\s+", " ", text).strip()
+    if len(collapsed) <= max_len:
+        return collapsed
+    return f"{collapsed[: max_len - 1].rstrip()}..."
 
 
 def get_definition(

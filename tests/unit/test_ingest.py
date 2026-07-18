@@ -66,6 +66,37 @@ def test_scan_repository_extracts_python_symbols(tmp_path: Path) -> None:
     ]
 
 
+def test_scan_repository_extracts_docs(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "worker.py").write_text("def build():\n    return 1\n", encoding="utf-8")
+    (repo_root / "README.md").write_text(
+        "# Usage\nCall `worker.build` to create a worker.\n",
+        encoding="utf-8",
+    )
+
+    repo = scan_repository(repo_root)
+
+    assert [doc.path for doc in repo.docs] == ["README.md"]
+    assert repo.docs[0].doc_type == "markdown"
+    assert repo.docs[0].chunks[0].heading_path == "Usage"
+    assert repo.docs[0].chunks[0].mentions == ("worker.build",)
+
+
+def test_scan_repository_content_hash_includes_docs(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "worker.py").write_text("def build():\n    return 1\n", encoding="utf-8")
+    readme = repo_root / "README.md"
+    readme.write_text("# Usage\nFirst version.\n", encoding="utf-8")
+
+    first = scan_repository(repo_root).commit
+    readme.write_text("# Usage\nSecond version.\n", encoding="utf-8")
+    second = scan_repository(repo_root).commit
+
+    assert first != second
+
+
 def test_scan_repository_resolves_relative_imports_and_nested_function_qnames(
     tmp_path: Path,
 ) -> None:

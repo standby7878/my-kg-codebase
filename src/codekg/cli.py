@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Annotated
 
 import typer
 from rich.console import Console
@@ -41,6 +42,29 @@ def reindex_repo(path: Path) -> None:
     from codekg.ingest import index_repository
 
     result = index_repository(path, replace=True)
+    console.print(result)
+
+
+@app.command("index-search")
+def index_search(
+    repo: Annotated[
+        str | None,
+        typer.Option("--repo", help="Optional repository name to rebuild in zvec."),
+    ] = None,
+    zvec_path: Annotated[
+        Path,
+        typer.Option(
+            "--zvec-path",
+            envvar="CODEKG_ZVEC_PATH",
+            help="zvec collection path.",
+        ),
+    ] = Path("/data/zvec/codekg"),
+) -> None:
+    """Rebuild the derived zvec lexical search index from Neo4j symbols."""
+
+    from codekg.search_index import rebuild_repo_search_index
+
+    result = rebuild_repo_search_index(repo=repo, zvec_path=str(zvec_path))
     console.print(result)
 
 

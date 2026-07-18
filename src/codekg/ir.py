@@ -36,6 +36,24 @@ class SymbolIR:
     end_line: int
     cyclomatic: int = 1
     parent_qname: str | None = None
+    docstring: str | None = None
+
+
+@dataclass(frozen=True)
+class DocChunkIR:
+    heading_path: str
+    start_line: int
+    end_line: int
+    text: str = ""
+    mentions: tuple[str, ...] = ()
+    chunk_index: int = 0
+
+
+@dataclass(frozen=True)
+class DocFileIR:
+    path: str
+    doc_type: str
+    chunks: tuple[DocChunkIR, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -56,3 +74,4 @@ class RepositoryIR:
     commit: str
     root_path: str
     files: tuple[FileIR, ...] = field(default_factory=tuple)
+    docs: tuple[DocFileIR, ...] = field(default_factory=tuple)

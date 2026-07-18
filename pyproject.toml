@@ -19,6 +19,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+search = [
+  "zvec>=0.5,<0.6",
+]
 dev = [
   "pytest",
   "pytest-asyncio",
