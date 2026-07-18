@@ -74,7 +74,6 @@ def load_repository(
                 "end_line": symbol.end_line,
                 "cyclomatic": symbol.cyclomatic,
                 "parent_qname": symbol.parent_qname,
-                "docstring": symbol.docstring,
             }
             if symbol.kind == "type":
                 type_row = {**row, "kind": "class"}
@@ -153,46 +152,6 @@ def load_repository(
         {"rows": inheritance_rows},
     )
 
-    doc_rows, doc_chunk_rows, mention_rows = _doc_rows(
-        repo,
-        {**type_rows_by_qname, **symbol_rows_by_qname},
-    )
-    db.execute_write(
-        """
-        UNWIND $rows AS row
-        MATCH (r:Repository {key: row.repo_key})
-        MERGE (d:Document {key: row.key})
-        SET d.path = row.path,
-            d.doc_type = row.doc_type
-        MERGE (r)-[:CONTAINS]->(d)
-        """,
-        {"rows": doc_rows},
-    )
-    db.execute_write(
-        """
-        UNWIND $rows AS row
-        MATCH (d:Document {key: row.doc_key})
-        MERGE (c:DocChunk {key: row.key})
-        SET c.path = row.path,
-            c.heading_path = row.heading_path,
-            c.chunk_index = row.chunk_index,
-            c.start_line = row.start_line,
-            c.end_line = row.end_line
-        MERGE (d)-[:HAS_CHUNK]->(c)
-        """,
-        {"rows": doc_chunk_rows},
-    )
-    db.execute_write(
-        """
-        UNWIND $rows AS row
-        MATCH (c:DocChunk {key: row.chunk_key})
-        MATCH (s {key: row.symbol_key})
-        WHERE s:Function OR s:Method OR s:Type
-        MERGE (c)-[:MENTIONS]->(s)
-        """,
-        {"rows": mention_rows},
-    )
-
     call_rows = _call_rows(repo, symbol_rows_by_qname)
     db.execute_write(
         """
@@ -207,18 +166,10 @@ def load_repository(
     )
 
     return {
-        "nodes": 1
-        + len(file_rows)
-        + len(type_rows)
-        + len(callable_rows)
-        + len(doc_rows)
-        + len(doc_chunk_rows),
+        "nodes": 1 + len(file_rows) + len(type_rows) + len(callable_rows),
         "imports": len(import_rows),
         "inherits": len(inheritance_rows),
         "calls": len(call_rows),
-        "docs": len(doc_rows),
-        "doc_chunks": len(doc_chunk_rows),
-        "mentions": len(mention_rows),
     }
 
 
@@ -251,8 +202,7 @@ def _merge_callables(db: Neo4jClient, label: str, rows: list[dict[str, object]])
             n.signature = row.signature,
             n.start_line = row.start_line,
             n.end_line = row.end_line,
-            n.cyclomatic = row.cyclomatic,
-            n.docstring = row.docstring
+            n.cyclomatic = row.cyclomatic
         MERGE (f)-[:CONTAINS]->(n)
         """,
         {"rows": rows},
@@ -302,43 +252,6 @@ def _inheritance_rows(
                 rows.append({"child_key": child["key"], "parent_key": parent["key"]})
                 break
     return rows
-
-
-def _doc_rows(
-    repo: RepositoryIR,
-    symbol_rows_by_qname: dict[str, dict[str, object]],
-) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
-    documents: list[dict[str, object]] = []
-    chunks: list[dict[str, object]] = []
-    mentions: list[dict[str, object]] = []
-    for doc in repo.docs:
-        doc_key = _doc_key(repo, doc.path)
-        documents.append(
-            {
-                "key": doc_key,
-                "repo_key": repo.repo_name,
-                "path": doc.path,
-                "doc_type": doc.doc_type,
-            }
-        )
-        for chunk in doc.chunks:
-            chunk_key = _doc_chunk_key(repo, doc.path, chunk.heading_path, chunk.chunk_index)
-            chunks.append(
-                {
-                    "key": chunk_key,
-                    "doc_key": doc_key,
-                    "path": doc.path,
-                    "heading_path": chunk.heading_path,
-                    "chunk_index": chunk.chunk_index,
-                    "start_line": chunk.start_line,
-                    "end_line": chunk.end_line,
-                }
-            )
-            for mention in chunk.mentions:
-                symbol = symbol_rows_by_qname.get(mention)
-                if symbol:
-                    mentions.append({"chunk_key": chunk_key, "symbol_key": symbol["key"]})
-    return documents, chunks, mentions
 
 
 def _call_rows(
@@ -454,9 +367,7 @@ def _symbol_key(repo: RepositoryIR, path: str, qname: str, start_line: int) -> s
     return _key(repo, f"{path}:{qname}:{start_line}")
 
 
-def _doc_key(repo: RepositoryIR, path: str) -> str:
-    return _key(repo, f"doc:{path}")
+def symbol_key(repo: RepositoryIR, path: str, qname: str, start_line: int) -> str:
+    """Return the stable Neo4j key shared with the zvec description record."""
 
-
-def _doc_chunk_key(repo: RepositoryIR, path: str, heading_path: str, chunk_index: int) -> str:
-    return _key(repo, f"{path}#{heading_path}:{chunk_index}")
+    return _symbol_key(repo, path, qname, start_line)

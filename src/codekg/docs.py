@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,9 +19,7 @@ class DocChunk:
 
 
 MARKDOWN_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*$")
-MENTION_RE = re.compile(
-    r"``([^`]+)``|`([^`]+)`|\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\b"
-)
+MENTION_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\b")
 
 
 def chunk_docs(paths: list[Path], globs: list[str]) -> Iterator[DocChunk]:
@@ -40,12 +38,29 @@ def chunk_docs(paths: list[Path], globs: list[str]) -> Iterator[DocChunk]:
                 yield from _chunk_markdown_file(path)
 
 
+def resolve_markdown_descriptions(
+    paths: Iterable[Path], callable_qnames: Iterable[str]
+) -> dict[str, tuple[str, ...]]:
+    """Return exact callable qname matches with Markdown chunk text.
+
+    Markdown is description enrichment, not a graph entity.  Only an explicit,
+    fully-qualified mention that exactly matches an indexed callable is attached.
+    """
+
+    known_qnames = set(callable_qnames)
+    descriptions: dict[str, list[str]] = {}
+    for chunk in chunk_docs(list(paths), []):
+        for qname in chunk.mentions:
+            if qname in known_qnames:
+                descriptions.setdefault(qname, []).append(chunk.text)
+    return {qname: tuple(texts) for qname, texts in descriptions.items()}
+
+
 def extract_mentions(text: str) -> tuple[str, ...]:
     mentions: list[str] = []
     seen: set[str] = set()
     for match in MENTION_RE.finditer(text):
-        value = next(group for group in match.groups() if group)
-        value = value.strip()
+        value = match.group(1)
         if not _looks_like_symbol(value) or value in seen:
             continue
         seen.add(value)

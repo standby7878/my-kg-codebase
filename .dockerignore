@@ -6,3 +6,6 @@ __pycache__
 *.pyc
 neo4j_data
 sources
+third_party/*
+!third_party/wheels/
+!third_party/wheels/zvec-0.5.1-*.whl

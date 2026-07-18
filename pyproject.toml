@@ -20,7 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 search = [
-  "zvec>=0.5,<0.6",
+  "zvec==0.5.1",
 ]
 dev = [
   "pytest",

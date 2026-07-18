@@ -38,7 +38,6 @@ from codekg.queries.repositories import list_repositories as query_list_reposito
 SymbolKind = Literal["function", "method", "type"]
 HierarchyDirection = Literal["ancestors", "descendants"]
 SearchMode = Literal["graph", "lexical"]
-SearchSource = Literal["symbols", "docs"]
 
 mcp = FastMCP(
     "codekg",
@@ -64,10 +63,9 @@ def list_repositories() -> list[dict[str, Any]]:
 @mcp.tool(
     description=(
         "Search indexed code symbols. mode='graph' searches Neo4j symbol names and "
-        "qualified names. mode='lexical' searches the zvec-derived symbol description "
-        "index, including docstrings, filtered source comments, and optional Markdown/RST "
-        "doc chunks when sources includes 'docs'. Use this first when you do not know "
-        "the exact symbol key. Results are capped by the limit argument."
+        "qualified names. mode='lexical' searches zvec descriptions for indexed functions "
+        "and methods, then resolves exact keys in Neo4j. Use this first when you do not "
+        "know the exact symbol key. Results are capped by the limit argument."
     )
 )
 def search_symbols(
@@ -78,13 +76,9 @@ def search_symbols(
         SearchMode,
         Field(description="graph for Neo4j name search, lexical for zvec description search."),
     ] = "graph",
-    sources: Annotated[
-        list[SearchSource] | None,
-        Field(description="Lexical sources to search. Defaults to symbols only."),
-    ] = None,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 25,
 ) -> list[dict[str, Any]]:
-    return query_search_symbols(q, kind=kind, repo=repo, mode=mode, sources=sources, limit=limit)
+    return query_search_symbols(q, kind=kind, repo=repo, mode=mode, limit=limit)
 
 
 @mcp.tool(

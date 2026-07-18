@@ -1,188 +1,176 @@
 from __future__ import annotations
 
+import gc
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from codekg.docs import DocChunk
+from codekg.ir import FileIR, RepositoryIR, SymbolIR
 from codekg.search_index import (
     build_symbol_text,
-    doc_chunk_doc_from_chunk,
-    doc_chunk_docs_from_repo,
+    callable_docs_from_repository,
     normalize_name,
-    rebuild_repo_search_index,
     validate_search_index_consistency,
 )
-from codekg.zvec_store import DocChunkDoc
+from codekg.zvec_store import (
+    SymbolDoc,
+    delete_repo,
+    doc_id_for_key,
+    fetch_symbol_docs,
+    open_write,
+    optimize_and_flush,
+    search_symbols,
+    upsert_symbol_docs,
+)
 
 pytestmark = pytest.mark.unit
+
+
+def _doc(*, key: str = "sample@abc:worker.py:worker.choose_standby:7") -> SymbolDoc:
+    return SymbolDoc(
+        key=key,
+        repo="sample",
+        commit="abc",
+        path="worker.py",
+        qname="worker.choose_standby",
+        kind="function",
+        signature="def choose_standby(nodes)",
+        start_line=7,
+        end_line=9,
+        text="choose_standby\nchoose standby\nPromote the reliable standby to primary.",
+    )
 
 
 def test_normalize_name_splits_snake_and_camel_case() -> None:
     assert normalize_name("pkg.mod.do_failoverDecision") == "do failover decision"
 
 
-def test_build_symbol_text_includes_docstring_and_comments(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    source = repo / "worker.py"
-    source.write_text(
-        "\n".join(
-            [
-                "# Promote the best standby during failover.",
-                "def choose_standby(nodes):",
-                '    """Choose the candidate with newest WAL."""',
-                "    return nodes[0]",
-            ]
+def test_callable_docs_fold_docstring_and_markdown_into_callable_text() -> None:
+    repo = RepositoryIR(
+        repo_name="sample",
+        commit="abc",
+        root_path="/repos/sample",
+        files=(
+            FileIR(
+                path="worker.py",
+                language="python",
+                loc=9,
+                module_qname="worker",
+                symbols=(
+                    SymbolIR(
+                        kind="function",
+                        name="<module>",
+                        qname="worker.__module__",
+                        signature="<module>",
+                        start_line=1,
+                        end_line=1,
+                    ),
+                    SymbolIR(
+                        kind="function",
+                        name="choose_standby",
+                        qname="worker.choose_standby",
+                        signature="def choose_standby(nodes)",
+                        start_line=7,
+                        end_line=9,
+                        docstring="Select the replica with the newest WAL.",
+                    ),
+                ),
+            ),
         ),
-        encoding="utf-8",
+        markdown_descriptions={
+            "worker.choose_standby": ("Promote a reliable standby during failover.",)
+        },
     )
 
+    docs = callable_docs_from_repository(repo)
+
+    assert [doc.qname for doc in docs] == ["worker.__module__", "worker.choose_standby"]
+    assert docs[1].key == "sample@abc:worker.py:worker.choose_standby:7"
+    assert "choose standby" in docs[1].text
+    assert "newest WAL" in docs[1].text
+    assert "reliable standby" in docs[1].text
+
+
+def test_build_symbol_text_never_reparses_comments() -> None:
     text = build_symbol_text(
         {
-            "root_path": str(repo),
-            "path": "worker.py",
             "qname": "worker.choose_standby",
             "name": "choose_standby",
             "signature": "def choose_standby(nodes)",
-            "start_line": 2,
-            "end_line": 4,
-        }
+            "docstring": "Select the newest WAL.",
+        },
+        ("Promote a reliable standby.",),
     )
 
     assert "choose standby" in text
     assert "newest WAL" in text
-    assert "best standby" in text
+    assert "reliable standby" in text
 
 
-def test_validate_search_index_consistency_reports_missing_and_orphaned(monkeypatch) -> None:
-    class FakeClient:
-        def execute_read(self, *args, **kwargs):
-            return [{"key": "graph-only"}, {"key": "shared"}]
+def test_real_zvec_fts_and_safe_key_liveness(tmp_path) -> None:
+    pytest.importorskip("zvec")
+    doc = _doc()
+    collection = open_write(str(tmp_path / "zvec"))
 
-    monkeypatch.setattr("codekg.search_index.open_read", lambda path: object())
-    monkeypatch.setattr(
-        "codekg.search_index.list_symbol_ids", lambda collection, repo=None: {"shared", "zvec-only"}
+    assert doc_id_for_key(doc.key) != doc.key
+    assert len(doc_id_for_key(doc.key)) == 64
+    assert doc_id_for_key(doc.key).isalnum()
+    assert "@" not in doc_id_for_key(doc.key)
+    assert ":" not in doc_id_for_key(doc.key)
+
+    assert upsert_symbol_docs(collection, [doc]) == 1
+    optimize_and_flush(collection)
+    hits = search_symbols(collection, "reliable standby", repo="sample")
+    assert [hit["key"] for hit in hits] == [doc.key]
+    assert fetch_symbol_docs(collection, {doc.key})[doc.key]["key"] == doc.key
+    assert (
+        validate_search_index_consistency([doc], live_graph_keys={doc.key}, collection=collection)[
+            "ok"
+        ]
+        is True
     )
-    monkeypatch.setattr(
-        "codekg.search_index.iter_doc_chunk_rows", lambda repo=None, client=None: []
+    graph_mismatch = validate_search_index_consistency(
+        [doc],
+        live_graph_keys={"graph-only"},
+        collection=collection,
     )
-    monkeypatch.setattr("codekg.search_index.list_doc_ids", lambda collection, repo=None: set())
+    assert graph_mismatch["ok"] is False
+    assert graph_mismatch["missing_in_graph"] == [doc.key]
+    assert graph_mismatch["unexpected_in_graph"] == ["graph-only"]
+    assert graph_mismatch["missing_in_zvec"] == ["graph-only"]
 
-    result = validate_search_index_consistency(client=FakeClient())  # type: ignore[arg-type]
-
-    assert result == {
-        "ok": False,
-        "graph_symbols": 2,
-        "zvec_symbols": 2,
-        "graph_docs": 0,
-        "zvec_docs": 0,
-        "missing_in_zvec": ["graph-only"],
-        "orphaned_in_zvec": ["zvec-only"],
-        "missing_docs_in_zvec": [],
-        "orphaned_docs_in_zvec": [],
-    }
-
-
-def test_doc_chunk_doc_uses_repo_commit_anchor(tmp_path: Path) -> None:
-    chunk = DocChunk(
-        path=(tmp_path / "docs" / "failover.rst").as_posix(),
-        heading_path="Failover > Promotion",
-        start_line=12,
-        end_line=30,
-        text="Promotion explains standby behavior.",
-        mentions=("patroni.ha.Ha",),
+    del collection
+    gc.collect()
+    script = """
+from codekg.zvec_store import open_read, search_symbols
+import sys
+collection = open_read(sys.argv[1])
+print(len(search_symbols(collection, 'reliable standby', repo='sample')))
+"""
+    root = Path(__file__).parents[2]
+    env = {**os.environ, "PYTHONPATH": f"{root / 'src'}:{os.environ.get('PYTHONPATH', '')}"}
+    reader = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "zvec")],
+        cwd=root,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
     )
+    assert reader.stdout.strip() == "1"
 
-    doc = doc_chunk_doc_from_chunk(chunk, root=tmp_path, repo="patroni", commit="abc")
+    collection = open_write(str(tmp_path / "zvec"))
 
-    assert doc.id == "patroni@abc:doc:docs/failover.rst:12"
-    assert doc.source == "doc"
-    assert doc.path == "docs/failover.rst"
-    assert "patroni.ha.Ha" in doc.text
-
-
-def test_doc_chunk_docs_from_repo_uses_ingest_doc_selection(tmp_path: Path) -> None:
-    (tmp_path / "README.MD").write_text("# Usage\nCall `pkg.run`.\n", encoding="utf-8")
-    vendor = tmp_path / "vendor"
-    vendor.mkdir()
-    (vendor / "ignored.md").write_text("# Ignored\nCall `pkg.ignored`.\n", encoding="utf-8")
-
-    docs = doc_chunk_docs_from_repo({"root_path": str(tmp_path), "repo": "sample", "commit": "abc"})
-
-    assert [doc.path for doc in docs] == ["README.MD"]
-    assert docs[0].id == "sample@abc:doc:README.MD:1"
-    assert "pkg.run" in docs[0].text
-
-
-def test_rebuild_search_index_deletes_only_stale_ids_after_upsert(monkeypatch) -> None:
-    calls: list[tuple[str, object]] = []
-    live_doc = DocChunkDoc(
-        id="live-doc",
-        source="doc",
-        repo="sample",
-        commit="abc",
-        path="README.md",
-        qname="Usage",
-        kind="doc",
-        signature="Usage",
-        start_line=1,
-        end_line=2,
-        text="Usage",
+    delete_repo(collection, "sample")
+    optimize_and_flush(collection)
+    result = validate_search_index_consistency(
+        [],
+        live_graph_keys=set(),
+        replaced_keys={doc.key},
+        collection=collection,
     )
-
-    monkeypatch.setattr("codekg.search_index.open_write", lambda path: object())
-    monkeypatch.setattr(
-        "codekg.search_index.iter_symbol_rows",
-        lambda repo=None, client=None: [
-            {
-                "key": "live-symbol",
-                "repo": "sample",
-                "commit": "abc",
-                "path": "worker.py",
-                "qname": "worker.run",
-                "kind": "function",
-                "name": "run",
-                "signature": "def run()",
-            }
-        ],
-    )
-    monkeypatch.setattr(
-        "codekg.search_index.iter_repository_rows",
-        lambda repo=None, client=None: [
-            {"repo": "sample", "commit": "abc", "root_path": "/missing"}
-        ],
-    )
-    monkeypatch.setattr(
-        "codekg.search_index.doc_chunk_docs_from_repo",
-        lambda row: [live_doc],
-    )
-    monkeypatch.setattr(
-        "codekg.search_index.list_symbol_ids",
-        lambda collection, repo=None: {"old-symbol", "live-symbol"},
-    )
-    monkeypatch.setattr(
-        "codekg.search_index.list_doc_ids",
-        lambda collection, repo=None: {"old-doc", "live-doc"},
-    )
-    monkeypatch.setattr(
-        "codekg.search_index.upsert_symbol_docs",
-        lambda collection, docs: calls.append(("symbols", [doc.id for doc in docs])) or len(docs),
-    )
-    monkeypatch.setattr(
-        "codekg.search_index.upsert_doc_chunks",
-        lambda collection, docs: calls.append(("docs", [doc.id for doc in docs])) or len(docs),
-    )
-    monkeypatch.setattr(
-        "codekg.search_index.delete_ids",
-        lambda collection, ids: calls.append(("delete", ids)),
-    )
-
-    result = rebuild_repo_search_index(repo="sample", client=object())  # type: ignore[arg-type]
-
-    assert result == {"symbols": 1, "docs": 1, "repositories": 1}
-    assert calls == [
-        ("symbols", ["live-symbol"]),
-        ("docs", ["live-doc"]),
-        ("delete", {"old-symbol", "old-doc"}),
-    ]
+    assert result["ok"] is True
+    assert fetch_symbol_docs(collection, {doc.key}) == {}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 
@@ -40,23 +41,6 @@ class SymbolIR:
 
 
 @dataclass(frozen=True)
-class DocChunkIR:
-    heading_path: str
-    start_line: int
-    end_line: int
-    text: str = ""
-    mentions: tuple[str, ...] = ()
-    chunk_index: int = 0
-
-
-@dataclass(frozen=True)
-class DocFileIR:
-    path: str
-    doc_type: str
-    chunks: tuple[DocChunkIR, ...] = ()
-
-
-@dataclass(frozen=True)
 class FileIR:
     path: str
     language: str
@@ -74,4 +58,4 @@ class RepositoryIR:
     commit: str
     root_path: str
     files: tuple[FileIR, ...] = field(default_factory=tuple)
-    docs: tuple[DocFileIR, ...] = field(default_factory=tuple)
+    markdown_descriptions: Mapping[str, tuple[str, ...]] = field(default_factory=dict)

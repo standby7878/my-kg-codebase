@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from codekg.ir import CallIR, DocChunkIR, DocFileIR, FileIR, InheritanceIR, RepositoryIR, SymbolIR
+from codekg.ir import CallIR, FileIR, InheritanceIR, RepositoryIR, SymbolIR
 from codekg.loader import delete_repository_by_name, load_repository
 
 pytestmark = pytest.mark.unit
@@ -68,6 +68,7 @@ def test_load_repository_batches_files_and_symbols() -> None:
                         signature="def build()",
                         start_line=5,
                         end_line=6,
+                        docstring="Build a worker instance.",
                     ),
                 ),
                 inheritance=(
@@ -113,6 +114,13 @@ def test_load_repository_batches_files_and_symbols() -> None:
     ]
     call_params = client.writes[-1][1]
     assert call_params["rows"][0]["resolution"] == "heuristic"  # type: ignore[index]
+    queries = [query for query, _ in client.writes]
+    assert all("Document" not in query for query in queries)
+    assert all("DocChunk" not in query for query in queries)
+    assert all("MENTIONS" not in query for query in queries)
+    for query in (client.writes[3][0], client.writes[4][0]):
+        assert "docstring" not in query
+        assert "prose" not in query
 
 
 def test_self_calls_resolve_only_within_callers_class() -> None:
@@ -219,7 +227,7 @@ def test_replace_load_deletes_before_reindexing() -> None:
     assert "MERGE (r:Repository" in client.writes[1][0]
 
 
-def test_load_repository_writes_doc_chunks_and_mentions() -> None:
+def test_load_repository_remains_code_only_when_markdown_enriches_symbols() -> None:
     repo = RepositoryIR(
         repo_name="sample",
         commit="abc123",
@@ -238,48 +246,39 @@ def test_load_repository_writes_doc_chunks_and_mentions() -> None:
                         signature="def build()",
                         start_line=1,
                         end_line=2,
+                        docstring="Build a worker instance.",
                     ),
                 ),
             ),
         ),
-        docs=(
-            DocFileIR(
-                path="README.md",
-                doc_type="markdown",
-                chunks=(
-                    DocChunkIR(
-                        heading_path="Usage",
-                        start_line=1,
-                        end_line=3,
-                        mentions=("worker.build", "missing.symbol"),
-                    ),
-                ),
-            ),
-        ),
+        markdown_descriptions={
+            "worker.build": ("Builds a ready-to-run worker from configuration.",),
+        },
     )
     client = FakeClient()
 
     result = load_repository(repo, replace=False, client=client)  # type: ignore[arg-type]
 
-    assert result["docs"] == 1
-    assert result["doc_chunks"] == 1
-    assert result["mentions"] == 1
-    assert result["nodes"] == 5
-    doc_params = client.writes[-4][1]
-    chunk_params = client.writes[-3][1]
-    mention_params = client.writes[-2][1]
-    assert doc_params["rows"] == [  # type: ignore[index]
+    assert result == {"nodes": 3, "imports": 0, "inherits": 0, "calls": 0}
+    queries = [query for query, _ in client.writes]
+    assert all("Document" not in query for query in queries)
+    assert all("DocChunk" not in query for query in queries)
+    assert all("MENTIONS" not in query for query in queries)
+    callable_query, callable_params = client.writes[3]
+    assert "docstring" not in callable_query
+    assert "description" not in callable_query
+    assert "prose" not in callable_query
+    assert callable_params["rows"] == [  # type: ignore[index]
         {
-            "key": "sample@abc123:doc:README.md",
-            "repo_key": "sample",
-            "path": "README.md",
-            "doc_type": "markdown",
-        }
-    ]
-    assert chunk_params["rows"][0]["key"] == "sample@abc123:doc:README.md:1"  # type: ignore[index]
-    assert mention_params["rows"] == [  # type: ignore[index]
-        {
-            "chunk_key": "sample@abc123:doc:README.md:1",
-            "symbol_key": "sample@abc123:worker.py:worker.build:1",
+            "key": "sample@abc123:worker.py:worker.build:1",
+            "file_key": "sample@abc123:worker.py",
+            "name": "build",
+            "qname": "worker.build",
+            "signature": "def build()",
+            "start_line": 1,
+            "end_line": 2,
+            "cyclomatic": 1,
+            "parent_qname": None,
+            "label": "Function",
         }
     ]

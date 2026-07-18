@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated
 
 import typer
 from rich.console import Console
@@ -45,29 +44,6 @@ def reindex_repo(path: Path) -> None:
     console.print(result)
 
 
-@app.command("index-search")
-def index_search(
-    repo: Annotated[
-        str | None,
-        typer.Option("--repo", help="Optional repository name to rebuild in zvec."),
-    ] = None,
-    zvec_path: Annotated[
-        Path,
-        typer.Option(
-            "--zvec-path",
-            envvar="CODEKG_ZVEC_PATH",
-            help="zvec collection path.",
-        ),
-    ] = Path("/data/zvec/codekg"),
-) -> None:
-    """Rebuild the derived zvec lexical search index from Neo4j symbols."""
-
-    from codekg.search_index import rebuild_repo_search_index
-
-    result = rebuild_repo_search_index(repo=repo, zvec_path=str(zvec_path))
-    console.print(result)
-
-
 @app.command("list")
 def list_repositories() -> None:
     """List indexed repositories."""
@@ -83,6 +59,8 @@ def delete_repository(repo_name: str) -> None:
     """Delete an indexed repository by name."""
 
     from codekg.loader import delete_repository_by_name
+    from codekg.zvec_store import delete_repo_records
 
+    delete_repo_records(repo_name)
     deleted = delete_repository_by_name(repo_name)
     console.print({"repo_name": repo_name, "deleted": deleted})

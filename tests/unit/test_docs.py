@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from codekg.docs import chunk_docs, extract_mentions
+from codekg.docs import chunk_docs, extract_mentions, resolve_markdown_descriptions
 
 pytestmark = pytest.mark.unit
 
@@ -31,7 +31,7 @@ def test_chunk_docs_splits_markdown_and_extracts_mentions(tmp_path: Path) -> Non
     assert "Failsafe.update" in chunks[1].mentions
 
 
-def test_chunk_docs_splits_rst_headings(tmp_path: Path) -> None:
+def test_chunk_docs_does_not_extract_rst(tmp_path: Path) -> None:
     doc = tmp_path / "README.rst"
     doc.write_text(
         "\n".join(
@@ -51,8 +51,7 @@ def test_chunk_docs_splits_rst_headings(tmp_path: Path) -> None:
 
     chunks = list(chunk_docs([doc], ["*.rst"]))
 
-    assert [chunk.heading_path for chunk in chunks] == ["PGHoard", "PGHoard > Restore"]
-    assert "pghoard.archive_sync.ArchiveSync" in chunks[0].mentions
+    assert chunks == []
 
 
 def test_extract_mentions_filters_plain_prose() -> None:
@@ -61,3 +60,33 @@ def test_extract_mentions_filters_plain_prose() -> None:
         "pkg.mod.func",
         "Class.method",
     )
+
+
+def test_resolve_markdown_descriptions_requires_exact_callable_qname(tmp_path: Path) -> None:
+    doc = tmp_path / "spec.md"
+    doc.write_text(
+        "\n".join(
+            [
+                "# Failover",
+                "Use `patroni.ha.Ha.promote` to promote a standby.",
+                "`Ha.promote` and `promote` are deliberately ambiguous.",
+                "```python",
+                "patroni.ha.Ha.restart",
+                "```",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    descriptions = resolve_markdown_descriptions(
+        [doc], {"patroni.ha.Ha.promote", "patroni.ha.Ha.restart"}
+    )
+
+    assert descriptions == {
+        "patroni.ha.Ha.promote": (
+            "# Failover\n"
+            "Use `patroni.ha.Ha.promote` to promote a standby.\n"
+            "`Ha.promote` and `promote` are deliberately ambiguous.",
+        ),
+        "patroni.ha.Ha.restart": ("```python\npatroni.ha.Ha.restart\n```",),
+    }

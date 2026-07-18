@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import gc
 from pathlib import Path
 
 import pytest
 
-from codekg.ingest import scan_repository
+from codekg.ingest import index_repository, scan_repository
+from codekg.ir import FileIR, RepositoryIR, SymbolIR
+from codekg.search_index import callable_docs_from_repository
+from codekg.zvec_store import fetch_symbol_docs, open_write, upsert_symbol_docs
 
 pytestmark = pytest.mark.unit
 
@@ -66,10 +70,13 @@ def test_scan_repository_extracts_python_symbols(tmp_path: Path) -> None:
     ]
 
 
-def test_scan_repository_extracts_docs(tmp_path: Path) -> None:
+def test_scan_repository_extracts_docstrings_and_markdown_descriptions(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    (repo_root / "worker.py").write_text("def build():\n    return 1\n", encoding="utf-8")
+    (repo_root / "worker.py").write_text(
+        'def build():\n    """Create a worker from the configured defaults."""\n    return 1\n',
+        encoding="utf-8",
+    )
     (repo_root / "README.md").write_text(
         "# Usage\nCall `worker.build` to create a worker.\n",
         encoding="utf-8",
@@ -77,13 +84,30 @@ def test_scan_repository_extracts_docs(tmp_path: Path) -> None:
 
     repo = scan_repository(repo_root)
 
-    assert [doc.path for doc in repo.docs] == ["README.md"]
-    assert repo.docs[0].doc_type == "markdown"
-    assert repo.docs[0].chunks[0].heading_path == "Usage"
-    assert repo.docs[0].chunks[0].mentions == ("worker.build",)
+    worker_file = next(file for file in repo.files if file.path == "worker.py")
+    assert worker_file.symbols[1].docstring == "Create a worker from the configured defaults."
+    assert repo.markdown_descriptions == {
+        "worker.build": ("# Usage\nCall `worker.build` to create a worker.",)
+    }
+    assert not hasattr(repo, "docs")
 
 
-def test_scan_repository_content_hash_includes_docs(tmp_path: Path) -> None:
+def test_scan_repository_excludes_virtual_environment_directories(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "app.py").write_text("def live():\n    return 1\n", encoding="utf-8")
+    virtualenv = repo_root / ".venv" / "lib"
+    virtualenv.mkdir(parents=True)
+    (virtualenv / "hidden.py").write_text("def hidden():\n    return 1\n", encoding="utf-8")
+    (virtualenv / "README.md").write_text("Use `hidden.hidden`.\n", encoding="utf-8")
+
+    repo = scan_repository(repo_root)
+
+    assert [file.path for file in repo.files] == ["app.py"]
+    assert repo.markdown_descriptions == {}
+
+
+def test_scan_repository_content_hash_includes_markdown(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     (repo_root / "worker.py").write_text("def build():\n    return 1\n", encoding="utf-8")
@@ -139,3 +163,99 @@ def test_scan_repository_resolves_relative_imports_and_nested_function_qnames(
         "sample.worker.outer_two",
         "sample.worker.outer_two.<locals>.inner",
     ]
+
+
+def test_replace_index_removes_previous_zvec_keys_before_graph_load(
+    tmp_path: Path, monkeypatch
+) -> None:
+    old_key = "sample@old:worker.py:worker.old:1"
+    repo = RepositoryIR(
+        repo_name="sample",
+        commit="new",
+        root_path="/repos/sample",
+        files=(
+            FileIR(
+                path="worker.py",
+                language="python",
+                loc=3,
+                module_qname="worker",
+                symbols=(
+                    SymbolIR(
+                        kind="function",
+                        name="new",
+                        qname="worker.new",
+                        signature="def new()",
+                        start_line=1,
+                        end_line=3,
+                        docstring="Create the new worker.",
+                    ),
+                ),
+            ),
+        ),
+    )
+    zvec_path = str(tmp_path / "zvec")
+    collection = open_write(zvec_path)
+    upsert_symbol_docs(
+        collection,
+        [
+            callable_docs_from_repository(
+                RepositoryIR(
+                    repo_name="sample",
+                    commit="old",
+                    root_path="/repos/sample",
+                    files=(
+                        FileIR(
+                            path="worker.py",
+                            language="python",
+                            loc=1,
+                            module_qname="worker",
+                            symbols=(
+                                SymbolIR(
+                                    kind="function",
+                                    name="old",
+                                    qname="worker.old",
+                                    signature="def old()",
+                                    start_line=1,
+                                    end_line=1,
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+            )[0]
+        ],
+    )
+    collection.flush()
+    del collection
+    gc.collect()
+    order: list[str] = []
+
+    monkeypatch.setattr("codekg.ingest.scan_repository", lambda path: repo)
+    new_key = callable_docs_from_repository(repo)[0].key
+    graph_rows = iter([[{"key": old_key}], [{"key": new_key}]])
+    monkeypatch.setattr("codekg.ingest.iter_callable_rows", lambda **kwargs: next(graph_rows))
+    monkeypatch.setattr(
+        "codekg.ingest.load_repository",
+        lambda *args, **kwargs: order.append("graph") or {"nodes": 2},
+    )
+    original_delete = __import__("codekg.ingest", fromlist=["delete_repo"]).delete_repo
+
+    def tracked_delete(collection, repo_name):
+        order.append("zvec")
+        original_delete(collection, repo_name)
+
+    monkeypatch.setattr("codekg.ingest.delete_repo", tracked_delete)
+
+    result = index_repository(
+        tmp_path,
+        replace=True,
+        client=object(),
+        zvec_path=zvec_path,
+    )
+
+    assert result["descriptions"] == 1
+    assert order == ["zvec", "graph"]
+    gc.collect()
+    checked_collection = open_write(zvec_path)
+    assert fetch_symbol_docs(checked_collection, {old_key}) == {}
+    assert fetch_symbol_docs(checked_collection, {new_key})[new_key]["key"] == new_key

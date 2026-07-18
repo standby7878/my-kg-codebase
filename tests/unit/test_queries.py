@@ -77,10 +77,9 @@ def test_search_symbols_lexical_resolves_zvec_hits(monkeypatch) -> None:
         assert limit == 25
         return [
             {
-                "id": "patroni@abc:ha.py:patroni.ha.Ha.promote:10",
+                "key": "patroni@abc:ha.py:patroni.ha.Ha.promote:10",
                 "score": 1.5,
                 "fields": {
-                    "source": "symbol",
                     "text": "promote standby\nChoose a node to promote.",
                 },
             }
@@ -106,67 +105,52 @@ def test_search_symbols_lexical_resolves_zvec_hits(monkeypatch) -> None:
     client.execute_read = fake_execute_read  # type: ignore[method-assign]
     monkeypatch.setattr("codekg.queries.code.open_zvec_read", fake_open_read)
     monkeypatch.setattr("codekg.queries.code.zvec_search_symbols", fake_zvec_search)
-    monkeypatch.setattr("codekg.queries.code.zvec_search_docs", lambda *args, **kwargs: [])
 
     rows = search_symbols(
         "promote standby",
         kind="method",
         repo="patroni",
         mode="lexical",
-        sources=["symbols"],
         client=client,  # type: ignore[arg-type]
     )
 
     assert rows[0]["key"] == "patroni@abc:ha.py:patroni.ha.Ha.promote:10"
     assert rows[0]["score"] == 1.5
-    assert rows[0]["source"] == "symbol"
     assert "Choose a node" in rows[0]["snippet"]
     assert client.calls[0][1]["keys"] == ["patroni@abc:ha.py:patroni.ha.Ha.promote:10"]
 
 
-def test_search_symbols_lexical_can_return_doc_hits(monkeypatch) -> None:
+def test_search_symbols_lexical_omits_stale_hits_and_preserves_zvec_rank(monkeypatch) -> None:
+    client = FakeClient()
+
     monkeypatch.setattr("codekg.queries.code.open_zvec_read", lambda path: object())
-    monkeypatch.setattr("codekg.queries.code.zvec_search_symbols", lambda *args, **kwargs: [])
     monkeypatch.setattr(
-        "codekg.queries.code.zvec_search_docs",
+        "codekg.queries.code.zvec_search_symbols",
         lambda *args, **kwargs: [
             {
-                "id": "patroni@abc:doc:docs/failover.rst:12",
-                "score": 2.0,
-                "fields": {
-                    "source": "doc",
-                    "repo": "patroni",
-                    "commit": "abc",
-                    "path": "docs/failover.rst",
-                    "qname": "Failover > Promotion",
-                    "signature": "Failover > Promotion",
-                    "start_line": 12,
-                    "end_line": 30,
-                    "text": "Promotion explains how a standby becomes primary.",
-                },
-            }
+                "key": "stale",
+                "score": 5.0,
+                "fields": {"text": "stale"},
+            },
+            {"key": "two", "score": 4.0, "fields": {"text": "second result"}},
+            {"key": "one", "score": 3.0, "fields": {"text": "first result"}},
         ],
     )
 
-    rows = search_symbols("standby primary", mode="lexical", sources=["docs"])
+    def fake_execute_read(query, params=None, *, max_rows=1000):
+        client.calls.append((query, params or {}, max_rows))
+        return [
+            {"key": "one", "labels": ["Function"], "name": "one"},
+            {"key": "two", "labels": ["Method"], "name": "two"},
+        ]
 
-    assert rows == [
-        {
-            "key": "patroni@abc:doc:docs/failover.rst:12",
-            "labels": ["DocChunk"],
-            "name": "Promotion",
-            "qname": "Failover > Promotion",
-            "signature": "Failover > Promotion",
-            "start_line": 12,
-            "end_line": 30,
-            "file": "docs/failover.rst",
-            "repo": "patroni",
-            "commit": "abc",
-            "source": "doc",
-            "snippet": "Promotion explains how a standby becomes primary.",
-            "score": 2.0,
-        }
-    ]
+    client.execute_read = fake_execute_read  # type: ignore[method-assign]
+
+    rows = search_symbols("standby primary", mode="lexical", client=client)  # type: ignore[arg-type]
+
+    assert [row["key"] for row in rows] == ["two", "one"]
+    assert [row["snippet"] for row in rows] == ["second result", "first result"]
+    assert client.calls[0][1]["keys"] == ["stale", "two", "one"]
 
 
 def test_variable_depth_queries_inline_bounded_depth() -> None:

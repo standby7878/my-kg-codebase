@@ -6,13 +6,16 @@ Keep Neo4j as the **code graph** and zvec as a derived, local **description inde
 There are no `Document` or `DocChunk` nodes, no `MENTIONS` relationships, and no standalone
 documentation search results. Markdown is an input to description construction only.
 
-Each zvec record represents exactly one live Neo4j `Function` or `Method` node. Its `id` is that
-node's Neo4j `key`. A descriptive search therefore has one simple join:
+Each zvec record represents exactly one live Neo4j `Function` or `Method` node. zvec document IDs
+must use its safe identifier alphabet and length limit, so `id` is the deterministic 64-character
+lowercase SHA-256 hex digest of the exact Neo4j `key`; the exact key is also stored in the required
+`key` scalar field. A
+descriptive search therefore has one simple join:
 
 ```text
 human-language query
   -> zvec ranks code descriptions
-  -> zvec record id (Neo4j symbol key)
+  -> zvec record key field (Neo4j symbol key)
   -> Neo4j fetches and returns the code-graph node
   -> existing graph tools traverse callers, callees, imports, hierarchy, and so on
 ```
@@ -74,7 +77,8 @@ There is one FTS collection named `codekg` and one record for every indexed `Fun
 search records in Phase A.
 
 ```text
-id          exact Neo4j Function/Method key; unique cross-store anchor
+id          SHA-256 hex digest of key; zvec-internal identifier
+key         exact Neo4j Function/Method key; unique cross-store anchor and join value
 text        complete description text; FTS indexed
 repo        repository name; scalar filter
 commit      indexed commit/content hash; scalar metadata
@@ -142,8 +146,16 @@ can be rerun safely.
 After every successful index, validate:
 
 ```text
-set(zvec record ids for repo) == set(live Neo4j Function/Method keys for repo)
+set(description keys built from the snapshot) == set(live Neo4j Function/Method keys for repo)
+every live graph key deterministically fetches a zvec record with the same key field
+every known pre-replacement key no longer fetches after replacement
 ```
+
+zvec 0.5.1 has no collection-scan API for FTS-only collections, so it cannot enumerate arbitrary
+records by repository. The writer is the only producer, deletes by repository filter before every
+replacement, and validates all live/current and known prior snapshot keys by deterministic fetch.
+This is the strongest directly testable invariant its API supports; the MCP join remains a final
+read-time liveness guard.
 
 MCP also resolves every zvec hit through Neo4j and drops a hit that no longer has a live matching
 node. That is a defensive read-time guard, not a substitute for the index-time check.
@@ -178,7 +190,7 @@ search_symbols(
 
 - `mode="graph"` preserves the current Neo4j full-text identifier/qname search, including types.
 - `mode="lexical"` performs zvec FTS over function/method descriptions. It filters by `repo` and
-  `kind`, resolves hit ids through Neo4j, and returns normal code-symbol result fields plus
+  `kind`, resolves hit `key` fields through Neo4j, and returns normal code-symbol result fields plus
   `score` and a bounded description `snippet`.
 - `sources` is intentionally absent: there is only one searchable source, code descriptions.
 - `semantic` and `hybrid` are deferred until an offline embedding model is deliberately added.
@@ -210,8 +222,9 @@ factual graph questions about it.
    - Create/open one FTS-only collection with the fields above.
    - Build descriptions from the in-memory repository snapshot, not by reparsing files after graph
      load.
-   - Delete records by repository filter, upsert a complete replacement set, flush, and validate
-     exact id equality with live graph function/method keys.
+   - Use a deterministic SHA-256 hex zvec ID for each record and retain the exact Neo4j key in a
+     `key` scalar field. Delete records by repository filter, upsert a complete replacement set, flush,
+     and validate exact `key` equality with live graph function/method keys.
 
 4. **Couple zvec to normal index/delete commands**
    - Invoke the derived-index lifecycle from `index_repository` and the repository-delete command.
@@ -256,7 +269,7 @@ In addition to the commands above:
 - An undocumented function is found by its normalized name.
 - Markdown prose that explicitly names a function improves retrieval of that function.
 - Lexical search always returns a live Neo4j code node, never a document-like result.
-- A replace index leaves no old repository zvec records and passes the exact-id consistency check.
+- A replace index leaves no old repository zvec records and passes the exact-key consistency check.
 - MCP cannot write the collection and has no network egress.
 - The final schema has no `Document` or `DocChunk` labels/constraints added by this feature.
 

@@ -6,11 +6,9 @@ import subprocess
 from collections.abc import Iterable
 from pathlib import Path
 
-from codekg.docs import chunk_docs
+from codekg.docs import resolve_markdown_descriptions
 from codekg.ir import (
     CallIR,
-    DocChunkIR,
-    DocFileIR,
     FileIR,
     ImportIR,
     InheritanceIR,
@@ -18,24 +16,31 @@ from codekg.ir import (
     SymbolIR,
 )
 from codekg.loader import load_repository
+from codekg.neo4j_client import Neo4jClient, get_client
+from codekg.search_index import (
+    callable_docs_from_repository,
+    iter_callable_rows,
+    validate_search_index_consistency,
+)
+from codekg.zvec_store import delete_repo, open_write, optimize_and_flush, upsert_symbol_docs
 
 LANGUAGES_BY_SUFFIX = {
     ".py": "python",
 }
-DOC_TYPES_BY_SUFFIX = {
-    ".md": "markdown",
-}
-
 SKIP_DIRS = {
     ".git",
     ".hg",
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
+    ".tox",
+    ".venv",
     "__pycache__",
     "build",
     "dist",
+    "env",
     "node_modules",
+    "venv",
     "vendor",
 }
 
@@ -84,6 +89,7 @@ class _PythonExtractor(ast.NodeVisitor):
                 signature=f"class {node.name}",
                 start_line=node.lineno,
                 end_line=getattr(node, "end_lineno", node.lineno),
+                docstring=ast.get_docstring(node, clean=True),
             )
         )
         for base in node.bases:
@@ -207,15 +213,54 @@ class _PythonExtractor(ast.NodeVisitor):
         return ".".join(package_parts) if package_parts else node.module
 
 
-def index_repository(path: Path, *, replace: bool) -> dict[str, int | str]:
-    """Extract a repository and load it into Neo4j."""
+def index_repository(
+    path: Path,
+    *,
+    replace: bool,
+    client: Neo4jClient | None = None,
+    zvec_path: str | None = None,
+) -> dict[str, int | str]:
+    """Replace a repository graph and its one-per-callable descriptions."""
 
     repo = scan_repository(path)
-    result = load_repository(repo, replace=replace)
+    db = client or get_client()
+    collection = open_write(zvec_path)
+    replaced_keys = (
+        {str(row["key"]) for row in iter_callable_rows(repo=repo.repo_name, client=db)}
+        if replace
+        else set()
+    )
+    if replace:
+        # Remove stale search hits before the corresponding graph nodes disappear.
+        delete_repo(collection, repo.repo_name)
+        optimize_and_flush(collection)
+
+    result = load_repository(repo, replace=replace, client=db)
+    descriptions = callable_docs_from_repository(repo)
+    indexed = upsert_symbol_docs(collection, descriptions)
+    optimize_and_flush(collection)
+    live_graph_keys = {
+        str(row["key"]) for row in iter_callable_rows(repo=repo.repo_name, client=db)
+    }
+    consistency = validate_search_index_consistency(
+        descriptions,
+        live_graph_keys=live_graph_keys,
+        replaced_keys=replaced_keys,
+        collection=collection,
+    )
+    if not consistency["ok"]:
+        raise RuntimeError(
+            "zvec description index is inconsistent after ingest: "
+            f"missing_in_graph={consistency['missing_in_graph']}, "
+            f"unexpected_in_graph={consistency['unexpected_in_graph']}, "
+            f"missing={consistency['missing_in_zvec']}, "
+            f"stale_after_replace={consistency['stale_after_replace']}"
+        )
     return {
         "repo_name": repo.repo_name,
         "commit": repo.commit,
         "files": len(repo.files),
+        "descriptions": indexed,
         **result,
     }
 
@@ -228,9 +273,21 @@ def scan_repository(path: Path) -> RepositoryIR:
     repo_name = root.name
     commit = _git_commit(root) or _content_hash(root)
     files = tuple(_scan_file(root, file_path) for file_path in _iter_source_files(root))
-    docs = tuple(_scan_doc_file(root, file_path) for file_path in iter_doc_files(root))
+    callable_qnames = {
+        symbol.qname
+        for file in files
+        for symbol in file.symbols
+        if symbol.kind in {"function", "method"}
+    }
+    markdown_descriptions = resolve_markdown_descriptions(
+        iter_markdown_files(root), callable_qnames
+    )
     return RepositoryIR(
-        repo_name=repo_name, commit=commit, root_path=str(root), files=files, docs=docs
+        repo_name=repo_name,
+        commit=commit,
+        root_path=str(root),
+        files=files,
+        markdown_descriptions=markdown_descriptions,
     )
 
 
@@ -242,11 +299,11 @@ def _iter_source_files(root: Path) -> Iterable[Path]:
             yield path
 
 
-def iter_doc_files(root: Path) -> Iterable[Path]:
+def iter_markdown_files(root: Path) -> Iterable[Path]:
     for path in sorted(root.rglob("*")):
         if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
             continue
-        if path.is_file() and path.suffix.lower() in DOC_TYPES_BY_SUFFIX:
+        if path.is_file() and path.suffix.lower() == ".md":
             yield path
 
 
@@ -275,26 +332,6 @@ def _scan_file(root: Path, path: Path) -> FileIR:
         symbols=tuple(extractor.symbols),
         inheritance=tuple(extractor.inheritance),
         calls=tuple(extractor.calls),
-    )
-
-
-def _scan_doc_file(root: Path, path: Path) -> DocFileIR:
-    rel_path = path.relative_to(root).as_posix()
-    chunks = tuple(
-        DocChunkIR(
-            heading_path=chunk.heading_path,
-            start_line=chunk.start_line,
-            end_line=chunk.end_line,
-            text=chunk.text,
-            mentions=chunk.mentions,
-            chunk_index=chunk.chunk_index,
-        )
-        for chunk in chunk_docs([path], [])
-    )
-    return DocFileIR(
-        path=rel_path,
-        doc_type=DOC_TYPES_BY_SUFFIX[path.suffix.lower()],
-        chunks=chunks,
     )
 
 
@@ -403,7 +440,7 @@ def _looks_like_commit(value: str) -> bool:
 
 def _content_hash(root: Path) -> str:
     digest = hashlib.sha256()
-    for path in sorted([*_iter_source_files(root), *iter_doc_files(root)]):
+    for path in sorted([*_iter_source_files(root), *iter_markdown_files(root)]):
         digest.update(path.relative_to(root).as_posix().encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()[:12]

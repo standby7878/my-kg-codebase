@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,28 +11,14 @@ COLLECTION_NAME = "codekg"
 
 
 class ZvecUnavailableError(RuntimeError):
-    """Raised when zvec is not installed or a collection cannot be opened."""
+    """Raised when the optional zvec package is not installed."""
 
 
 @dataclass(frozen=True)
 class SymbolDoc:
-    id: str
-    source: str
-    repo: str
-    commit: str
-    path: str
-    qname: str
-    kind: str
-    signature: str
-    start_line: int
-    end_line: int
-    text: str
+    """One lexical-search document for one Neo4j callable node."""
 
-
-@dataclass(frozen=True)
-class DocChunkDoc:
-    id: str
-    source: str
+    key: str
     repo: str
     commit: str
     path: str
@@ -55,21 +42,32 @@ def zvec_available() -> bool:
     return True
 
 
+def doc_id_for_key(key: str) -> str:
+    """Derive a fixed-width zvec-safe ID from a Neo4j key.
+
+    zvec limits document-id length, so the exact key is stored separately in
+    the mandatory scalar ``key`` field and is always used for graph joins.
+    """
+
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
 def ensure_collection(path: str | None = None):
+    """Open a collection, creating it only when its path is absent.
+
+    In particular, a corrupt or incompatible existing collection must not be
+    replaced by an empty one.  Those failures deliberately propagate to the
+    caller so an ingest cannot claim success with no searchable descriptions.
+    """
+
     zvec = _zvec()
-    collection_path = path or default_path()
-    try:
-        return zvec.open(
-            collection_path,
-            option=zvec.CollectionOption(read_only=False, enable_mmap=True),
-        )
-    except Exception:
-        Path(collection_path).parent.mkdir(parents=True, exist_ok=True)
-        return zvec.create_and_open(
-            path=collection_path,
-            schema=_schema(zvec),
-            option=zvec.CollectionOption(read_only=False, enable_mmap=True),
-        )
+    collection_path = Path(path or default_path())
+    option = zvec.CollectionOption(read_only=False, enable_mmap=True)
+    if collection_path.exists():
+        return zvec.open(str(collection_path), option=option)
+
+    collection_path.parent.mkdir(parents=True, exist_ok=True)
+    return zvec.create_and_open(path=str(collection_path), schema=_schema(zvec), option=option)
 
 
 def open_write(path: str | None = None):
@@ -78,45 +76,44 @@ def open_write(path: str | None = None):
 
 def open_read(path: str | None = None):
     zvec = _zvec()
-    try:
-        return zvec.open(
-            path or default_path(),
-            option=zvec.CollectionOption(read_only=True, enable_mmap=True),
-        )
-    except Exception as exc:
-        raise ZvecUnavailableError(str(exc)) from exc
+    return zvec.open(
+        path or default_path(),
+        option=zvec.CollectionOption(read_only=True, enable_mmap=True),
+    )
 
 
 def delete_repo(collection, repo: str) -> None:
     collection.delete_by_filter(f"repo = '{_filter_string(repo)}'")
 
 
-def delete_ids(collection, ids: set[str]) -> None:
-    for batch in _batches(sorted(ids), 100):
-        quoted = ", ".join(f"'{_filter_string(item)}'" for item in batch)
+def delete_repo_records(repo: str, *, zvec_path: str | None = None) -> None:
+    """Delete a repository's descriptions before deleting its graph nodes."""
+
+    collection = open_write(zvec_path)
+    delete_repo(collection, repo)
+    optimize_and_flush(collection)
+
+
+def optimize_and_flush(collection) -> None:
+    """Publish scalar and FTS mutations for a separate read-only process."""
+
+    collection.optimize()
+    collection.flush()
+
+
+def delete_keys(collection, keys: set[str]) -> None:
+    for batch in _batches(sorted(keys), 100):
+        quoted = ", ".join(f"'{_filter_string(key)}'" for key in batch)
         collection.delete_by_filter(f"key in ({quoted})")
 
 
-def delete_source(collection, source: str) -> None:
-    collection.delete_by_filter(f"source = '{_filter_string(source)}'")
-
-
 def upsert_symbol_docs(collection, docs: list[SymbolDoc]) -> int:
-    return _upsert_docs(collection, docs)
-
-
-def upsert_doc_chunks(collection, docs: list[DocChunkDoc]) -> int:
-    return _upsert_docs(collection, docs)
-
-
-def _upsert_docs(collection, docs: list[SymbolDoc] | list[DocChunkDoc]) -> int:
     zvec = _zvec()
     rows = [
         zvec.Doc(
-            id=doc.id,
+            id=doc_id_for_key(doc.key),
             fields={
-                "key": doc.id,
-                "source": doc.source,
+                "key": doc.key,
                 "repo": doc.repo,
                 "commit": doc.commit,
                 "path": doc.path,
@@ -137,7 +134,7 @@ def _upsert_docs(collection, docs: list[SymbolDoc] | list[DocChunkDoc]) -> int:
         statuses = [statuses]
     failed = [status for status in statuses if not status.ok()]
     if failed:
-        raise ZvecUnavailableError(f"zvec upsert failed for {len(failed)} document(s)")
+        raise RuntimeError(f"zvec upsert failed for {len(failed)} description record(s)")
     return len(rows)
 
 
@@ -152,7 +149,7 @@ def search_symbols(
     _zvec()
     from zvec.model.param.query import Fts, Query
 
-    filters = ["source = 'symbol'"]
+    filters = []
     if repo:
         filters.append(f"repo = '{_filter_string(repo)}'")
     if kind:
@@ -160,9 +157,9 @@ def search_symbols(
     docs = collection.query(
         queries=Query(field_name="text", fts=Fts(match_string=query)),
         topk=max(1, min(int(limit), 500)),
-        filter=" and ".join(filters),
+        filter=" and ".join(filters) or None,
         output_fields=[
-            "source",
+            "key",
             "repo",
             "commit",
             "path",
@@ -176,81 +173,29 @@ def search_symbols(
         include_vector=False,
     )
     return [
-        {
-            "id": doc.id,
-            "score": doc.score,
-            "fields": _doc_fields(doc),
-        }
+        {"key": str(_doc_fields(doc)["key"]), "score": doc.score, "fields": _doc_fields(doc)}
         for doc in docs
     ]
 
 
-def search_docs(
-    collection,
-    query: str,
-    *,
-    repo: str | None = None,
-    limit: int = 25,
-) -> list[dict[str, Any]]:
-    _zvec()
-    from zvec.model.param.query import Fts, Query
+def fetch_symbol_docs(collection, keys: set[str]) -> dict[str, dict[str, Any]]:
+    """Fetch requested descriptions by safe id, keyed by their Neo4j key.
 
-    filters = ["source = 'doc'"]
-    if repo:
-        filters.append(f"repo = '{_filter_string(repo)}'")
-    docs = collection.query(
-        queries=Query(field_name="text", fts=Fts(match_string=query)),
-        topk=max(1, min(int(limit), 500)),
-        filter=" and ".join(filters),
-        output_fields=[
-            "source",
-            "repo",
-            "commit",
-            "path",
-            "qname",
-            "kind",
-            "signature",
-            "start_line",
-            "end_line",
-            "text",
-        ],
+    zvec 0.5.1 cannot enumerate all documents with an empty query.  Liveness
+    therefore uses only deterministic ``fetch`` calls for known graph keys.
+    """
+
+    ids_by_key = {key: doc_id_for_key(key) for key in keys}
+    if not ids_by_key:
+        return {}
+    fetched = collection.fetch(
+        list(ids_by_key.values()),
+        output_fields=["key"],
         include_vector=False,
     )
-    return [
-        {
-            "id": doc.id,
-            "score": doc.score,
-            "fields": _doc_fields(doc),
-        }
-        for doc in docs
-    ]
-
-
-def list_symbol_ids(collection, *, repo: str | None = None, limit: int = 100000) -> set[str]:
-    return _list_source_ids(collection, source="symbol", repo=repo, limit=limit)
-
-
-def list_doc_ids(collection, *, repo: str | None = None, limit: int = 100000) -> set[str]:
-    return _list_source_ids(collection, source="doc", repo=repo, limit=limit)
-
-
-def _list_source_ids(
-    collection,
-    *,
-    source: str,
-    repo: str | None,
-    limit: int,
-) -> set[str]:
-    filters = [f"source = '{_filter_string(source)}'"]
-    if repo:
-        filters.append(f"repo = '{_filter_string(repo)}'")
-    docs = collection.query(
-        topk=max(1, min(int(limit), 100000)),
-        filter=" and ".join(filters),
-        output_fields=["repo"],
-        include_vector=False,
-    )
-    return {doc.id for doc in docs}
+    return {
+        key: _doc_fields(fetched[doc_id]) for key, doc_id in ids_by_key.items() if doc_id in fetched
+    }
 
 
 def _schema(zvec):
@@ -259,12 +204,6 @@ def _schema(zvec):
         fields=[
             zvec.FieldSchema(
                 "key",
-                zvec.DataType.STRING,
-                nullable=False,
-                index_param=zvec.InvertIndexParam(),
-            ),
-            zvec.FieldSchema(
-                "source",
                 zvec.DataType.STRING,
                 nullable=False,
                 index_param=zvec.InvertIndexParam(),
