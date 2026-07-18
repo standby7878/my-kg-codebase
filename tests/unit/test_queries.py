@@ -3,10 +3,13 @@ from __future__ import annotations
 import pytest
 
 from codekg.queries.code import (
+    SymbolResolutionError,
     find_callees,
     find_callers,
     find_dead_code,
+    get_class_hierarchy,
     get_complexity,
+    get_definition,
     search_symbols,
     trace_call_path,
 )
@@ -30,6 +33,25 @@ class FakeClient:
         return [{"ok": True}]
 
 
+class SelectorClient(FakeClient):
+    """Small query double that makes selector resolution explicit."""
+
+    def __init__(self, exact_rows=None, qname_rows=None) -> None:
+        super().__init__()
+        self.exact_rows = exact_rows or []
+        self.qname_rows = qname_rows or []
+
+    def execute_read(self, query, params=None, *, max_rows=1000):  # type: ignore[no-untyped-def]
+        self.calls.append((query, params or {}, max_rows))
+        if "codekg: exact-symbol-selector" in query:
+            if isinstance(self.exact_rows, dict):
+                return self.exact_rows.get((params or {})["identifier"], [])
+            return self.exact_rows
+        if "codekg: qname-symbol-selector" in query:
+            return self.qname_rows
+        return [{"ok": True}]
+
+
 def test_list_repositories_uses_read_query() -> None:
     client = FakeClient()
 
@@ -49,6 +71,7 @@ def test_search_symbols_caps_limit_and_filters_kind() -> None:
     assert "s:Method" in query
     assert params["fulltext_query"] == "backup"
     assert params["repo"] == "patroni"
+    assert params["commit"] is None
     assert params["limit"] == 500
     assert max_rows == 500
 
@@ -153,34 +176,127 @@ def test_search_symbols_lexical_omits_stale_hits_and_preserves_zvec_rank(monkeyp
     assert client.calls[0][1]["keys"] == ["stale", "two", "one"]
 
 
-def test_variable_depth_queries_inline_bounded_depth() -> None:
-    client = FakeClient()
-
-    find_callers("pkg.fn", depth=999, client=client)  # type: ignore[arg-type]
-    find_callees("pkg.fn", depth=999, client=client)  # type: ignore[arg-type]
-    trace_call_path("pkg.fn", "pkg.other", max_depth=999, client=client)  # type: ignore[arg-type]
-
-    caller_query = client.calls[0][0]
-    callee_query = client.calls[1][0]
-    trace_query = client.calls[2][0]
-    assert "[:CALLS*1..10]" in caller_query
-    assert "MATCH (callee:Function {qname: $qname})" in caller_query
-    assert "MATCH (callee:Method {qname: $qname})" in caller_query
-    assert "MATCH (caller:Function {qname: $qname})" in callee_query
-    assert "MATCH (caller:Method {qname: $qname})" in callee_query
-    assert "MATCH (source:Function {qname: $from_qname})" in trace_query
-    assert "MATCH (target:Method {qname: $to_qname})" in trace_query
-    assert trace_query.count("UNION") == 3
+def _symbol(key: str = "repo@abc:pkg.py:pkg.fn:1") -> dict[str, object]:
+    return {
+        "key": key,
+        "labels": ["Function"],
+        "name": "fn",
+        "qname": "pkg.fn",
+        "signature": "def fn()",
+        "start_line": 1,
+        "end_line": 2,
+        "cyclomatic": 1,
+        "file": "pkg.py",
+        "repo": "repo",
+        "commit": "abc",
+    }
 
 
-def test_find_dead_code_filters_module_pseudo_functions() -> None:
+def test_qname_selector_requires_repo_and_exact_key_never_falls_back() -> None:
+    client = SelectorClient(exact_rows=[_symbol()])
+
+    with pytest.raises(SymbolResolutionError, match="does not belong"):
+        get_definition("repo@abc:pkg.py:pkg.fn:1", repo="other", client=client)  # type: ignore[arg-type]
+
+    assert len(client.calls) == 1
+    assert "exact-symbol-selector" in client.calls[0][0]
+
+    with pytest.raises(SymbolResolutionError, match="requires an explicit repository"):
+        get_definition("pkg.fn", client=SelectorClient())  # type: ignore[arg-type]
+
+
+def test_qname_selector_reports_candidate_keys_for_ambiguity() -> None:
+    client = SelectorClient(
+        qname_rows=[_symbol("repo@abc:a.py:pkg.fn:1"), _symbol("repo@abc:b.py:pkg.fn:4")]
+    )
+
+    with pytest.raises(SymbolResolutionError, match="use one of these exact keys") as exc_info:
+        get_definition("pkg.fn", repo="repo", client=client)  # type: ignore[arg-type]
+
+    assert "repo@abc:a.py:pkg.fn:1" in str(exc_info.value)
+    assert "repo@abc:b.py:pkg.fn:4" in str(exc_info.value)
+
+
+def test_call_queries_use_authoritative_callsites_at_depth_one_and_projection_afterwards() -> None:
+    client = SelectorClient(exact_rows=[_symbol()])
+
+    find_callers("repo@abc:pkg.py:pkg.fn:1", depth=1, client=client)  # type: ignore[arg-type]
+    find_callees("repo@abc:pkg.py:pkg.fn:1", depth=2, client=client)  # type: ignore[arg-type]
+
+    callers_query = client.calls[1][0]
+    callees_query = client.calls[3][0]
+    assert "RESOLVES_TO" in callers_query
+    assert "HAS_CALLSITE" in callers_query
+    assert "[:EXACT_CALLS*1..2]" in callees_query
+    assert "RESOLVES_TO" not in callees_query
+    assert "node.key STARTS WITH $snapshot_prefix" in callees_query
+
+
+def test_trace_path_uses_keys_and_bounded_projection() -> None:
+    client = SelectorClient(
+        exact_rows={
+            "repo@abc:pkg.py:pkg.fn:1": [_symbol()],
+            "repo@abc:pkg.py:pkg.other:4": [_symbol("repo@abc:pkg.py:pkg.other:4")],
+        }
+    )
+
+    trace_call_path(
+        "repo@abc:pkg.py:pkg.fn:1",
+        "repo@abc:pkg.py:pkg.other:4",
+        max_depth=999,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    query, params, _ = client.calls[2]
+    assert "shortestPath" in query
+    assert "[:EXACT_CALLS*1..10]" in query
+    assert "{key: node.key, qname: node.qname}" in query
+    assert params["source_key"] == "repo@abc:pkg.py:pkg.fn:1"
+    assert params["target_key"] == "repo@abc:pkg.py:pkg.other:4"
+    assert params["snapshot_prefix"] == "repo@abc:"
+
+
+def test_trace_path_rejects_cross_snapshot_endpoints() -> None:
+    target = _symbol("other@def:pkg.py:pkg.other:4")
+    target["repo"] = "other"
+    target["commit"] = "def"
+    client = SelectorClient(
+        exact_rows={
+            "repo@abc:pkg.py:pkg.fn:1": [_symbol()],
+            "other@def:pkg.py:pkg.other:4": [target],
+        }
+    )
+
+    with pytest.raises(SymbolResolutionError, match="same repository and commit"):
+        trace_call_path(
+            "repo@abc:pkg.py:pkg.fn:1",
+            "other@def:pkg.py:pkg.other:4",
+            client=client,  # type: ignore[arg-type]
+        )
+
+
+def test_hierarchy_is_selected_by_key_and_confined_to_its_snapshot() -> None:
+    selected = _symbol("repo@abc:pkg.py:pkg.Child:4")
+    selected["labels"] = ["Type"]
+    client = SelectorClient(exact_rows=[selected])
+
+    get_class_hierarchy("repo@abc:pkg.py:pkg.Child:4", client=client)  # type: ignore[arg-type]
+
+    query, params, _ = client.calls[1]
+    assert "(t:Type {key: $key})" in query
+    assert "node.key STARTS WITH $snapshot_prefix" in query
+    assert params["snapshot_prefix"] == "repo@abc:"
+
+
+def test_find_dead_code_uses_authoritative_resolution_count() -> None:
     client = FakeClient()
 
     find_dead_code("sample", client=client)  # type: ignore[arg-type]
 
     query = client.calls[0][0]
-    assert "s.name <> '<module>'" in query
-    assert "AND NOT s.qname ENDS WITH '.__module__'" in query
+    assert "RESOLVES_TO" in query
+    assert "incoming_resolved_calls" in query
+    assert "CALLS" not in query
 
 
 def test_get_complexity_supports_top_n_mode() -> None:

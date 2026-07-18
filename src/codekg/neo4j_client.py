@@ -32,11 +32,17 @@ class Neo4jClient:
         username: str | None = None,
         password: str | None = None,
         database: str | None = None,
+        transaction_timeout_seconds: float | None = None,
     ) -> None:
         self.uri = uri or os.getenv("NEO4J_URI", DEFAULT_URI)
         self.username = username or os.getenv("NEO4J_USERNAME", DEFAULT_USERNAME)
         self.password = password or os.getenv("NEO4J_PASSWORD")
         self.database = database or os.getenv("NEO4J_DATABASE", DEFAULT_DATABASE)
+        self.transaction_timeout_seconds = (
+            transaction_timeout_seconds
+            if transaction_timeout_seconds is not None
+            else _optional_timeout_from_environment()
+        )
         if not self.password:
             raise CodeKGNeo4jError("NEO4J_PASSWORD must be set")
         self._driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
@@ -50,6 +56,8 @@ class Neo4jClient:
         params: Mapping[str, Any] | None = None,
         *,
         max_rows: int = 1000,
+        operation: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> list[dict[str, Any]]:
         params = dict(params or {})
         try:
@@ -68,14 +76,20 @@ class Neo4jClient:
                     result.consume()
                     return rows
 
+                timeout = _transaction_timeout(timeout_seconds, self.transaction_timeout_seconds)
+                if timeout is not None:
+                    work.timeout = timeout
                 return session.execute_read(work)
         except Neo4jError as exc:
-            raise CodeKGNeo4jError(str(exc)) from exc
+            raise _operation_error("read", operation, query, exc) from exc
 
     def execute_write(
         self,
         query: str,
         params: Mapping[str, Any] | None = None,
+        *,
+        operation: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> list[dict[str, Any]]:
         params = dict(params or {})
         try:
@@ -87,9 +101,12 @@ class Neo4jClient:
                     result.consume()
                     return rows
 
+                timeout = _transaction_timeout(timeout_seconds, self.transaction_timeout_seconds)
+                if timeout is not None:
+                    work.timeout = timeout
                 return session.execute_write(work)
         except Neo4jError as exc:
-            raise CodeKGNeo4jError(str(exc)) from exc
+            raise _operation_error("write", operation, query, exc) from exc
 
     def close(self) -> None:
         self._driver.close()
@@ -120,3 +137,38 @@ def close_client() -> None:
             return
         _client.close()
         _client = None
+
+
+def _optional_timeout_from_environment() -> float | None:
+    value = os.getenv("NEO4J_TRANSACTION_TIMEOUT_SECONDS")
+    if value is None or not value.strip():
+        return None
+    try:
+        timeout = float(value)
+    except ValueError as exc:
+        raise CodeKGNeo4jError(
+            "NEO4J_TRANSACTION_TIMEOUT_SECONDS must be a positive number of seconds"
+        ) from exc
+    if timeout <= 0:
+        raise CodeKGNeo4jError(
+            "NEO4J_TRANSACTION_TIMEOUT_SECONDS must be a positive number of seconds"
+        )
+    return timeout
+
+
+def _transaction_timeout(explicit: float | None, configured: float | None) -> float | None:
+    timeout = explicit if explicit is not None else configured
+    if timeout is not None and timeout <= 0:
+        raise ValueError("Neo4j transaction timeout must be positive")
+    return timeout
+
+
+def _operation_error(
+    mode: str,
+    operation: str | None,
+    query: str,
+    exc: Neo4jError,
+) -> CodeKGNeo4jError:
+    context = operation or "unnamed operation"
+    statement = " ".join(query.split())[:160]
+    return CodeKGNeo4jError(f"Neo4j {mode} failed during {context}: {exc}; query={statement!r}")

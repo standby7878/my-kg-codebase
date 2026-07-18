@@ -44,7 +44,8 @@ mcp = FastMCP(
     instructions=(
         "Read-only tools for querying the offline CodeKG Neo4j graph. "
         "Use list_repositories first when the repository name is unknown. "
-        "Prefer exact keys and qualified names returned by earlier tools."
+        "Use exact keys returned by earlier tools. Qualified-name selectors require repo, "
+        "and ambiguous qualified names return their candidate exact keys."
     ),
 )
 
@@ -65,102 +66,124 @@ def list_repositories() -> list[dict[str, Any]]:
         "Search indexed code symbols. mode='graph' searches Neo4j symbol names and "
         "qualified names. mode='lexical' searches zvec descriptions for indexed functions "
         "and methods, then resolves exact keys in Neo4j. Use this first when you do not "
-        "know the exact symbol key. Results are capped by the limit argument."
+        "know the exact symbol key. Results are capped by the limit argument and can be "
+        "restricted to one indexed commit."
     )
 )
 def search_symbols(
     q: Annotated[str, Field(description="Case-insensitive substring to search for.")],
     kind: Annotated[SymbolKind | None, Field(description="Optional symbol kind filter.")] = None,
     repo: Annotated[str | None, Field(description="Optional repository name filter.")] = None,
+    commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     mode: Annotated[
         SearchMode,
         Field(description="graph for Neo4j name search, lexical for zvec description search."),
     ] = "graph",
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 25,
 ) -> list[dict[str, Any]]:
-    return query_search_symbols(q, kind=kind, repo=repo, mode=mode, limit=limit)
+    return query_search_symbols(q, kind=kind, repo=repo, commit=commit, mode=mode, limit=limit)
 
 
 @mcp.tool(
     description=(
         "Return the definition metadata for one indexed symbol, including repository, "
-        "file path, line span, qualified name, signature, and symbol kind. Use an exact "
-        "symbol key or qualified name from search results."
+        "file path, line span, qualified name, signature, and symbol kind. Prefer an exact "
+        "symbol key. A qualified-name fallback requires repo and fails on ambiguity."
     )
 )
 def get_definition(
     identifier: Annotated[str, Field(description="Symbol key or qualified name.")],
-    repo: Annotated[str | None, Field(description="Optional repository name filter.")] = None,
+    repo: Annotated[str | None, Field(description="Required for qualified-name lookup.")] = None,
+    commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
 ) -> list[dict[str, Any]]:
-    return query_get_definition(identifier, repo=repo)
+    return query_get_definition(identifier, repo=repo, commit=commit)
 
 
 @mcp.tool(
     description=(
-        "Find symbols that call the given function or method. Traversal depth is bounded "
-        "and results are capped. Treat edges with resolution='heuristic' as approximate."
+        "Find symbols that call the selected function or method. Exact keys are preferred; "
+        "qualified names require repo. Depth 1 reads authoritative CallSite resolutions; "
+        "deeper traversal uses the dedicated EXACT_CALLS projection."
     )
 )
 def find_callers(
-    qname: Annotated[str, Field(description="Function or method qualified name.")],
+    identifier: Annotated[str, Field(description="Function or method key, or qualified name.")],
+    repo: Annotated[str | None, Field(description="Required for qualified-name lookup.")] = None,
+    commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS traversal depth.")] = 1,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
 ) -> list[dict[str, Any]]:
-    return query_find_callers(qname, depth=depth, limit=limit)
+    return query_find_callers(identifier, repo=repo, commit=commit, depth=depth, limit=limit)
 
 
 @mcp.tool(
     description=(
-        "Find symbols called by the given function or method. Traversal depth is bounded "
-        "and results are capped. Treat edges with resolution='heuristic' as approximate."
+        "Find symbols called by the selected function or method. Exact keys are preferred; "
+        "qualified names require repo. Depth 1 reads authoritative CallSite resolutions; "
+        "deeper traversal uses the dedicated EXACT_CALLS projection."
     )
 )
 def find_callees(
-    qname: Annotated[str, Field(description="Function or method qualified name.")],
+    identifier: Annotated[str, Field(description="Function or method key, or qualified name.")],
+    repo: Annotated[str | None, Field(description="Required for qualified-name lookup.")] = None,
+    commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS traversal depth.")] = 1,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
 ) -> list[dict[str, Any]]:
-    return query_find_callees(qname, depth=depth, limit=limit)
+    return query_find_callees(identifier, repo=repo, commit=commit, depth=depth, limit=limit)
 
 
 @mcp.tool(
     description=(
-        "Find a bounded call path between two functions or methods. Use exact qualified "
-        "names or keys. Returns no path when the graph cannot prove a connection within "
-        "max_depth."
+        "Find a bounded call path between two functions or methods. Prefer exact keys; "
+        "qualified-name endpoints require repo. The returned path contains exact key/qname "
+        "pairs and uses only EXACT_CALLS projections."
     )
 )
 def trace_call_path(
-    from_qname: Annotated[str, Field(description="Source function or method qualified name.")],
-    to_qname: Annotated[str, Field(description="Target function or method qualified name.")],
+    from_identifier: Annotated[str, Field(description="Source function or method key/qname.")],
+    to_identifier: Annotated[str, Field(description="Target function or method key/qname.")],
+    repo: Annotated[str | None, Field(description="Required for qualified-name endpoints.")] = None,
+    commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     max_depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS path depth.")] = 8,
     limit: Annotated[int, Field(ge=1, le=10, description="Maximum paths to return.")] = 5,
 ) -> list[dict[str, Any]]:
-    return query_trace_call_path(from_qname, to_qname, max_depth=max_depth, limit=limit)
+    return query_trace_call_path(
+        from_identifier,
+        to_identifier,
+        repo=repo,
+        commit=commit,
+        max_depth=max_depth,
+        limit=limit,
+    )
 
 
 @mcp.tool(
     description=(
-        "List files that import the requested module qualified name. Results are capped "
-        "and grouped by repository and file path."
+        "List files that import the selected module. Module keys are exact; module qualified "
+        "names require repo. Results are capped and grouped by repository and file path."
     )
 )
 def find_importers(
-    module_qname: Annotated[str, Field(description="Imported module qualified name.")],
-    repo: Annotated[str | None, Field(description="Optional repository name filter.")] = None,
+    module_identifier: Annotated[str, Field(description="Imported module key or qualified name.")],
+    repo: Annotated[str | None, Field(description="Required for qualified-name lookup.")] = None,
+    commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 100,
 ) -> list[dict[str, Any]]:
-    return query_find_importers(module_qname, repo=repo, limit=limit)
+    return query_find_importers(module_identifier, repo=repo, commit=commit, limit=limit)
 
 
 @mcp.tool(
     description=(
-        "Return ancestors or descendants of a type through inheritance and interface "
-        "relationships. Direction must be explicit. Results are bounded."
+        "Return ancestors or descendants of a selected type through inheritance and interface "
+        "relationships. Exact keys are preferred; qualified names require repo. Direction "
+        "must be explicit and results are bounded."
     )
 )
 def get_class_hierarchy(
-    type_qname: Annotated[str, Field(description="Type qualified name.")],
+    identifier: Annotated[str, Field(description="Type key or qualified name.")],
+    repo: Annotated[str | None, Field(description="Required for qualified-name lookup.")] = None,
+    commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     direction: Annotated[
         HierarchyDirection,
         Field(description="Use ancestors for base types or descendants for subtypes."),
@@ -168,27 +191,36 @@ def get_class_hierarchy(
     depth: Annotated[int, Field(ge=1, le=10, description="Maximum hierarchy depth.")] = 5,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
 ) -> list[dict[str, Any]]:
-    return query_get_class_hierarchy(type_qname, direction=direction, depth=depth, limit=limit)
+    return query_get_class_hierarchy(
+        identifier,
+        repo=repo,
+        commit=commit,
+        direction=direction,
+        depth=depth,
+        limit=limit,
+    )
 
 
 @mcp.tool(
     description=(
-        "List callable symbols in a repository with no inbound call edges. Excludes known "
-        "entry points when entry-point metadata is available. Results are candidates, not "
-        "confirmed dead code."
+        "List callable symbols in a repository with no inbound authoritative CallSite "
+        "resolution. Results include incoming_resolved_calls and are unreferenced candidates, "
+        "not confirmed dead code."
     )
 )
 def find_dead_code(
     repo: Annotated[str, Field(description="Repository name.")],
+    commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 100,
 ) -> list[dict[str, Any]]:
-    return query_find_dead_code(repo, limit=limit)
+    return query_find_dead_code(repo, commit=commit, limit=limit)
 
 
 @mcp.tool(
     description=(
         "Return cyclomatic complexity for one symbol, or the most complex symbols in a "
-        "repository when a top-N request is provided."
+        "repository when a top-N request is provided. An identifier is exact-key-first; "
+        "qualified-name lookup requires repo."
     )
 )
 def get_complexity(
@@ -197,12 +229,13 @@ def get_complexity(
         Field(description="Optional symbol key or qualified name for a single symbol."),
     ] = None,
     repo: Annotated[str | None, Field(description="Optional repository name filter.")] = None,
+    commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     top_n: Annotated[
         int | None,
         Field(ge=1, le=500, description="Return the top N most complex callables."),
     ] = 25,
 ) -> list[dict[str, Any]]:
-    return query_get_complexity(identifier, repo=repo, top_n=top_n)
+    return query_get_complexity(identifier, repo=repo, commit=commit, top_n=top_n)
 
 
 def main() -> None:

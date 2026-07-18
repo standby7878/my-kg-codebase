@@ -11,6 +11,7 @@ pytestmark = pytest.mark.unit
 async def test_mcp_registers_exactly_ten_tools() -> None:
     tools = await mcp.get_tools()
 
+    assert len(tools) == 10
     assert sorted(tools) == [
         "find_callees",
         "find_callers",
@@ -23,3 +24,7 @@ async def test_mcp_registers_exactly_ten_tools() -> None:
         "search_symbols",
         "trace_call_path",
     ]
+    assert all(tool.description for tool in tools.values())
+    assert "exact symbol key" in tools["get_definition"].description.lower()
+    assert "callsite" in tools["find_callers"].description.lower()
+    assert "unreferenced candidates" in tools["find_dead_code"].description.lower()

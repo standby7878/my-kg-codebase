@@ -46,7 +46,7 @@ markers = [
 target-version = "py312"
 line-length = 100
 src = ["src", "tests"]
-exclude = ["third_party"]
+exclude = ["third_party", "tests/fixtures/structural_phase1/syntax_error.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

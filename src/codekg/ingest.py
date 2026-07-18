@@ -4,6 +4,7 @@ import ast
 import hashlib
 import subprocess
 from collections.abc import Iterable
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from codekg.docs import resolve_markdown_descriptions
@@ -12,6 +13,8 @@ from codekg.ir import (
     FileIR,
     ImportIR,
     InheritanceIR,
+    ModuleInitIR,
+    ParseDiagnosticIR,
     RepositoryIR,
     SymbolIR,
 )
@@ -45,28 +48,27 @@ SKIP_DIRS = {
 }
 
 
+@dataclass(frozen=True)
+class _LexicalScope:
+    """A lexical declaration scope used to construct Python qualified names."""
+
+    kind: str
+    qname: str
+
+
 class _PythonExtractor(ast.NodeVisitor):
-    def __init__(self, path: str, module_qname: str) -> None:
+    def __init__(self, path: str, module_qname: str, source: str) -> None:
         self.path = path
         self.module_qname = module_qname
+        self.source = source
         self.imports: list[ImportIR] = []
         self.symbols: list[SymbolIR] = []
         self.inheritance: list[InheritanceIR] = []
         self.calls: list[CallIR] = []
-        self._class_stack: list[str] = []
-        self._function_stack: list[str] = []
+        self._scope_stack: list[_LexicalScope] = []
         self._module_callable_qname = f"{module_qname}.__module__"
         self._callable_stack: list[str] = [self._module_callable_qname]
-        self.symbols.append(
-            SymbolIR(
-                kind="function",
-                name="<module>",
-                qname=self._module_callable_qname,
-                signature="<module>",
-                start_line=1,
-                end_line=1,
-            )
-        )
+        self._call_ordinal = 0
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -80,7 +82,7 @@ class _PythonExtractor(ast.NodeVisitor):
             self.imports.append(ImportIR(module=module, name=alias.name, alias=alias.asname))
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        qname = ".".join([self.module_qname, *self._class_stack, node.name])
+        qname = self._child_qname(node.name)
         self.symbols.append(
             SymbolIR(
                 kind="type",
@@ -102,9 +104,24 @@ class _PythonExtractor(ast.NodeVisitor):
                         base_qname=base_qname,
                     )
                 )
-        self._class_stack.append(node.name)
-        self.generic_visit(node)
-        self._class_stack.pop()
+        # Class decorators, bases, keywords, and body expressions are evaluated
+        # while creating the class, not while calling one of its methods.  There
+        # is no separate class-runtime graph node, so retain their enclosing
+        # callable (or ModuleInit) attribution while using the lexical class
+        # scope for names declared in the body.
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for base in node.bases:
+            self.visit(base)
+        for keyword in node.keywords:
+            self.visit(keyword.value)
+        for type_param in getattr(node, "type_params", ()):
+            self.visit(type_param)
+
+        self._scope_stack.append(_LexicalScope(kind="class", qname=qname))
+        for statement in node.body:
+            self.visit(statement)
+        self._scope_stack.pop()
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._visit_function(node, is_async=False)
@@ -114,17 +131,22 @@ class _PythonExtractor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         if self._callable_stack:
-            callee_name, callee_qname, receiver = self._callee_from_expr(node.func)
-            if callee_name:
-                self.calls.append(
-                    CallIR(
-                        caller_qname=self._callable_stack[-1],
-                        callee_name=callee_name,
-                        callee_qname=callee_qname,
-                        receiver=receiver,
-                        line=node.lineno,
-                    )
+            callee_name, callee_qname_hint, receiver_kind = self._callee_from_expr(node.func)
+            self._call_ordinal += 1
+            self.calls.append(
+                CallIR(
+                    owner_qname=self._callable_stack[-1],
+                    raw_callee=self._source_for(node.func),
+                    callee_name=callee_name,
+                    callee_qname_hint=callee_qname_hint,
+                    receiver_kind=receiver_kind,
+                    start_line=node.lineno,
+                    start_column=node.col_offset,
+                    end_line=getattr(node, "end_lineno", node.lineno),
+                    end_column=getattr(node, "end_col_offset", node.col_offset),
+                    ordinal=self._call_ordinal,
                 )
+            )
         self.generic_visit(node)
 
     def _visit_function(
@@ -133,17 +155,10 @@ class _PythonExtractor(ast.NodeVisitor):
         *,
         is_async: bool,
     ) -> None:
-        parent_qname = (
-            ".".join([self.module_qname, *self._class_stack])
-            if self._class_stack and not self._function_stack
-            else None
-        )
-        parts = [self.module_qname, *self._class_stack, *self._function_stack]
-        if self._function_stack:
-            parts.append("<locals>")
-        parts.append(node.name)
-        qname = ".".join(parts)
-        kind = "method" if self._class_stack and not self._function_stack else "function"
+        parent = self._scope_stack[-1] if self._scope_stack else None
+        parent_qname = parent.qname if parent and parent.kind == "class" else None
+        qname = self._child_qname(node.name)
+        kind = "method" if parent and parent.kind == "class" else "function"
         prefix = "async " if is_async else ""
         self.symbols.append(
             SymbolIR(
@@ -158,28 +173,95 @@ class _PythonExtractor(ast.NodeVisitor):
                 docstring=ast.get_docstring(node, clean=True),
             )
         )
-        self._function_stack.append(node.name)
-        self._callable_stack.append(qname)
-        self.generic_visit(node)
-        self._callable_stack.pop()
-        self._function_stack.pop()
+        # These expressions execute when the function is defined.  Visiting
+        # them before installing the new callable scope prevents decorator,
+        # default, and annotation calls from being attributed to the function
+        # body that has not executed yet.
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        self.visit(node.args)
+        if node.returns is not None:
+            self.visit(node.returns)
+        for type_param in getattr(node, "type_params", ()):
+            self.visit(type_param)
 
-    def _callee_from_expr(self, node: ast.expr) -> tuple[str | None, str | None, str | None]:
+        self._scope_stack.append(_LexicalScope(kind="function", qname=qname))
+        self._callable_stack.append(qname)
+        for statement in node.body:
+            self.visit(statement)
+        self._callable_stack.pop()
+        self._scope_stack.pop()
+
+    def _child_qname(self, name: str) -> str:
+        if not self._scope_stack:
+            return f"{self.module_qname}.{name}"
+        parent = self._scope_stack[-1]
+        separator = ".<locals>." if parent.kind == "function" else "."
+        return f"{parent.qname}{separator}{name}"
+
+    def _nearest_class_qname(self) -> str | None:
+        for scope in reversed(self._scope_stack):
+            if scope.kind == "class":
+                return scope.qname
+        return None
+
+    def _callee_from_expr(
+        self, node: ast.expr
+    ) -> tuple[
+        str | None,
+        str | None,
+        str,
+    ]:
         if isinstance(node, ast.Name):
-            return node.id, f"{self.module_qname}.{node.id}", None
+            return node.id, f"{self.module_qname}.{node.id}", "none"
         if not isinstance(node, ast.Attribute):
-            return None, None, None
+            return None, None, "dynamic"
 
         chain = _attribute_chain(node)
         if not chain:
-            return node.attr, None, None
+            if _is_super_call(node.value):
+                return node.attr, None, "super"
+            return node.attr, None, "dynamic"
 
-        receiver = chain[0] if len(chain) > 1 else None
-        if receiver in {"self", "cls"} and self._class_stack:
-            qname = ".".join([self.module_qname, *self._class_stack, node.attr])
+        receiver = chain[0]
+        if receiver in {"self", "cls"}:
+            owner_qname = self._nearest_class_qname()
+            qname = f"{owner_qname}.{node.attr}" if owner_qname else None
             return node.attr, qname, receiver
 
-        return node.attr, ".".join(chain), receiver
+        if len(chain) == 2 and receiver in self._imported_names():
+            return node.attr, ".".join(chain), "name"
+        return node.attr, ".".join(chain), "attribute"
+
+    def _imported_names(self) -> set[str]:
+        names: set[str] = set()
+        for import_ir in self.imports:
+            if import_ir.alias:
+                names.add(import_ir.alias)
+            else:
+                names.add(import_ir.name)
+                names.add(import_ir.module.split(".", maxsplit=1)[0])
+        return names
+
+    def call_sites(self) -> tuple[CallIR, ...]:
+        ordered = sorted(
+            self.calls,
+            key=lambda call: (
+                call.start_line,
+                call.start_column,
+                call.ordinal,
+            ),
+        )
+        return tuple(replace(call, ordinal=index) for index, call in enumerate(ordered, start=1))
+
+    def _source_for(self, node: ast.AST) -> str:
+        source = ast.get_source_segment(self.source, node)
+        if source:
+            return source
+        try:
+            return ast.unparse(node)
+        except (AttributeError, ValueError):
+            return type(node).__name__
 
     def _base_from_expr(self, node: ast.expr) -> tuple[str | None, str | None]:
         if isinstance(node, ast.Name):
@@ -316,22 +398,44 @@ def _scan_file(root: Path, path: Path) -> FileIR:
     if language != "python":
         return FileIR(path=rel_path, language=language, loc=loc, module_qname=module_qname)
 
+    module_init = ModuleInitIR(
+        qname=f"{module_qname}.__module__",
+        start_line=1,
+        end_line=max(1, loc),
+    )
     try:
         tree = ast.parse(text, filename=rel_path)
-    except SyntaxError:
-        return FileIR(path=rel_path, language=language, loc=loc, module_qname=module_qname)
+    except SyntaxError as error:
+        return FileIR(
+            path=rel_path,
+            language=language,
+            loc=loc,
+            module_qname=module_qname,
+            module_init=module_init,
+            parse_status="error",
+            diagnostics=(
+                ParseDiagnosticIR(
+                    category="syntax_error",
+                    severity="error",
+                    line=error.lineno,
+                    column=error.offset,
+                    message=error.msg,
+                ),
+            ),
+        )
 
-    extractor = _PythonExtractor(rel_path, module_qname)
+    extractor = _PythonExtractor(rel_path, module_qname, text)
     extractor.visit(tree)
     return FileIR(
         path=rel_path,
         language=language,
         loc=loc,
         module_qname=module_qname,
+        module_init=module_init,
         imports=tuple(extractor.imports),
         symbols=tuple(extractor.symbols),
         inheritance=tuple(extractor.inheritance),
-        calls=tuple(extractor.calls),
+        calls=extractor.call_sites(),
     )
 
 
@@ -366,6 +470,12 @@ def _attribute_chain(node: ast.expr) -> list[str]:
     else:
         return []
     return list(reversed(parts))
+
+
+def _is_super_call(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "super"
+    )
 
 
 def _cyclomatic(node: ast.AST) -> int:

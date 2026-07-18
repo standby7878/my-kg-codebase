@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -13,11 +14,16 @@ class ImportIR:
 
 @dataclass(frozen=True)
 class CallIR:
-    caller_qname: str
-    callee_name: str
-    callee_qname: str | None = None
-    receiver: str | None = None
-    line: int = 0
+    owner_qname: str
+    raw_callee: str
+    callee_name: str | None
+    callee_qname_hint: str | None
+    receiver_kind: Literal["none", "name", "self", "cls", "super", "attribute", "dynamic"]
+    start_line: int
+    start_column: int
+    end_line: int
+    end_column: int
+    ordinal: int
 
 
 @dataclass(frozen=True)
@@ -41,11 +47,32 @@ class SymbolIR:
 
 
 @dataclass(frozen=True)
+class ModuleInitIR:
+    """The executable module scope for top-level statements and calls."""
+
+    qname: str
+    start_line: int
+    end_line: int
+
+
+@dataclass(frozen=True)
+class ParseDiagnosticIR:
+    category: Literal["syntax_error"]
+    severity: Literal["error"]
+    line: int | None
+    column: int | None
+    message: str
+
+
+@dataclass(frozen=True)
 class FileIR:
     path: str
     language: str
     loc: int
     module_qname: str
+    module_init: ModuleInitIR | None = None
+    parse_status: Literal["ok", "error"] = "ok"
+    diagnostics: tuple[ParseDiagnosticIR, ...] = ()
     imports: tuple[ImportIR, ...] = ()
     symbols: tuple[SymbolIR, ...] = ()
     inheritance: tuple[InheritanceIR, ...] = ()

@@ -64,3 +64,29 @@ def delete_repository(repo_name: str) -> None:
     delete_repo_records(repo_name)
     deleted = delete_repository_by_name(repo_name)
     console.print({"repo_name": repo_name, "deleted": deleted})
+
+
+@app.command("evaluate")
+def evaluate(
+    manifest: Path = Path("evaluation/corpora.json"),
+    output: Path = Path("evaluation/report.json"),
+    project_root: Path = Path("."),
+    zvec_root: Path = Path(".codekg-evaluation-zvec"),
+    require_pins: bool = typer.Option(
+        False,
+        "--require-pins",
+        help="Require an external pin environment value when an optional corpus path is set.",
+    ),
+) -> None:
+    """Run pinned local corpora through Neo4j and isolated zvec indexes."""
+
+    from codekg.evaluation import run_evaluation, write_report
+
+    report = run_evaluation(
+        manifest.resolve(),
+        project_root=project_root.resolve(),
+        zvec_root=zvec_root.resolve(),
+        require_pins=require_pins,
+    )
+    write_report(report, output.resolve())
+    console.print(report["summary"])

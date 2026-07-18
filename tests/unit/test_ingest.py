@@ -46,28 +46,40 @@ def test_scan_repository_extracts_python_symbols(tmp_path: Path) -> None:
 
     worker_file = next(file for file in repo.files if file.path == "worker.py")
     assert worker_file.language == "python"
+    assert worker_file.module_init is not None
+    assert worker_file.module_init.qname == "worker.__module__"
     assert [symbol.qname for symbol in worker_file.symbols] == [
-        "worker.__module__",
         "worker.BaseWorker",
         "worker.Worker",
         "worker.Worker.run",
         "worker.build",
     ]
-    assert worker_file.symbols[3].kind == "method"
-    assert worker_file.symbols[3].cyclomatic == 2
+    assert worker_file.symbols[2].kind == "method"
+    assert worker_file.symbols[2].cyclomatic == 2
     inheritance = [
         (edge.type_qname, edge.base_name, edge.base_qname) for edge in worker_file.inheritance
     ]
     assert inheritance == [("worker.Worker", "BaseWorker", "worker.BaseWorker")]
     assert {import_ir.module for import_ir in worker_file.imports} == {"os", "pathlib"}
-    calls = [(call.caller_qname, call.callee_name, call.callee_qname) for call in worker_file.calls]
-    assert calls == [
-        ("worker.Worker.run", "Path", "worker.Path"),
-        ("worker.Worker.run", "getcwd", "os.getcwd"),
-        ("worker.build", "Worker", "worker.Worker"),
-        ("worker.build", "run", "worker.run"),
-        ("worker.__module__", "build", "worker.build"),
+    calls = [
+        (call.owner_qname, call.raw_callee, call.callee_name, call.callee_qname_hint)
+        for call in worker_file.calls
     ]
+    assert calls == [
+        ("worker.Worker.run", "Path", "Path", "worker.Path"),
+        ("worker.Worker.run", "os.getcwd", "getcwd", "os.getcwd"),
+        ("worker.build", "Worker", "Worker", "worker.Worker"),
+        ("worker.build", "worker.run", "run", "worker.run"),
+        ("worker.__module__", "build", "build", "worker.build"),
+    ]
+    assert [call.receiver_kind for call in worker_file.calls] == [
+        "none",
+        "name",
+        "none",
+        "attribute",
+        "none",
+    ]
+    assert [call.ordinal for call in worker_file.calls] == [1, 2, 3, 4, 5]
 
 
 def test_scan_repository_extracts_docstrings_and_markdown_descriptions(tmp_path: Path) -> None:
@@ -85,7 +97,7 @@ def test_scan_repository_extracts_docstrings_and_markdown_descriptions(tmp_path:
     repo = scan_repository(repo_root)
 
     worker_file = next(file for file in repo.files if file.path == "worker.py")
-    assert worker_file.symbols[1].docstring == "Create a worker from the configured defaults."
+    assert worker_file.symbols[0].docstring == "Create a worker from the configured defaults."
     assert repo.markdown_descriptions == {
         "worker.build": ("# Usage\nCall `worker.build` to create a worker.",)
     }
@@ -157,12 +169,61 @@ def test_scan_repository_resolves_relative_imports_and_nested_function_qnames(
         ("sample.helpers", "helper"),
     ]
     assert [symbol.qname for symbol in worker_file.symbols] == [
-        "sample.worker.__module__",
         "sample.worker.outer_one",
         "sample.worker.outer_one.<locals>.inner",
         "sample.worker.outer_two",
         "sample.worker.outer_two.<locals>.inner",
     ]
+
+
+def test_scan_repository_retains_all_call_sites_and_syntax_diagnostics(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "calls.py").write_text(
+        "def run():\n"
+        "    first(second())\n"
+        "    self.save()\n"
+        "    cls.create()\n"
+        "    super().close()\n"
+        "    object.attr.work()\n",
+        encoding="utf-8",
+    )
+    (repo_root / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+
+    repo = scan_repository(repo_root)
+
+    calls_file = next(file for file in repo.files if file.path == "calls.py")
+    assert calls_file.parse_status == "ok"
+    assert calls_file.diagnostics == ()
+    assert calls_file.module_init is not None
+    assert [(call.raw_callee, call.ordinal) for call in calls_file.calls] == [
+        ("first", 1),
+        ("second", 2),
+        ("self.save", 3),
+        ("cls.create", 4),
+        ("super().close", 5),
+        ("super", 6),
+        ("object.attr.work", 7),
+    ]
+    assert [call.receiver_kind for call in calls_file.calls] == [
+        "none",
+        "none",
+        "self",
+        "cls",
+        "super",
+        "none",
+        "attribute",
+    ]
+    assert all(call.start_line <= call.end_line for call in calls_file.calls)
+
+    broken_file = next(file for file in repo.files if file.path == "broken.py")
+    assert broken_file.module_init is not None
+    assert broken_file.parse_status == "error"
+    assert broken_file.symbols == ()
+    assert broken_file.calls == ()
+    assert broken_file.diagnostics[0].category == "syntax_error"
+    assert broken_file.diagnostics[0].severity == "error"
+    assert broken_file.diagnostics[0].line == 1
 
 
 def test_replace_index_removes_previous_zvec_keys_before_graph_load(

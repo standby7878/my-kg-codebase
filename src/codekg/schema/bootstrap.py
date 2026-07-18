@@ -11,6 +11,12 @@ BOOTSTRAP_CYPHER = [
     "CREATE CONSTRAINT method_key IF NOT EXISTS FOR (n:Method) REQUIRE n.key IS UNIQUE",
     "CREATE CONSTRAINT type_key IF NOT EXISTS FOR (n:Type) REQUIRE n.key IS UNIQUE",
     "CREATE CONSTRAINT module_key IF NOT EXISTS FOR (n:Module) REQUIRE n.key IS UNIQUE",
+    "CREATE CONSTRAINT module_init_key IF NOT EXISTS FOR (n:ModuleInit) REQUIRE n.key IS UNIQUE",
+    "CREATE CONSTRAINT call_site_key IF NOT EXISTS FOR (n:CallSite) REQUIRE n.key IS UNIQUE",
+    (
+        "CREATE CONSTRAINT parse_diagnostic_key IF NOT EXISTS "
+        "FOR (n:ParseDiagnostic) REQUIRE n.key IS UNIQUE"
+    ),
     "CREATE CONSTRAINT reference_key IF NOT EXISTS FOR (n:Reference) REQUIRE n.key IS UNIQUE",
     "CREATE INDEX repository_name IF NOT EXISTS FOR (n:Repository) ON (n.repo_name)",
     "CREATE INDEX file_path IF NOT EXISTS FOR (n:File) ON (n.path)",
@@ -21,6 +27,9 @@ BOOTSTRAP_CYPHER = [
     "CREATE INDEX type_name IF NOT EXISTS FOR (n:Type) ON (n.name)",
     "CREATE INDEX type_qname IF NOT EXISTS FOR (n:Type) ON (n.qname)",
     "CREATE INDEX module_name IF NOT EXISTS FOR (n:Module) ON (n.name)",
+    "CREATE INDEX module_init_qname IF NOT EXISTS FOR (n:ModuleInit) ON (n.qname)",
+    "CREATE INDEX call_site_owner_key IF NOT EXISTS FOR (n:CallSite) ON (n.owner_key)",
+    "CREATE INDEX call_site_status IF NOT EXISTS FOR (n:CallSite) ON (n.status)",
     """
     CREATE FULLTEXT INDEX code_symbol_search IF NOT EXISTS
     FOR (n:Function|Method|Type)
