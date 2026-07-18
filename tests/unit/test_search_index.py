@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import codekg.zvec_store as zvec_store
 from codekg.ir import FileIR, RepositoryIR, SymbolIR
 from codekg.search_index import (
     build_symbol_text,
@@ -108,6 +109,36 @@ def test_build_symbol_text_never_reparses_comments() -> None:
     assert "choose standby" in text
     assert "newest WAL" in text
     assert "reliable standby" in text
+
+
+def test_upsert_symbol_docs_batches_at_zvec_write_limit(monkeypatch) -> None:
+    class FakeDoc:
+        def __init__(self, *, id, fields):
+            self.id = id
+            self.fields = fields
+
+    class FakeZvec:
+        Doc = FakeDoc
+
+    class FakeStatus:
+        def ok(self) -> bool:
+            return True
+
+    class FakeCollection:
+        def __init__(self):
+            self.batch_sizes = []
+
+        def upsert(self, docs):
+            self.batch_sizes.append(len(docs))
+            return [FakeStatus() for _ in docs]
+
+    collection = FakeCollection()
+    monkeypatch.setattr(zvec_store, "_zvec", lambda: FakeZvec())
+
+    docs = [_doc(key=f"sample@abc:worker.py:worker_{index}:7") for index in range(1025)]
+
+    assert upsert_symbol_docs(collection, docs) == 1025
+    assert collection.batch_sizes == [1024, 1]
 
 
 def test_real_zvec_fts_and_safe_key_liveness(tmp_path) -> None:

@@ -32,6 +32,17 @@ Run the test suites individually or together:
 .venv/bin/python -m pytest -q     # full pytest suite
 ```
 
+For a quick check of the bulk-ingestion implementation and its command-line
+surface, run the focused tests:
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/unit/test_bulk_export.py \
+  tests/unit/test_bulk_import.py \
+  tests/unit/test_cli.py \
+  tests/unit/test_run_compose.py
+```
+
 Validate Compose configuration before starting services, and build the image:
 
 ```bash
@@ -104,13 +115,38 @@ CODEKG_REPOS_ROOT=/work/codekg-corpus/service-a;/work/codekg-corpus/service-b
 
 Build the local image, start Neo4j plus the HTTP MCP server, then index every
 configured repository. Indexing is an operator action; MCP clients cannot
-trigger it.
+trigger it. `index-sources` defaults to the staged bulk path (`--mode auto`):
+it exports the full configured corpus to CSV, creates a new Neo4j store with
+`neo4j-admin database import full`, builds the matching zvec index, validates
+the callable keys, and then publishes the new generation. The running graph is
+left in place if export, import, schema setup, or validation fails.
 
 ```bash
 bash run-compose.sh dev-local build
 bash run-compose.sh dev-local start
 bash run-compose.sh dev-local index-sources
 ```
+
+Use the explicit transactional mode only for a targeted update or operational
+debugging. It performs the existing batched Cypher writes and is not an
+automatic fallback for a failed bulk import:
+
+```bash
+bash run-compose.sh dev-local index-sources --mode transactional
+```
+
+Use `--mode bulk` when a CI or operational run must require the offline import
+path:
+
+```bash
+bash run-compose.sh dev-local index-sources --mode bulk
+```
+
+The active graph, zvec, log, and CSV-staging volume names are recorded in the
+ignored `compose/dev-local/runtime.env` pointer file. This makes the bulk CSVs
+available for diagnosis after a failed run without replacing the active
+generation. Treat generation volumes as immutable; inspect or remove them only
+after confirming that they are not the active generation.
 
 Confirm that every intended repository was indexed:
 

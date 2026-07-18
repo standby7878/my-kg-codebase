@@ -28,6 +28,51 @@
       "pin": {
         "git_commit_env": "CODEKG_EVAL_EXTERNAL_COMMIT"
       }
+    },
+    {
+      "id": "requests",
+      "kind": "external",
+      "path_env": "CODEKG_REQUESTS_PATH",
+      "required": false,
+      "pin": {
+        "git_commit": "f361ead047be5cb873174218582f7d8b9fcd9f49"
+      }
+    },
+    {
+      "id": "click",
+      "kind": "external",
+      "path_env": "CODEKG_CLICK_PATH",
+      "required": false,
+      "pin": {
+        "git_commit": "333c28d79cd982990ee98eef61ec20ab1a4f38ba"
+      }
+    },
+    {
+      "id": "sqlalchemy-engine",
+      "kind": "external",
+      "path_env": "CODEKG_SQLALCHEMY_ENGINE_PATH",
+      "required": false,
+      "pin": {
+        "git_commit": "13cbc1af77e11c908ddd798be6941e995356e1a1"
+      }
+    },
+    {
+      "id": "sqlalchemy-pool",
+      "kind": "external",
+      "path_env": "CODEKG_SQLALCHEMY_POOL_PATH",
+      "required": false,
+      "pin": {
+        "git_commit": "13cbc1af77e11c908ddd798be6941e995356e1a1"
+      }
+    },
+    {
+      "id": "sqlalchemy-sql",
+      "kind": "external",
+      "path_env": "CODEKG_SQLALCHEMY_SQL_PATH",
+      "required": false,
+      "pin": {
+        "git_commit": "13cbc1af77e11c908ddd798be6941e995356e1a1"
+      }
     }
   ]
 }

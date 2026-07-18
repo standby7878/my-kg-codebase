@@ -8,6 +8,7 @@ from typing import Any
 
 DEFAULT_ZVEC_PATH = "/data/zvec/codekg"
 COLLECTION_NAME = "codekg"
+ZVEC_MAX_WRITE_BATCH_SIZE = 1024
 
 
 class ZvecUnavailableError(RuntimeError):
@@ -129,13 +130,16 @@ def upsert_symbol_docs(collection, docs: list[SymbolDoc]) -> int:
     ]
     if not rows:
         return 0
-    statuses = collection.upsert(rows)
-    if not isinstance(statuses, list):
-        statuses = [statuses]
-    failed = [status for status in statuses if not status.ok()]
-    if failed:
-        raise RuntimeError(f"zvec upsert failed for {len(failed)} description record(s)")
-    return len(rows)
+    total = 0
+    for batch in _batches(rows, ZVEC_MAX_WRITE_BATCH_SIZE):
+        statuses = collection.upsert(batch)
+        if not isinstance(statuses, list):
+            statuses = [statuses]
+        failed = [status for status in statuses if not status.ok()]
+        if failed:
+            raise RuntimeError(f"zvec upsert failed for {len(failed)} description record(s)")
+        total += len(batch)
+    return total
 
 
 def search_symbols(

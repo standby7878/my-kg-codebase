@@ -9,3 +9,4 @@ third_party/*
 !third_party/wheels/zvec-0.5.1-*.whl
 AGENTS.md
 project_export*.txt
+compose/dev-local/runtime.env

@@ -7,6 +7,17 @@ services:
       dockerfile: docker/app.Dockerfile
     image: codekg-app:local
 
+  bulk-importer:
+    build:
+      context: ../..
+      dockerfile: docker/bulk-import.Dockerfile
+    image: codekg-neo4j-bulk-import:local
+    pull_policy: never
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - bulk_staging:/import:ro
+
   neo4j:
     image: neo4j:5.26-community
     init: true
@@ -85,6 +96,29 @@ services:
       - /tmp
     command: ["codekg", "list"]
 
+  bulk-exporter:
+    image: codekg-app:local
+    pull_policy: never
+    init: true
+    volumes:
+      - zvec_data:/data/zvec
+      - bulk_staging:/data/bulk
+    environment:
+      NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
+      NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-change-me-123}
+      NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
+    networks:
+      - backend
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    command: ["codekg", "--help"]
+
   mcp:
     image: codekg-app:local
     pull_policy: never
@@ -123,5 +157,10 @@ networks:
 
 volumes:
   neo4j_data:
+    name: ${CODEKG_NEO4J_DATA_VOLUME:-codekg-dev-local_neo4j_data}
   neo4j_logs:
+    name: ${CODEKG_NEO4J_LOGS_VOLUME:-codekg-dev-local_neo4j_logs}
   zvec_data:
+    name: ${CODEKG_ZVEC_DATA_VOLUME:-codekg-dev-local_zvec_data}
+  bulk_staging:
+    name: ${CODEKG_BULK_STAGING_VOLUME:-codekg-dev-local_bulk_staging}

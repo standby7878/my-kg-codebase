@@ -111,3 +111,81 @@ def evaluate(
     )
     write_report(report, output.resolve())
     console.print(report["summary"])
+
+
+@app.command("bulk-export")
+def bulk_export(
+    output: Path,
+    paths: Annotated[list[Path], typer.Argument(min=1)],
+) -> None:
+    """Export snapshots scanned from repository paths."""
+
+    from codekg.bulk_export import export_repositories
+    from codekg.ingest import scan_repository
+
+    repositories = [scan_repository(path) for path in paths]
+    result = export_repositories(repositories, output)
+    console.print({"manifest": str(result.manifest_path), "counts": dict(result.counts)})
+
+
+@app.command("bulk-import")
+def bulk_import(
+    manifest: Path,
+    database: str = typer.Option("neo4j", "--database"),
+    neo4j_admin: str = typer.Option("neo4j-admin", "--neo4j-admin"),
+) -> None:
+    """Import a bulk-export manifest into Neo4j."""
+
+    from codekg.bulk_import import run_bulk_import
+
+    result = run_bulk_import(manifest, database=database, neo4j_admin=neo4j_admin)
+    console.print(result)
+
+
+@app.command("bulk-zvec")
+def bulk_zvec(paths: Annotated[list[Path], typer.Argument(min=1)]) -> None:
+    """Build the derived zvec index from repository snapshots."""
+
+    from codekg.ingest import scan_repository
+    from codekg.search_index import callable_docs_from_repository
+    from codekg.zvec_store import open_write, optimize_and_flush, upsert_symbol_docs
+
+    repositories = [scan_repository(path) for path in paths]
+    descriptions = [
+        doc for repository in repositories for doc in callable_docs_from_repository(repository)
+    ]
+    collection = open_write()
+    document_count = upsert_symbol_docs(collection, descriptions)
+    optimize_and_flush(collection)
+    console.print({"repositories": len(paths), "documents": document_count})
+
+
+@app.command("validate-bulk-index")
+def validate_bulk_index(paths: Annotated[list[Path], typer.Argument(min=1)]) -> None:
+    """Validate staged zvec descriptions against live graph callables."""
+
+    from codekg.ingest import scan_repository
+    from codekg.search_index import (
+        callable_docs_from_repository,
+        iter_callable_rows,
+        validate_search_index_consistency,
+    )
+    from codekg.zvec_store import open_write
+
+    repositories = [scan_repository(path) for path in paths]
+    descriptions = [
+        doc for repository in repositories for doc in callable_docs_from_repository(repository)
+    ]
+    live_graph_keys = {
+        str(row["key"])
+        for repository in repositories
+        for row in iter_callable_rows(repo=repository.repo_name)
+    }
+    result = validate_search_index_consistency(
+        descriptions,
+        live_graph_keys=live_graph_keys,
+        collection=open_write(),
+    )
+    console.print(result)
+    if not result["ok"]:
+        raise typer.Exit(1)

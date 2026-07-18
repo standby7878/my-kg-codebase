@@ -17,8 +17,8 @@ RUN pip install --upgrade pip \
     && pip check
 
 RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin codekg \
-    && mkdir -p /data/zvec \
-    && chown -R codekg:codekg /app /data/zvec
+    && mkdir -p /data/zvec /data/bulk \
+    && chown -R codekg:codekg /app /data/zvec /data/bulk
 
 USER codekg
 

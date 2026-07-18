@@ -68,6 +68,23 @@ To index every configured repository independently:
 bash run-compose.sh dev-local index-sources
 ```
 
+`index-sources` defaults to a staged bulk build: CodeKG exports the complete
+configured corpus to CSV, creates a fresh Neo4j store with `neo4j-admin`,
+builds the matching zvec index, validates their exact callable keys, then
+briefly restarts Neo4j and MCP on the new generation. The previous generation
+remains available if staging or validation fails.
+
+Use transactional writes only for a targeted update or operational debugging:
+
+```bash
+bash run-compose.sh dev-local index-sources --mode transactional
+```
+
+The default `--mode auto` resolves to bulk; `--mode bulk` requires the offline
+import path to succeed and never silently falls back to transactional writes.
+The active generation pointers live in the ignored
+`compose/dev-local/runtime.env` file.
+
 To index one target repository without changing the profile configuration, use
 a temporary environment override:
 
