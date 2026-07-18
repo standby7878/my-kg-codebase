@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -10,6 +11,7 @@ pytestmark = pytest.mark.unit
 
 
 SCRIPT = Path(__file__).parents[2] / "run-compose.sh"
+COMPOSE_FILE = SCRIPT.parent / "compose" / "dev-local" / "docker-compose.yml"
 
 
 def run_index_sources(
@@ -148,3 +150,52 @@ def test_duplicate_checkout_basenames_fail_before_docker(tmp_path: Path) -> None
 
     assert result.returncode != 0
     assert not log.exists() or log.read_bytes() == b""
+
+
+def test_mcp_has_frontend_network_for_loopback_port_publishing() -> None:
+    compose = COMPOSE_FILE.read_text(encoding="utf-8")
+
+    services_block = compose.split("\nservices:\n", 1)[1].split("\nnetworks:\n", 1)[0]
+    service_blocks = {
+        service: block
+        for service, block in re.findall(
+            r"(?ms)^  ([a-z0-9_-]+):\n(.*?)(?=^  [a-z0-9_-]+:\n|\Z)",
+            services_block,
+        )
+    }
+
+    def service_networks(block: str) -> set[str]:
+        networks = re.search(
+            r"(?ms)^    networks:\n(?P<networks>.*?)(?=^    \S|\Z)",
+            block,
+        )
+        if networks is None:
+            return set()
+        return {
+            network
+            for pair in re.findall(
+                r"^      - ([a-z0-9-]+)$|^      ([a-z0-9-]+):$", networks["networks"], re.M
+            )
+            for network in pair
+            if network
+        }
+
+    service_network_membership = {
+        service: service_networks(block) for service, block in service_blocks.items()
+    }
+    mcp_block = service_blocks["mcp"]
+    networks_block = compose.split("\nnetworks:\n", 1)[1]
+
+    assert service_network_membership["mcp"] == {"backend", "frontend"}
+    assert service_network_membership["neo4j"] == {"backend", "frontend"}
+    assert all(
+        "frontend" not in networks
+        for service, networks in service_network_membership.items()
+        if service not in {"mcp", "neo4j"}
+    )
+    assert '      - "127.0.0.1:${MCP_PORT:-8765}:${MCP_PORT:-8765}"' in mcp_block
+    assert "  backend:\n    driver: bridge\n    internal: true\n" in networks_block
+    assert "  frontend:\n    driver: bridge\n" in networks_block
+    frontend_network = re.search(r"(?ms)^  frontend:\n(?P<config>.*?)(?=^  \S|\Z)", networks_block)
+    assert frontend_network is not None
+    assert "    internal:" not in frontend_network["config"]

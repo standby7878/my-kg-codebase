@@ -36,6 +36,7 @@ services:
       backend:
         aliases:
           - neo4j
+      frontend:
     healthcheck:
       test:
         [
@@ -140,6 +141,7 @@ services:
       - zvec_data:/data/zvec:ro
     networks:
       - backend
+      - frontend
     read_only: true
     cap_drop:
       - ALL
@@ -154,6 +156,8 @@ networks:
   backend:
     driver: bridge
     internal: true
+  frontend:
+    driver: bridge
 
 volumes:
   neo4j_data:

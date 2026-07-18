@@ -9,3 +9,4 @@ sources
 third_party/*
 !third_party/wheels/
 !third_party/wheels/zvec-0.5.1-*.whl
+codekg-csv-export/
