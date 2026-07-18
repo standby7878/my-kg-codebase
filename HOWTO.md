@@ -1,12 +1,8 @@
 # CodeKG HOWTO
 
-This project builds a local Neo4j-backed code knowledge graph for four source
-repositories:
-
-- `pghoard`
-- `pgbackrest`
-- `pglookout`
-- `patroni`
+This project builds a local Neo4j-backed code knowledge graph for an arbitrary
+number of source repositories. Set `CODEKG_REPOS_ROOT` to a semicolon-separated
+list of individual code-repository paths.
 
 The current implementation supports schema bootstrap, source mounting, indexing,
 repository listing, and a read-only FastMCP server with ten KG query tools.
@@ -17,14 +13,20 @@ module.
 ## Prerequisites
 
 - Docker with Compose v2
-- The four source repositories checked out next to this project directory:
-  - `../pghoard`
-  - `../pgbackrest`
-  - `../pglookout`
-  - `../patroni`
+- One or more local code repositories to index
 
-The dev profile paths live in `compose/dev-local/env`. They are relative to the
-Compose file and point outside this project with `../../../<repo>`.
+The dev profile setting lives in `compose/dev-local/env` as
+`CODEKG_REPOS_ROOT`. It can contain absolute paths or paths relative to
+`compose/dev-local/`. Spaces are allowed in paths; semicolons separate entries
+and are not valid inside a configured path. For example, this config names four
+independent targets:
+
+```dotenv
+CODEKG_REPOS_ROOT=../../sources/repo-a;../../sources/repo-b;../../sources/repositories with spaces/repo-c;../../sources/repo-d
+```
+
+Each source is mounted read-only and indexed independently. The setting does
+not identify a shared parent or search one for repositories.
 
 ## Build the App Image
 
@@ -65,19 +67,29 @@ bash run-compose.sh dev-local start
 bash run-compose.sh dev-local index-sources
 ```
 
-This reindexes all four mounted repositories:
+This indexes every repository listed in `CODEKG_REPOS_ROOT`; there is no fixed
+repository count. Each listed path must be an individual target code
+repository.
 
-- `/repos/pghoard`
-- `/repos/pgbackrest`
-- `/repos/pglookout`
-- `/repos/patroni`
+To index one target repository without changing the profile configuration, use
+a temporary environment override:
+
+```bash
+CODEKG_REPOS_ROOT=/absolute/path/to/repository bash run-compose.sh dev-local index-sources
+```
+
+The override applies only to that invocation; the profile setting in
+`compose/dev-local/env` is unchanged.
 
 `reindex` deletes the old graph for that repository name and writes a fresh
 snapshot. The scanner reads `.git/HEAD` directly, so it records the real commit
 short SHA even though the app image does not install the `git` binary.
 
 Indexed source repositories are local input data for the KG, not part of the
-CodeKG package. Keep them as sibling directories of this project.
+CodeKG package. Keep them at the configured paths. Markdown
+specifications, design notes, and API documentation must live inside the code
+repository they describe; they enrich lexical search. An independent
+specifications-only repository is not indexed independently.
 
 Current extraction level:
 
@@ -98,10 +110,7 @@ docker compose \
 Expected shape:
 
 ```text
-{'repo_name': 'patroni', 'commit': '...', 'root_path': '/repos/patroni', 'files': 118}
-{'repo_name': 'pgbackrest', 'commit': '...', 'root_path': '/repos/pgbackrest', 'files': 569}
-{'repo_name': 'pghoard', 'commit': '...', 'root_path': '/repos/pghoard', 'files': 70}
-{'repo_name': 'pglookout', 'commit': '...', 'root_path': '/repos/pglookout', 'files': 20}
+{'repo_name': '<repository-directory>', 'commit': '...', 'root_path': '/repos/<repository-directory>', 'files': 118}
 ```
 
 ## Stop or Clean
@@ -124,9 +133,8 @@ Inside the app image, the CLI is `codekg`.
 
 ```bash
 codekg bootstrap
-codekg reindex /repos/pghoard
 codekg list
-codekg delete pghoard
+codekg delete <repository-directory>
 ```
 
 The host helper script wraps the common Compose invocations.

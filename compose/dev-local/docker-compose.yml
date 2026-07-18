@@ -72,10 +72,6 @@ services:
       schema_bootstrap:
         condition: service_completed_successfully
     volumes:
-      - ${CODEKG_PGHOARD_PATH:-../../../pghoard}:/repos/pghoard:ro
-      - ${CODEKG_PGBACKREST_PATH:-../../../pgbackrest}:/repos/pgbackrest:ro
-      - ${CODEKG_PGLOOKOUT_PATH:-../../../pglookout}:/repos/pglookout:ro
-      - ${CODEKG_PATRONI_PATH:-../../../patroni}:/repos/patroni:ro
       - zvec_data:/data/zvec
     environment:
       NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}

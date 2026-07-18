@@ -25,6 +25,46 @@ def test_index_command_replaces_existing_snapshot(monkeypatch) -> None:
     assert calls == [(Path("sample-repo"), True)]
 
 
+def test_index_all_indexes_sorted_immediate_directories_and_skips_hidden_files(
+    monkeypatch, tmp_path: Path
+) -> None:
+    (tmp_path / "zeta").mkdir()
+    (tmp_path / "alpha").mkdir()
+    (tmp_path / ".hidden").mkdir()
+    (tmp_path / "README.md").write_text("not a repository")
+    (tmp_path / "alpha" / "nested").mkdir()
+    calls: list[tuple[Path, bool]] = []
+
+    def fake_index_repository(path: Path, *, replace: bool) -> dict[str, object]:
+        calls.append((path, replace))
+        return {"repo_name": path.name}
+
+    monkeypatch.setattr("codekg.ingest.index_repository", fake_index_repository)
+
+    result = CliRunner().invoke(app, ["index-all", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert calls == [
+        (tmp_path / "alpha", True),
+        (tmp_path / "zeta", True),
+    ]
+    assert "alpha" in result.stdout
+    assert "zeta" in result.stdout
+    assert "hidden" not in result.stdout
+
+
+@pytest.mark.parametrize("root_kind", ["missing", "file"])
+def test_index_all_requires_directory_root(tmp_path: Path, root_kind: str) -> None:
+    root = tmp_path / "missing"
+    if root_kind == "file":
+        root.write_text("not a directory")
+
+    result = CliRunner().invoke(app, ["index-all", str(root)])
+
+    assert result.exit_code != 0
+    assert "index root must be an existing directory" in result.output
+
+
 def test_delete_command_removes_zvec_records_before_graph(monkeypatch) -> None:
     calls: list[tuple[str, str]] = []
 

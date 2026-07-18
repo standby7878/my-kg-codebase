@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Annotated
 
 import typer
 from rich.console import Console
@@ -42,6 +43,26 @@ def reindex_repo(path: Path) -> None:
 
     result = index_repository(path, replace=True)
     console.print(result)
+
+
+@app.command("index-all")
+def index_all(root: Annotated[Path, typer.Argument()] = Path("/repos")) -> None:
+    """Index every immediate repository directory under a root path."""
+
+    from codekg.ingest import index_repository
+
+    if not root.is_dir():
+        raise typer.BadParameter(
+            f"index root must be an existing directory: {root}",
+            param_hint="root",
+        )
+
+    children = sorted(
+        (child for child in root.iterdir() if not child.name.startswith(".") and child.is_dir()),
+        key=lambda child: child.name,
+    )
+    for child in children:
+        console.print(index_repository(child, replace=True))
 
 
 @app.command("list")
