@@ -138,7 +138,9 @@ services:
     ports:
       - "127.0.0.1:${MCP_PORT:-8765}:${MCP_PORT:-8765}"
     volumes:
-      - zvec_data:/data/zvec:ro
+      # zvec 0.5.1 opens LOCK even with CollectionOption(read_only=True).
+      # MCP never calls write APIs, but needs a writable mount for that lock.
+      - zvec_data:/data/zvec
     networks:
       - backend
       - frontend

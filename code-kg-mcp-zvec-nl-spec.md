@@ -45,7 +45,7 @@ qualified-name search must continue to work.
 | 7 | Offline runtime | Phase A is FTS-only and has no embedding model. A later semantic phase must vendor its model and runtime. |
 | 8 | MCP budget | Keep the existing ten tools. Descriptive search is a `search_symbols` mode. |
 | 9 | Idempotency | zvec is a derived per-repository index. On replacement or deletion, remove its records before changing the graph snapshot, then rebuild from the new snapshot. |
-| 10 | Concurrency | Ingestion is the only zvec writer. MCP opens the collection read-only from the `zvec_data` volume. |
+| 10 | Concurrency | Ingestion is the only component that calls zvec write APIs. MCP opens the collection read-only, but zvec 0.5.1 requires its `zvec_data` mount to be writable so it can open its lock file. |
 
 ## Data design
 
@@ -241,9 +241,12 @@ factual graph questions about it.
 6. **Package and harden the runtime**
    - Vendor `zvec-0.5.1` for supported image architectures under `third_party/wheels/` and install
      it with `pip --no-index --find-links ...`.
-   - Mount `zvec_data` read-write in ingestion and read-only in MCP.
-   - Preserve MCP read-only root filesystem, dropped capabilities, no-new-privileges, tmpfs, and
-     no-egress network posture.
+   - Mount `zvec_data` read-write in ingestion and MCP: zvec 0.5.1 opens
+     `/data/zvec/codekg/LOCK` even when the MCP collection API is read-only.
+     MCP must not call zvec write APIs, and its container root filesystem remains read-only.
+   - Preserve MCP read-only root filesystem, dropped capabilities, no-new-privileges, and tmpfs.
+     The backend network remains internal, and published MCP ports remain loopback-bound; MCP also
+     attaches to the non-internal frontend network for that loopback publishing.
 
 7. **Verify the complete slice**
    - Unit tests for description construction, zvec adapter, lifecycle ordering, and MCP result
@@ -252,7 +255,9 @@ factual graph questions about it.
      return the expected code node.
    - Replacement test at a new commit proves that no old zvec ids remain and all current ids resolve
      to live code nodes.
-   - MCP read-only collection test and container no-egress test.
+   - MCP read-only collection runtime test using the production mount and container security
+     settings. The MCP service also joins the non-internal frontend network to publish its
+     loopback-bound port, so this topology does not provide a no-egress guarantee.
 
 ## Acceptance criteria for Phase A
 
@@ -270,7 +275,10 @@ In addition to the commands above:
 - Markdown prose that explicitly names a function improves retrieval of that function.
 - Lexical search always returns a live Neo4j code node, never a document-like result.
 - A replace index leaves no old repository zvec records and passes the exact-key consistency check.
-- MCP cannot write the collection and has no network egress.
+- MCP opens the collection through the read-only API while retaining the writable data mount
+  required by zvec's lock file. Its root filesystem is read-only and its published port is
+  loopback-bound. Because MCP joins the non-internal frontend network, no network-egress claim is
+  made for this Compose topology.
 - The final schema has no `Document` or `DocChunk` labels/constraints added by this feature.
 
 ## Deferred follow-ups

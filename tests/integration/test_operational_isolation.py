@@ -62,7 +62,7 @@ def isolated_project() -> tuple[str, dict[str, str]]:
     )
 
 
-def test_services_use_only_internal_backend_and_loopback_published_ports(
+def test_service_network_topology_and_loopback_published_ports(
     isolated_project: tuple[str, dict[str, str]],
 ) -> None:
     project, env = isolated_project
@@ -72,9 +72,12 @@ def test_services_use_only_internal_backend_and_loopback_published_ports(
     model = json.loads(config.stdout)
 
     services = model["services"]
-    assert set(services["neo4j"]["networks"]) == {"backend"}
+    # Neo4j and MCP publish only loopback-bound ports and therefore attach to
+    # the frontend network as well as the internal backend. Ingestion remains
+    # reachable only through the backend.
+    assert set(services["neo4j"]["networks"]) == {"backend", "frontend"}
     assert set(services["ingestion"]["networks"]) == {"backend"}
-    assert set(services["mcp"]["networks"]) == {"backend"}
+    assert set(services["mcp"]["networks"]) == {"backend", "frontend"}
     assert services["neo4j"]["ports"]
     assert services["mcp"]["ports"]
     assert all(port.get("host_ip") == "127.0.0.1" for port in services["neo4j"]["ports"])
@@ -100,7 +103,7 @@ def test_services_use_only_internal_backend_and_loopback_published_ports(
     assert network_data["Options"].get("com.docker.network.bridge.enable_ip_masquerade") != "true"
 
 
-def test_dynamic_ingestion_source_and_mcp_mounts_are_read_only(
+def test_dynamic_ingestion_source_and_mcp_mounts_preserve_isolation(
     isolated_project: tuple[str, dict[str, str]], tmp_path: Path
 ) -> None:
     project, env = isolated_project
@@ -138,7 +141,96 @@ def test_dynamic_ingestion_source_and_mcp_mounts_are_read_only(
 
     config = _run_compose(project, "config", "--format", "json", env=env)
     assert config.returncode == 0, config.stderr
-    mcp_mounts = json.loads(config.stdout)["services"]["mcp"]["volumes"]
+    mcp_service = json.loads(config.stdout)["services"]["mcp"]
+    mcp_mounts = mcp_service["volumes"]
     assert {mount["target"] for mount in mcp_mounts} == {"/data/zvec"}
     assert not any(mount["target"].startswith("/repos") for mount in mcp_mounts)
-    assert mcp_mounts[0]["read_only"] is True
+    # zvec 0.5.1 opens /data/zvec/codekg/LOCK even when its collection API is
+    # read-only, so this data mount must remain writable.
+    assert mcp_mounts[0].get("read_only", False) is False
+    assert mcp_service["read_only"] is True
+
+
+def test_mcp_opens_seeded_zvec_collection_read_only_with_production_mount(
+    isolated_project: tuple[str, dict[str, str]],
+) -> None:
+    """Exercise zvec's reader in the MCP service's actual Compose sandbox."""
+
+    project, env = isolated_project
+    env = env.copy()
+    # Keep this runtime fixture separate from the developer's persistent local index.
+    env["CODEKG_ZVEC_DATA_VOLUME"] = f"{project}-zvec"
+    seed = """
+from codekg.zvec_store import SymbolDoc, open_write, optimize_and_flush, upsert_symbol_docs
+
+collection = open_write()
+upsert_symbol_docs(collection, [SymbolDoc(
+    key="runtime:read-only",
+    repo="runtime",
+    commit="test",
+    path="runtime.py",
+    qname="runtime_reader",
+    kind="function",
+    signature="()",
+    start_line=1,
+    end_line=1,
+    text="runtime read only collection",
+)])
+optimize_and_flush(collection)
+"""
+    try:
+        seeded = _run_compose(
+            project,
+            "run",
+            "--rm",
+            "--no-deps",
+            "--entrypoint",
+            "python",
+            "ingestion",
+            "-c",
+            seed,
+            env=env,
+        )
+        if seeded.returncode != 0:
+            pytest.skip(
+                f"Required Compose image or zvec runtime unavailable: {seeded.stderr.strip()}"
+            )
+
+        read = """
+from codekg.zvec_store import fetch_symbol_docs, open_read
+
+collection = open_read()
+docs = fetch_symbol_docs(collection, {"runtime:read-only"})
+assert docs["runtime:read-only"]["key"] == "runtime:read-only"
+"""
+        opened = _run_compose(
+            project,
+            "run",
+            "--rm",
+            "--no-deps",
+            "--entrypoint",
+            "python",
+            "mcp",
+            "-c",
+            read,
+            env=env,
+        )
+        assert opened.returncode == 0, opened.stderr
+    finally:
+        subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-p",
+                project,
+                "-f",
+                str(COMPOSE_FILE),
+                "down",
+                "-v",
+                "--remove-orphans",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )

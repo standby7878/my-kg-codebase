@@ -194,6 +194,8 @@ def test_mcp_has_frontend_network_for_loopback_port_publishing() -> None:
         if service not in {"mcp", "neo4j"}
     )
     assert '      - "127.0.0.1:${MCP_PORT:-8765}:${MCP_PORT:-8765}"' in mcp_block
+    assert "      - zvec_data:/data/zvec\n" in mcp_block
+    assert "zvec_data:/data/zvec:ro" not in mcp_block
     assert "  backend:\n    driver: bridge\n    internal: true\n" in networks_block
     assert "  frontend:\n    driver: bridge\n" in networks_block
     frontend_network = re.search(r"(?ms)^  frontend:\n(?P<config>.*?)(?=^  \S|\Z)", networks_block)
