@@ -69,6 +69,15 @@ async def test_http_mcp_transport_supports_protocol_client_session() -> None:
         tools = await asyncio.wait_for(list_tools_when_ready(), timeout=65)
         assert tools
         assert any(tool.name == "list_repositories" for tool in tools)
+        search_tool = next(tool for tool in tools if tool.name == "search_symbols")
+        assert search_tool.inputSchema["properties"]["scope"]["enum"] == [
+            "source",
+            "tests",
+            "docs",
+            "examples",
+            "benchmarks",
+            "all",
+        ]
 
         # The clean Compose graph has no repositories, which makes this a deterministic
         # protocol-level exercise of the typed error envelope without seeding graph data.
@@ -82,6 +91,8 @@ async def test_http_mcp_transport_supports_protocol_client_session() -> None:
         assert result.structuredContent["status"] == "repository_required"
         assert result.structuredContent["results"] == []
         assert result.structuredContent["next_cursor"] is None
+        assert result.structuredContent["scope"] == "source"
+        assert result.structuredContent["diagnostics"]["scope"] == "source"
         assert len(result.content) == 1
         text = result.content[0].text
         structured_bytes = len(json.dumps(result.structuredContent, separators=(",", ":")).encode())

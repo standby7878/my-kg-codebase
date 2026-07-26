@@ -70,11 +70,20 @@ results from another repository. An absent name returns a typed
 
 `search_symbols` defaults to five compact candidates (maximum 20) and uses
 `hybrid` ranking, which combines exact name matches with lexical descriptions.
-Each candidate has a stable `symbol_id`, qualified name, file, line span,
-score, and matched terms. Pass `symbol_id` to `get_definition`,
-`find_callers`, `find_callees`, or `trace_call_path`; use `next_cursor` to
-request another page with the same repository, query, and mode. The structured
-MCP result is canonical; its text companion is only a short summary.
+Its default `scope` is `source`; use `tests`, `docs`, `examples`, `benchmarks`,
+or `all` only when that category is relevant. Scope is applied before
+graph/lexical fusion, ranking, and pagination within a fixed bounded backend
+candidate pool. It keeps default source discovery narrow, but it is not a
+guarantee of strict scope-recall beyond that pool; strict backend scope
+filtering and re-indexing are deferred. Each candidate has a stable
+`symbol_id`, qualified name, file, line span, score, matched terms, and match
+type. Search also returns compact
+scope diagnostics and, for a plausible first result, recommends
+`get_definition` with its exact symbol ID. Use that definition call to verify
+indexed metadata and line bounds, then use `find_callers` or `find_callees` to
+verify relationships. Use `next_cursor` only when no candidate is plausible,
+with the same repository, query, mode, and scope. The structured MCP result is
+canonical; its text companion is only a short summary.
 
 ## Index target repositories
 

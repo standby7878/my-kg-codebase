@@ -5,7 +5,7 @@ import json
 import pytest
 
 from codekg.mcp import server
-from codekg.mcp.server import mcp
+from codekg.mcp.server import SearchScope, mcp
 
 pytestmark = pytest.mark.unit
 
@@ -28,8 +28,9 @@ async def test_mcp_registers_exactly_ten_tools() -> None:
         "trace_call_path",
     ]
     assert all(tool.description for tool in tools.values())
-    assert "exact symbol key" in tools["get_definition"].description.lower()
-    assert "callsite" in tools["find_callers"].description.lower()
+    assert "line bounds" in tools["get_definition"].description.lower()
+    assert "verify bounded incoming" in tools["find_callers"].description.lower()
+    assert "verify bounded outgoing" in tools["find_callees"].description.lower()
     assert "unreferenced candidates" in tools["find_dead_code"].description.lower()
 
 
@@ -38,15 +39,24 @@ async def test_search_symbols_has_compact_repository_scoped_schema() -> None:
     tool = (await mcp.get_tools())["search_symbols"]
     properties = tool.parameters["properties"]
 
-    assert set(("query", "repository", "kind", "commit", "mode", "limit", "cursor")) <= set(
-        properties
-    )
+    assert set(
+        ("query", "repository", "kind", "commit", "mode", "scope", "limit", "cursor")
+    ) <= set(properties)
     assert "q" not in properties
     assert "repo" not in properties
     assert properties["limit"]["default"] == 5
     assert properties["limit"]["maximum"] == 20
     assert properties["mode"]["default"] == "hybrid"
     assert "hybrid" in properties["mode"]["enum"]
+    assert properties["scope"]["default"] == "source"
+    assert properties["scope"]["enum"] == [
+        "source",
+        "tests",
+        "docs",
+        "examples",
+        "benchmarks",
+        "all",
+    ]
 
 
 @pytest.mark.asyncio
@@ -86,10 +96,17 @@ async def test_search_symbols_returns_concise_text_and_canonical_structured_resu
         "kind": None,
         "commit": None,
         "mode": "hybrid",
+        "scope": "source",
         "limit": 5,
         "cursor": None,
     }
-    assert result.structured_content == response
+    assert result.structured_content == {
+        **response,
+        "scope": "source",
+        "diagnostics": {"scope": "source", "candidate_count": 1},
+        "recommended_next_tool": "get_definition",
+        "recommended_symbol_id": "requests@f361ead047be:sessions.py:Session.prepare_request:450",
+    }
     text = result.content[0].text
     assert (
         text == "Found 1 symbol candidate(s) in repository=requests. "
@@ -97,6 +114,22 @@ async def test_search_symbols_returns_concise_text_and_canonical_structured_resu
     )
     assert len(text.encode()) < len(json.dumps(response, separators=(",", ":")).encode())
     assert "Session.prepare_request" not in text
+
+
+def test_discovery_guidance_preserves_query_diagnostics_and_recommendation() -> None:
+    response: dict[str, object] = {
+        "status": "ok",
+        "results": [{"symbol_id": "requests@abc:sessions.py:Session.request:1"}],
+        "diagnostics": {"match_types": ["exact_qualified_name"]},
+        "recommended_next_tool": "find_callees",
+    }
+
+    server._add_discovery_guidance(response, SearchScope.SOURCE)
+
+    assert response["scope"] == "source"
+    assert response["diagnostics"] == {"match_types": ["exact_qualified_name"]}
+    assert response["recommended_next_tool"] == "find_callees"
+    assert response["recommended_symbol_id"] == "requests@abc:sessions.py:Session.request:1"
 
 
 def test_search_symbols_error_summary_does_not_duplicate_available_repositories() -> None:

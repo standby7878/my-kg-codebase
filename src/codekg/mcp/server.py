@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+from enum import StrEnum
 from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
@@ -41,6 +42,18 @@ SymbolKind = Literal["function", "method", "type"]
 HierarchyDirection = Literal["ancestors", "descendants"]
 SearchMode = Literal["graph", "lexical", "hybrid"]
 
+
+class SearchScope(StrEnum):
+    """Repository file categories available to compact symbol discovery."""
+
+    SOURCE = "source"
+    TESTS = "tests"
+    DOCS = "docs"
+    EXAMPLES = "examples"
+    BENCHMARKS = "benchmarks"
+    ALL = "all"
+
+
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
@@ -71,7 +84,8 @@ def list_repositories() -> list[dict[str, Any]]:
         "list_repositories first when the repository is unknown. With multiple indexed "
         "repositories, repository is required; searches never fall back to other "
         "repositories. mode='hybrid' combines exact graph-name matching with lexical "
-        "ranking. Use returned symbol_id values with definition and relationship tools."
+        "ranking. This is candidate discovery only: after a plausible candidate, call "
+        "get_definition with its returned symbol_id instead of issuing another broad search."
     )
 )
 def search_symbols(
@@ -93,6 +107,15 @@ def search_symbols(
         SearchMode,
         Field(description="hybrid, graph, or lexical discovery ranking mode."),
     ] = "hybrid",
+    scope: Annotated[
+        SearchScope,
+        Field(
+            description=(
+                "Repository file scope: source (default), tests, docs, examples, "
+                "benchmarks, or all. Applied before candidate ranking."
+            )
+        ),
+    ] = SearchScope.SOURCE,
     limit: Annotated[
         int, Field(ge=1, le=20, description="Maximum compact candidates to return.")
     ] = 5,
@@ -103,15 +126,19 @@ def search_symbols(
 ) -> ToolResult:
     """Return canonical structured discovery data plus a deliberately small text summary."""
     started = time.perf_counter()
-    response = query_discover_symbols(
-        repository=repository,
-        query=query,
-        kind=kind,
-        commit=commit,
-        mode=mode,
-        limit=limit,
-        cursor=cursor,
+    response = dict(
+        query_discover_symbols(
+            repository=repository,
+            query=query,
+            kind=kind,
+            commit=commit,
+            mode=mode,
+            scope=scope.value,
+            limit=limit,
+            cursor=cursor,
+        )
     )
+    _add_discovery_guidance(response, scope)
     structured_bytes = len(json.dumps(response, separators=(",", ":"), default=str).encode())
     text = _search_summary(response)
     text_bytes = len(text.encode())
@@ -122,6 +149,7 @@ def search_symbols(
                 "repository": response.get("repository", repository),
                 "commit": response.get("commit", commit),
                 "mode": mode,
+                "scope": scope.value,
                 "requested_count": limit,
                 "returned_count": len(response.get("results", [])),
                 "duration_ms": round((time.perf_counter() - started) * 1000, 2),
@@ -134,6 +162,26 @@ def search_symbols(
         ),
     )
     return ToolResult(content=text, structured_content=response)
+
+
+def _add_discovery_guidance(response: dict[str, object], scope: SearchScope) -> None:
+    """Keep scope and the discovery-to-evidence workflow visible to MCP clients."""
+    response.setdefault("scope", scope.value)
+    results = response.get("results")
+    result_count = len(results) if isinstance(results, list) else 0
+    response.setdefault(
+        "diagnostics",
+        {"scope": scope.value, "candidate_count": result_count},
+    )
+    if response.get("status", "ok") != "ok" or not isinstance(results, list) or not results:
+        return
+    first = results[0]
+    if not isinstance(first, dict):
+        return
+    symbol_id = first.get("symbol_id")
+    if isinstance(symbol_id, str) and symbol_id:
+        response.setdefault("recommended_next_tool", "get_definition")
+        response.setdefault("recommended_symbol_id", symbol_id)
 
 
 def _search_summary(response: dict[str, Any]) -> str:
@@ -155,9 +203,9 @@ def _search_summary(response: dict[str, Any]) -> str:
 
 @mcp.tool(
     description=(
-        "Return the definition metadata for one indexed symbol, including repository, "
-        "file path, line span, qualified name, signature, and symbol kind. Prefer an exact "
-        "symbol key. A qualified-name fallback requires repo and fails on ambiguity."
+        "Verify exact indexed definition metadata and line bounds for one selected symbol. "
+        "Pass the symbol_id returned by search_symbols; a qualified-name fallback requires "
+        "repo and fails on ambiguity."
     )
 )
 def get_definition(
@@ -170,8 +218,8 @@ def get_definition(
 
 @mcp.tool(
     description=(
-        "Find symbols that call the selected function or method. Exact keys are preferred; "
-        "qualified names require repo. Depth 1 reads authoritative CallSite resolutions; "
+        "Verify bounded incoming relationships for a selected function or method. Pass its "
+        "exact symbol_id when available. Depth 1 reads authoritative CallSite resolutions; "
         "deeper traversal uses the dedicated EXACT_CALLS projection."
     )
 )
@@ -187,8 +235,8 @@ def find_callers(
 
 @mcp.tool(
     description=(
-        "Find symbols called by the selected function or method. Exact keys are preferred; "
-        "qualified names require repo. Depth 1 reads authoritative CallSite resolutions; "
+        "Verify bounded outgoing relationships for a selected function or method. Pass its "
+        "exact symbol_id when available. Depth 1 reads authoritative CallSite resolutions; "
         "deeper traversal uses the dedicated EXACT_CALLS projection."
     )
 )

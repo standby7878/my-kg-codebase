@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import json
+
 import pytest
 
 from codekg.queries.code import (
@@ -254,9 +257,18 @@ def test_discover_symbols_compacts_results_and_paginates() -> None:
         "end_line",
         "score",
         "matched_terms",
+        "match_type",
+        "scope",
     }
     assert first["qualified_name"] == "requests.Session.prepare_request"
     assert response["next_cursor"]
+    payload = json.loads(
+        base64.urlsafe_b64decode(
+            response["next_cursor"] + "=" * (-len(response["next_cursor"]) % 4)
+        )
+    )
+    assert payload["v"] == 2
+    assert payload["s"] == "source"
     assert client.calls[1][1]["repo"] == "requests"
     assert client.calls[1][1]["commit"] == "abc"
     assert client.calls[1][1]["limit"] == 100
@@ -271,6 +283,436 @@ def test_discover_symbols_compacts_results_and_paginates() -> None:
     )  # type: ignore[arg-type]
     assert [row["qualified_name"] for row in next_page["results"]] == ["requests.Session.send"]
     assert client.calls[3][1]["limit"] == 100
+
+
+def test_discover_backend_query_excludes_stopwords() -> None:
+    client = DiscoveryClient([_repository()], [])
+
+    discover_symbols(
+        "request with auth",
+        repository="requests",
+        mode="graph",
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert client.calls[1][1]["fulltext_query"] == "request AND auth"
+
+
+def test_discover_lexical_backend_query_excludes_stopwords(monkeypatch) -> None:
+    client = DiscoveryClient([_repository()], [])
+    observed: list[str] = []
+
+    def lexical(query, **kwargs):  # type: ignore[no-untyped-def]
+        observed.append(query)
+        return []
+
+    monkeypatch.setattr("codekg.queries.code._search_symbols_lexical", lexical)
+    discover_symbols(
+        "request with auth",
+        repository="requests",
+        mode="lexical",
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert observed == ["request auth"]
+
+
+def test_discover_one_token_prose_does_not_get_qname_suffix_tier() -> None:
+    client = DiscoveryClient(
+        [_repository()],
+        [
+            {
+                "key": "suffix",
+                "name": "other",
+                "qname": "pkg.Session.request",
+                "file": "pkg.py",
+                "start_line": 1,
+                "end_line": 1,
+                "score": 1,
+            },
+            {
+                "key": "name",
+                "name": "request",
+                "qname": "pkg.request",
+                "file": "pkg.py",
+                "start_line": 2,
+                "end_line": 2,
+                "score": 1,
+            },
+        ],
+    )
+
+    response = discover_symbols("request", repository="requests", mode="graph", client=client)  # type: ignore[arg-type]
+
+    assert response["results"][0]["symbol_id"] == "name"
+    assert response["results"][0]["match_type"] == "exact_name"
+    assert response["results"][1]["match_type"] == "terms"
+
+
+def test_discover_prepared_request_prepare_exact_and_suffix_tiers() -> None:
+    row = {
+        "key": "prepare",
+        "name": "prepare",
+        "qname": "requests.models.PreparedRequest.prepare",
+        "file": "requests/models.py",
+        "start_line": 1,
+        "end_line": 2,
+        "score": 0,
+    }
+    client = DiscoveryClient([_repository()], [row])
+
+    suffix = discover_symbols(
+        "PreparedRequest.prepare", repository="requests", mode="graph", client=client
+    )  # type: ignore[arg-type]
+    exact = discover_symbols(
+        "requests.models.PreparedRequest.prepare",
+        repository="requests",
+        mode="graph",
+        client=client,
+    )  # type: ignore[arg-type]
+
+    assert suffix["results"][0]["match_type"] == "qualified_name_suffix"
+    assert exact["results"][0]["match_type"] == "exact_qualified_name"
+
+
+def test_discover_analyzer_rejects_stopword_only_query_without_backend_search() -> None:
+    client = DiscoveryClient([_repository()])
+
+    response = discover_symbols("the and with", repository="requests", client=client)  # type: ignore[arg-type]
+
+    assert response["status"] == "invalid_query"
+    assert response["diagnostics"]["query_terms"] == []
+    assert response["diagnostics"]["ignored_terms"] == ["the", "and", "with"]
+    assert client.calls == []
+
+
+def test_discover_qname_suffix_and_exact_tiers_beat_prose() -> None:
+    client = DiscoveryClient(
+        [_repository()],
+        [
+            {
+                "key": "prose",
+                "name": "helper",
+                "qname": "requests.helper",
+                "file": "requests/helper.py",
+                "start_line": 1,
+                "end_line": 2,
+                "snippet": "Session request instructions",
+                "score": 999,
+            },
+            {
+                "key": "suffix",
+                "name": "request",
+                "qname": "requests.sessions.Session.request",
+                "file": "requests/sessions.py",
+                "start_line": 3,
+                "end_line": 4,
+                "score": 0,
+            },
+        ],
+    )
+
+    response = discover_symbols(
+        "Session.request",
+        repository="requests",
+        mode="graph",
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert response["results"][0]["symbol_id"] == "suffix"
+    assert response["results"][0]["match_type"] == "qualified_name_suffix"
+    assert response["results"][0]["matched_terms"] == ["session", "request"]
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("pkg/tests/test_client.py", "tests"),
+        ("pkg/testing/client.py", "tests"),
+        ("pkg/fixtures/client.py", "tests"),
+        ("pkg/conftest.py", "tests"),
+        ("pkg/client_test.py", "tests"),
+        ("benchmarks/search.py", "benchmarks"),
+        ("pkg/benchmark_search.py", "benchmarks"),
+        ("examples/demo.py", "examples"),
+        ("samples/demo.py", "examples"),
+        ("docs/usage.md", "docs"),
+        ("pkg/module.py", "source"),
+        ("strange/location/generated.py", "source"),
+    ],
+)
+def test_discovery_path_scope_classifier(path: str, expected: str) -> None:
+    from codekg.queries.code import _path_scope
+
+    assert _path_scope(path) == expected
+
+
+def test_discover_scope_filters_before_ranking_and_pagination() -> None:
+    client = DiscoveryClient(
+        [_repository()],
+        [
+            {
+                "key": "test",
+                "name": "request",
+                "qname": "tests.request",
+                "file": "tests/test_api.py",
+                "start_line": 1,
+                "end_line": 2,
+                "score": 999,
+            },
+            {
+                "key": "source",
+                "name": "request",
+                "qname": "requests.request",
+                "file": "requests/api.py",
+                "start_line": 1,
+                "end_line": 2,
+                "score": 1,
+            },
+        ],
+    )
+
+    response = discover_symbols(
+        "request", repository="requests", mode="graph", limit=1, client=client
+    )  # type: ignore[arg-type]
+
+    assert [row["symbol_id"] for row in response["results"]] == ["source"]
+    assert response["next_cursor"] is None
+    assert response["diagnostics"]["scoped_candidate_count"] == 1
+    assert response["diagnostics"]["candidate_pool"] == 100
+
+
+def test_discover_retrieval_scope_matrix_includes_fixtures_as_tests() -> None:
+    rows = [
+        {
+            "key": "source",
+            "name": "request",
+            "qname": "pkg.request",
+            "file": "pkg/request.py",
+            "start_line": 1,
+            "end_line": 1,
+            "score": 1,
+        },
+        {
+            "key": "tests",
+            "name": "request",
+            "qname": "pkg.tests.request",
+            "file": "fixtures/request.py",
+            "start_line": 1,
+            "end_line": 1,
+            "score": 1,
+        },
+        {
+            "key": "docs",
+            "name": "request",
+            "qname": "pkg.docs.request",
+            "file": "docs/request.py",
+            "start_line": 1,
+            "end_line": 1,
+            "score": 1,
+        },
+        {
+            "key": "examples",
+            "name": "request",
+            "qname": "pkg.examples.request",
+            "file": "samples/request.py",
+            "start_line": 1,
+            "end_line": 1,
+            "score": 1,
+        },
+        {
+            "key": "benchmarks",
+            "name": "request",
+            "qname": "pkg.benchmarks.request",
+            "file": "benchmark_request.py",
+            "start_line": 1,
+            "end_line": 1,
+            "score": 1,
+        },
+    ]
+    expected = {
+        "source": {"source"},
+        "tests": {"tests"},
+        "docs": {"docs"},
+        "examples": {"examples"},
+        "benchmarks": {"benchmarks"},
+        "all": {"source", "tests", "docs", "examples", "benchmarks"},
+    }
+
+    for scope, ids in expected.items():
+        client = DiscoveryClient([_repository()], rows)
+        response = discover_symbols(
+            "request",
+            repository="requests",
+            mode="graph",
+            scope=scope,
+            client=client,  # type: ignore[arg-type]
+        )
+        assert {row["symbol_id"] for row in response["results"]} == ids
+
+
+def test_discover_cursor_binds_scope_and_analyzer() -> None:
+    client = DiscoveryClient(
+        [_repository()],
+        [
+            {
+                "key": "one",
+                "name": "request",
+                "qname": "requests.request",
+                "file": "requests/api.py",
+                "start_line": 1,
+                "end_line": 2,
+                "score": 1,
+            },
+            {
+                "key": "two",
+                "name": "request",
+                "qname": "requests.other_request",
+                "file": "requests/api.py",
+                "start_line": 3,
+                "end_line": 4,
+                "score": 1,
+            },
+        ],
+    )
+    first = discover_symbols("request", repository="requests", mode="graph", limit=1, client=client)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="cursor"):
+        discover_symbols(
+            "request",
+            repository="requests",
+            mode="graph",
+            scope="all",
+            cursor=first["next_cursor"],
+            client=client,
+        )  # type: ignore[arg-type]
+
+
+def test_merge_zvec_fields_supplements_graph_row() -> None:
+    from codekg.queries.code import _merge_zvec_hit
+
+    row = _merge_zvec_hit(
+        {
+            "key": "one",
+            "score": 1.0,
+            "fields": {
+                "qname": "pkg.Session.request",
+                "signature": "def request()",
+                "path": "pkg/session.py",
+                "text": "request docs",
+            },
+        },
+        {"one": {"key": "one"}},
+    )
+
+    assert row["qname"] == "pkg.Session.request"
+    assert row["signature"] == "def request()"
+    assert row["file"] == "pkg/session.py"
+    assert row["snippet"] == "request docs"
+
+
+def test_merge_zvec_description_excludes_generated_identifier_header() -> None:
+    from codekg.queries.code import _merge_zvec_hit
+
+    row = _merge_zvec_hit(
+        {
+            "key": "one",
+            "score": 1.0,
+            "fields": {
+                "qname": "pkg.Session.request",
+                "signature": "def request()",
+                "path": "pkg/session.py",
+                "text": (
+                    "request\nrequest\npkg.Session.request\ndef request()\n"
+                    "Merge session state defaults."
+                ),
+            },
+        },
+        {"one": {"key": "one"}},
+    )
+
+    assert row["_description"] == "Merge session state defaults."
+    assert row["snippet"] == "Merge session state defaults."
+
+
+def test_prepared_request_behavioral_description_beats_generic_identifier_terms() -> None:
+    from codekg.queries.code import _rank_discovery_rows
+
+    ranked = _rank_discovery_rows(
+        "PreparedRequest prepare with session state merge defaults request method",
+        [
+            {
+                "key": "merge-environment-settings",
+                "name": "merge_environment_settings",
+                "qname": "requests.sessions.Session.merge_environment_settings",
+                "signature": "def merge_environment_settings(self, request)",
+                "file": "requests/sessions.py",
+                "_description": "Check the environment and merge it with some settings.",
+                "score": 10,
+            },
+            {
+                "key": "merge-hooks",
+                "name": "merge_hooks",
+                "qname": "requests.sessions.merge_hooks",
+                "signature": "def merge_hooks(request_hooks, session_hooks)",
+                "file": "requests/sessions.py",
+                "_description": "Properly merges both requests and session hooks.",
+                "score": 10,
+            },
+            {
+                "key": "merge-setting",
+                "name": "merge_setting",
+                "qname": "requests.sessions.merge_setting",
+                "signature": "def merge_setting(request_setting, session_setting)",
+                "file": "requests/sessions.py",
+                "_description": "Determines appropriate setting for a given request and session.",
+                "score": 1,
+            },
+            {
+                "key": "session-prepare-request",
+                "name": "prepare_request",
+                "qname": "requests.sessions.Session.prepare_request",
+                "signature": "def prepare_request(self, request)",
+                "file": "requests/sessions.py",
+                "_description": (
+                    "Constructs a PreparedRequest for transmission. The PreparedRequest has "
+                    "settings merged from the Request instance and those of the Session."
+                ),
+                "score": 1,
+            },
+        ],
+    )
+
+    assert ranked[0]["key"] == "session-prepare-request"
+
+
+def test_specific_description_term_outweighs_generic_description_term() -> None:
+    from codekg.queries.code import _rank_discovery_rows
+
+    ranked = _rank_discovery_rows(
+        "session request",
+        [
+            {
+                "key": "generic",
+                "name": "first",
+                "qname": "pkg.first",
+                "file": "pkg/first.py",
+                "_description": "request",
+                "score": 0,
+            },
+            {
+                "key": "specific",
+                "name": "second",
+                "qname": "pkg.second",
+                "file": "pkg/second.py",
+                "_description": "session",
+                "score": 0,
+            },
+        ],
+    )
+
+    assert [row["key"] for row in ranked] == ["specific", "generic"]
+    assert [row["_discovery_score"] for row in ranked] == [120, 40]
 
 
 def test_discover_symbols_default_limit_and_upper_bound() -> None:

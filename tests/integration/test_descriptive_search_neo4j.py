@@ -217,7 +217,7 @@ def test_requests_discovery_places_prepare_request_in_top_five(tmp_path: Path) -
                 requests_root, replace=False, client=client, zvec_path=zvec_path
             )
             response = discover_symbols(
-                "prepare request session cookies auth",
+                "PreparedRequest prepare with session state merge defaults request method",
                 repository=str(indexed["repo_name"]),
                 mode="hybrid",
                 limit=5,
@@ -225,9 +225,37 @@ def test_requests_discovery_places_prepare_request_in_top_five(tmp_path: Path) -
                 client=client,
             )
             assert response["status"] == "ok"
-            assert any(
-                str(row["qualified_name"]).endswith(".Session.prepare_request")
-                for row in response["results"]
+            assert str(response["results"][0]["qualified_name"]).endswith(
+                ".Session.prepare_request"
             )
+            assert all(
+                not str(row["file"]).startswith(("test/", "tests/")) for row in response["results"]
+            )
+            assert "with" in response["diagnostics"]["ignored_terms"]
+            assert all("with" not in row["matched_terms"] for row in response["results"])
+
+            exact = discover_symbols(
+                "Session.request",
+                repository=str(indexed["repo_name"]),
+                mode="hybrid",
+                limit=5,
+                zvec_path=zvec_path,
+                client=client,
+            )
+            assert str(exact["results"][0]["qualified_name"]).endswith(".Session.request")
+            assert exact["results"][0]["match_type"] == "qualified_name_suffix"
+            assert exact["results"][0]["scope"] == "source"
+
+            test_scope = discover_symbols(
+                "session request",
+                repository=str(indexed["repo_name"]),
+                scope="tests",
+                mode="hybrid",
+                limit=5,
+                zvec_path=zvec_path,
+                client=client,
+            )
+            assert test_scope["results"]
+            assert all(row["scope"] == "tests" for row in test_scope["results"])
         finally:
             client.close()

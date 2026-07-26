@@ -15,10 +15,38 @@ SymbolKind = Literal["function", "method", "type"]
 HierarchyDirection = Literal["ancestors", "descendants"]
 SearchMode = Literal["graph", "lexical"]
 DiscoverySearchMode = Literal["graph", "lexical", "hybrid"]
+DiscoveryScope = Literal["source", "tests", "docs", "examples", "benchmarks", "all"]
 
 _DISCOVERY_DEFAULT_LIMIT = 5
 _DISCOVERY_MAX_LIMIT = 20
 _DISCOVERY_CANDIDATE_POOL = 100
+_GENERIC_CODE_TERMS = frozenset(
+    {"method", "function", "class", "object", "value", "data", "prepare", "prepared", "request"}
+)
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "in",
+        "into",
+        "is",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "via",
+        "with",
+    }
+)
 
 
 class SymbolResolutionError(ValueError):
@@ -160,6 +188,7 @@ def discover_symbols(
     commit: str | None = None,
     kind: SymbolKind | None = None,
     mode: DiscoverySearchMode = "hybrid",
+    scope: DiscoveryScope = "source",
     limit: int = _DISCOVERY_DEFAULT_LIMIT,
     cursor: str | None = None,
     zvec_path: str | None = None,
@@ -173,6 +202,20 @@ def discover_symbols(
 
     if not 1 <= int(limit) <= _DISCOVERY_MAX_LIMIT:
         raise ValueError(f"limit must be between 1 and {_DISCOVERY_MAX_LIMIT}")
+    if scope not in ("source", "tests", "docs", "examples", "benchmarks", "all"):
+        raise ValueError("scope must be source, tests, docs, examples, benchmarks, or all")
+    terms, ignored_terms = _query_analysis(query)
+    if not terms:
+        return {
+            "status": "invalid_query",
+            "results": [],
+            "next_cursor": None,
+            "diagnostics": {
+                "scope": scope,
+                "query_terms": [],
+                "ignored_terms": ignored_terms,
+            },
+        }
     db = client or get_client()
     repositories = _repository_snapshots(db)
     available = sorted({str(row["repo_name"]) for row in repositories})
@@ -208,7 +251,8 @@ def discover_symbols(
         # left several snapshots, make the selection deterministic and expose it.
         commit = str(sorted(str(row["commit"]) for row in snapshots)[-1])
 
-    offset = _decode_cursor(cursor, repository, commit, query, mode, kind)
+    offset = _decode_cursor(cursor, repository, commit, query, terms, mode, kind, scope)
+    retrieval_query = " ".join(terms)
     # Every page reranks the same bounded, repository-scoped candidate pool.
     # This makes cursor exhaustion deterministic rather than silently changing
     # the candidate universe on a later page.
@@ -217,11 +261,16 @@ def discover_symbols(
     lexical_rows: list[dict[str, object]] = []
     if mode in ("graph", "hybrid"):
         graph_rows = search_symbols(
-            query, kind=kind, repo=repository, commit=commit, limit=candidate_limit, client=db
+            retrieval_query,
+            kind=kind,
+            repo=repository,
+            commit=commit,
+            limit=candidate_limit,
+            client=db,
         )
     if mode in ("lexical", "hybrid"):
         lexical_rows = _search_symbols_lexical(
-            query,
+            retrieval_query,
             kind=kind,
             repo=repository,
             commit=commit,
@@ -229,7 +278,8 @@ def discover_symbols(
             zvec_path=zvec_path,
             client=db,
         )
-    ranked = _rank_discovery_rows(query, [*graph_rows, *lexical_rows])
+    scoped_rows = [row for row in [*graph_rows, *lexical_rows] if _matches_scope(row, scope)]
+    ranked = _rank_discovery_rows(query, scoped_rows)
     page = ranked[offset : offset + limit + 1]
     has_more = len(page) > limit
     page = page[:limit]
@@ -239,10 +289,23 @@ def discover_symbols(
         "commit": commit,
         "results": [_compact_discovery_row(row, query) for row in page],
         "next_cursor": (
-            _encode_cursor(repository, commit, query, mode, kind, offset + limit)
+            _encode_cursor(repository, commit, query, terms, mode, kind, scope, offset + limit)
             if has_more
             else None
         ),
+        "diagnostics": {
+            "scope": scope,
+            "query_terms": terms,
+            "ignored_terms": ignored_terms,
+            "candidate_pool": _DISCOVERY_CANDIDATE_POOL,
+            "scoped_candidate_count": len(scoped_rows),
+            "exact_match_count": sum(
+                row.get("_match_type")
+                in {"exact_qualified_name", "qualified_name_suffix", "exact_name"}
+                for row in ranked
+            ),
+            "ranked_count": len(ranked),
+        },
     }
 
 
@@ -261,11 +324,23 @@ def _encode_cursor(
     repository: str,
     commit: str,
     query: str,
+    terms: list[str],
     mode: DiscoverySearchMode,
     kind: SymbolKind | None,
+    scope: DiscoveryScope,
     offset: int,
 ) -> str:
-    payload = {"v": 1, "r": repository, "c": commit, "q": query, "m": mode, "k": kind, "o": offset}
+    payload = {
+        "v": 2,
+        "r": repository,
+        "c": commit,
+        "q": query,
+        "a": terms,
+        "m": mode,
+        "k": kind,
+        "s": scope,
+        "o": offset,
+    }
     return (
         base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode())
         .decode()
@@ -278,8 +353,10 @@ def _decode_cursor(
     repository: str,
     commit: str,
     query: str,
+    terms: list[str],
     mode: DiscoverySearchMode,
     kind: SymbolKind | None,
+    scope: DiscoveryScope,
 ) -> int:
     if cursor is None:
         return 0
@@ -291,9 +368,11 @@ def _decode_cursor(
             payload.get("r"),
             payload.get("c"),
             payload.get("q"),
+            payload.get("a"),
             payload.get("m"),
             payload.get("k"),
-        ) != (1, repository, commit, query, mode, kind):
+            payload.get("s"),
+        ) != (2, repository, commit, query, terms, mode, kind, scope):
             raise ValueError
         offset = payload.get("o")
         if not isinstance(offset, int) or offset < 0:
@@ -304,24 +383,46 @@ def _decode_cursor(
 
 
 def _rank_discovery_rows(query: str, rows: list[dict[str, object]]) -> list[dict[str, object]]:
-    terms = _query_terms(query)
+    terms = _analyze_query(query)
     by_key: dict[str, dict[str, object]] = {}
     for row in rows:
         key = str(row.get("key", ""))
         if not key:
             continue
-        name_terms = set(_query_terms(str(row.get("name") or "")))
-        qname_terms = set(_query_terms(str(row.get("qname") or "")))
-        matched = set(terms) & (name_terms | qname_terms)
-        description_matched = set(terms) & set(_query_terms(str(row.get("snippet") or "")))
-        # Exact names and qualified names dominate description-only lexical hits.
-        score = min(float(row.get("score") or 0), 10) + len(matched) * 100
-        score += len(description_matched - matched) * 20
-        if " ".join(terms) in str(row.get("qname") or "").lower().replace("_", " "):
-            score += 200
+        qname_terms = _analyze_text(str(row.get("qname") or ""))
+        name_terms = _analyze_text(str(row.get("name") or ""))
+        signature_terms = _analyze_text(str(row.get("signature") or ""))
+        path_terms = _analyze_text(str(row.get("file") or ""))
+        description_terms = _description_match_terms(str(row.get("_description") or ""))
+        qname_matches = set(terms) & set(qname_terms)
+        name_matches = set(terms) & set(name_terms)
+        signature_matches = set(terms) & set(signature_terms)
+        path_matches = set(terms) & set(path_terms)
+        description_matches = set(terms) & set(description_terms)
+        match_type = "terms"
+        score = min(float(row.get("score") or 0), 10)
+        if _identifier_key(query) == _identifier_key(str(row.get("qname") or "")):
+            score += 10000
+            match_type = "exact_qualified_name"
+        elif _is_identifier_like_query(query, terms) and _ends_with_tokens(qname_terms, terms):
+            score += 9000
+            match_type = "qualified_name_suffix"
+        elif _identifier_key(query) == _identifier_key(str(row.get("name") or "")):
+            score += 8000
+            match_type = "exact_name"
+        score += _weighted_matches(qname_matches | name_matches, specific=300, generic=100)
+        score += _weighted_matches(signature_matches, specific=80, generic=30)
+        score += _weighted_matches(path_matches, specific=40, generic=20)
+        # Zvec text begins with identifier/signature material.  Only the tail
+        # after that generated header participates as behavioral evidence.
+        score += _weighted_matches(description_matches, specific=120, generic=40)
         row = dict(row)
         row["_discovery_score"] = score
-        row["_matched_terms"] = sorted(matched | description_matched)
+        matched = (
+            qname_matches | name_matches | signature_matches | path_matches | description_matches
+        )
+        row["_matched_terms"] = [term for term in terms if term in matched]
+        row["_match_type"] = match_type
         current = by_key.get(key)
         if current is None or float(row["_discovery_score"]) > float(current["_discovery_score"]):
             by_key[key] = row
@@ -335,12 +436,92 @@ def _rank_discovery_rows(query: str, rows: list[dict[str, object]]) -> list[dict
     )
 
 
-def _query_terms(value: str) -> list[str]:
+def _weighted_matches(matches: set[str], *, specific: int, generic: int) -> int:
+    return sum(generic if term in _GENERIC_CODE_TERMS else specific for term in matches)
+
+
+def _analyze_text(value: str) -> list[str]:
     return [
-        term.lower()
-        for term in re.findall(r"[A-Za-z0-9]+", value.replace("_", " ").replace(".", " "))
-        if len(term) > 1
+        token.lower() for token in re.findall(r"[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+", value)
     ]
+
+
+def _description_match_terms(value: str) -> list[str]:
+    """Add small prose-only inflection variants without changing identifier matching."""
+
+    terms = _analyze_text(value)
+    variants = list(terms)
+    for term in terms:
+        if len(term) > 3 and term.endswith("ed"):
+            variants.append(term[:-1])
+    return variants
+
+
+def _analyze_query(value: str) -> list[str]:
+    return _query_analysis(value)[0]
+
+
+def _query_analysis(value: str) -> tuple[list[str], list[str]]:
+    tokens = _analyze_text(value)
+    return (
+        _ordered_unique(term for term in tokens if term not in _STOPWORDS),
+        _ordered_unique(term for term in tokens if term in _STOPWORDS),
+    )
+
+
+def _ordered_unique(terms) -> list[str]:
+    return list(dict.fromkeys(terms))
+
+
+def _identifier_key(value: str) -> str:
+    return ".".join(_analyze_text(value))
+
+
+def _ends_with_tokens(value: list[str], suffix: list[str]) -> bool:
+    return bool(suffix) and len(value) >= len(suffix) and value[-len(suffix) :] == suffix
+
+
+def _is_identifier_like_query(value: str, terms: list[str]) -> bool:
+    """Limit suffix matching to explicit identifier syntax, not natural-language words."""
+
+    if len(terms) < 2:
+        return False
+    return (
+        "." in value
+        or "_" in value
+        or bool(re.search(r"[a-z0-9][A-Z]", value))
+        or bool(re.search(r"[A-Z][a-z]+[A-Z]", value))
+    )
+
+
+def _path_scope(path: object) -> DiscoveryScope:
+    parts = [part.lower() for part in str(path).replace("\\", "/").split("/") if part]
+    basename = parts[-1] if parts else ""
+    if (
+        any(
+            part in {"test", "tests", "testing", "fixtures", "test_helpers", "testhelpers"}
+            for part in parts
+        )
+        or basename == "conftest.py"
+        or (basename.startswith("test_") and basename.endswith(".py"))
+        or (basename.endswith("_test.py"))
+        or basename in {"test_helpers.py", "testhelper.py"}
+    ):
+        return "tests"
+    if any(part in {"benchmark", "benchmarks", "bench"} for part in parts) or (
+        (basename.startswith("benchmark_") or basename.endswith("_benchmark.py"))
+        and basename.endswith(".py")
+    ):
+        return "benchmarks"
+    if any(part in {"example", "examples", "sample", "samples", "demo", "demos"} for part in parts):
+        return "examples"
+    if any(part in {"doc", "docs", "documentation"} for part in parts):
+        return "docs"
+    return "source"
+
+
+def _matches_scope(row: dict[str, object], scope: DiscoveryScope) -> bool:
+    return scope == "all" or _path_scope(row.get("file")) == scope
 
 
 def _compact_discovery_row(row: dict[str, object], query: str) -> dict[str, object]:
@@ -351,7 +532,9 @@ def _compact_discovery_row(row: dict[str, object], query: str) -> dict[str, obje
         "start_line": row.get("start_line"),
         "end_line": row.get("end_line"),
         "score": row.get("_discovery_score", row.get("score", 0)),
-        "matched_terms": row.get("_matched_terms", _query_terms(query)),
+        "matched_terms": row.get("_matched_terms", _analyze_query(query)),
+        "match_type": row.get("_match_type", "terms"),
+        "scope": _path_scope(row.get("file")),
     }
 
 
@@ -363,7 +546,13 @@ def _merge_zvec_hit(
     row = dict(rows_by_key[key])
     fields = hit.get("fields")
     if isinstance(fields, dict):
-        row["snippet"] = _snippet(str(fields.get("text") or ""))
+        row.setdefault("qname", fields.get("qname"))
+        row.setdefault("signature", fields.get("signature"))
+        row.setdefault("file", fields.get("path"))
+        row.setdefault("name", str(fields.get("qname") or "").rsplit(".", 1)[-1])
+        description = _description_only(str(fields.get("text") or ""), fields)
+        row["_description"] = _snippet(description)
+        row["snippet"] = row["_description"]
     row["score"] = hit.get("score")
     return row
 
@@ -373,6 +562,20 @@ def _snippet(text: str, *, max_len: int = 240) -> str:
     if len(collapsed) <= max_len:
         return collapsed
     return f"{collapsed[: max_len - 1].rstrip()}..."
+
+
+def _description_only(text: str, fields: dict[object, object]) -> str:
+    """Strip CodeKG's generated name/qname/signature header from zvec text."""
+
+    qname = str(fields.get("qname") or "")
+    signature = str(fields.get("signature") or "")
+    lines = text.splitlines()
+    if not qname or qname not in lines:
+        return text
+    start = lines.index(qname) + 1
+    if signature and start < len(lines) and lines[start] == signature:
+        start += 1
+    return "\n".join(lines[start:])
 
 
 def get_definition(
