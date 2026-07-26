@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "task_id": "requests-intent-001",
+  "repository": "requests",
+  "repository_commit": "f361ead047be5cb873174218582f7d8b9fcd9f49",
+  "profile": "benchmark",
+  "model": "gpt-5.4-mini",
+  "model_reasoning_effort": "low",
+  "seed": 20260726,
+  "warmups_per_arm": 1,
+  "measured_repetitions": 10,
+  "arms": [
+    "codekg",
+    "native"
+  ],
+  "codekg_tools": [
+    "search_symbols",
+    "get_definition",
+    "find_callers",
+    "find_callees"
+  ],
+  "prompt_files": {
+    "codekg": "prompts/requests-intent-001-codekg.txt",
+    "native": "prompts/requests-intent-001-native.txt"
+  },
+  "schema_file": "codex-answer.schema.json",
+  "gold_file": "gold/requests-intent-001.gold.json"
+}

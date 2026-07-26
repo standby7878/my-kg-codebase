@@ -1,0 +1,46 @@
+Task ID: requests-intent-001
+
+Repository under evaluation: requests
+
+Objective:
+Identify the method responsible for taking a high-level Request together with session-level state, merging the relevant session defaults, and producing the PreparedRequest that will later be sent.
+
+Mandatory native-search protocol:
+1. Your first action must be an actual shell command that prints the working directory and Git root, then searches the repository for likely symbols.
+2. Investigate only the repository provided as the current working directory.
+3. Do not use web search, external documentation, MCP tools, or prior model knowledge as evidence.
+4. Run at least one repository search command and inspect its completed output before reasoning about the answer.
+5. Read the exact implementation source of the strongest candidate with
+   numbered output covering every line of its complete definition.
+6. Read at least one directly relevant caller or delegated helper the same way
+   to confirm the responsibility boundary. Prefer a separate, explicit
+   numbered inspection command for every symbol you intend to report.
+7. Do not modify any files.
+8. Exact repository-relative paths and non-null complete definition line ranges
+   are required. A caller or helper range must cover its complete definition,
+   not merely excerpt lines inspected during investigation.
+9. Every symbol included in `symbols`, `evidence`, or the answer must have its
+   whole definition inspected through its last syntax line. `end_line` must be
+   that last syntax line, with no trailing blank separator. Do not report an
+   extra caller or helper when its complete definition boundary was not
+   inspected, and never use approximate `+` line ranges. A grep match or file
+   mention is not inspection evidence: a successful command must name the
+   exact repository-relative file and emit numbered source output for every
+   line from the reported `start_line` through `end_line` (for example,
+   `nl -ba FILE | sed -n 'START,ENDp'`).
+10. Do not report any symbol, file, line range, or behavior unless verified from completed repository commands.
+11. You may return an infrastructure error only after an actual shell-tool attempt returns an explicit error and that command attempt/error is emitted in the run events. Uncertainty or lack of prior context is not an infrastructure failure.
+12. If repository access or a required command explicitly fails after being attempted, stop and set the answer field to:
+    INFRA_ERROR: native_search_failed
+
+What to distinguish:
+- The method that builds the PreparedRequest using session-level state.
+- The higher-level method that orchestrates the request.
+- The lower-level PreparedRequest method that performs detailed preparation, if delegation occurs.
+
+Return:
+- The primary implementation symbol.
+- Its repository-relative source file and exact line range.
+- One directly relevant caller or delegated helper, with file and line range.
+- A concise explanation of why the primary symbol is the correct responsibility boundary.
+- The final answer must conform to the supplied JSON schema.

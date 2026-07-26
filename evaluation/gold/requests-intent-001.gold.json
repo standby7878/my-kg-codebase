@@ -1,0 +1,40 @@
+{
+  "task_id": "requests-intent-001",
+  "repository": "requests",
+  "commit": "f361ead047be5cb873174218582f7d8b9fcd9f49",
+  "category": "intent_symbol_discovery",
+  "primary": {
+    "symbol": "src.requests.sessions.Session.prepare_request",
+    "accepted_suffixes": [
+      "Session.prepare_request",
+      "sessions.Session.prepare_request"
+    ],
+    "file": "src/requests/sessions.py",
+    "start_line": 511,
+    "end_line": 555
+  },
+  "relevant": [
+    {
+      "symbol": "src.requests.sessions.Session.request",
+      "accepted_suffixes": [
+        "Session.request",
+        "sessions.Session.request"
+      ],
+      "file": "src/requests/sessions.py",
+      "start_line": 557,
+      "end_line": 653,
+      "relationship": "caller"
+    },
+    {
+      "symbol": "src.requests.models.PreparedRequest.prepare",
+      "accepted_suffixes": [
+        "PreparedRequest.prepare",
+        "models.PreparedRequest.prepare"
+      ],
+      "file": "src/requests/models.py",
+      "start_line": 424,
+      "end_line": 451,
+      "relationship": "callee"
+    }
+  ]
+}

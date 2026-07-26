@@ -96,8 +96,12 @@ The frozen benchmark inputs are:
 * [`gold/requests-intent-001.gold.json`](gold/requests-intent-001.gold.json),
   which records exact definition ranges for the primary symbol, caller, and
   delegated helper at that commit;
-* [`codex-answer.schema.json`](codex-answer.schema.json), which requires
-  positive non-null line numbers and repository-relative POSIX paths;
+* [`codex-answer.schema.json`](codex-answer.schema.json), which constrains the
+  model-facing object shape, evidence counts, positive non-null line numbers,
+  and confidence range. Repository-relative POSIX path safety is enforced by
+  the independent post-generation validator; a model-facing negative-lookahead
+  path pattern is intentionally omitted because it breaks structured-output
+  continuation after MCP calls in the pinned Codex CLI;
 * the CodeKG and native prompts under [`prompts/`](prompts/).
 
 The measured CodeKG task can use only `search_symbols`, `get_definition`,
