@@ -13,6 +13,7 @@ from codekg.ingest import index_repository, scan_repository
 from codekg.neo4j_client import Neo4jClient
 from codekg.queries.code import (
     SymbolResolutionError,
+    discover_symbols,
     find_callees,
     find_callers,
     get_definition,
@@ -269,5 +270,69 @@ def test_descriptive_discovery_returns_an_exact_key_for_snapshot_safe_navigation
             )
             gc.collect()
             assert _fresh_reader_counts(zvec_path, current_alpha.repo_name) == (0, 1)
+        finally:
+            client.close()
+
+
+def test_compact_discovery_is_repository_scoped_and_returns_typed_missing_repo(
+    tmp_path: Path,
+) -> None:
+    """Exercise the public discovery contract against two real graph snapshots."""
+
+    pytest.importorskip("zvec")
+    alpha = tmp_path / "alpha"
+    beta = tmp_path / "beta"
+    alpha.mkdir()
+    beta.mkdir()
+    _write_alpha_source(alpha)
+    _write_beta_source(beta)
+    zvec_path = str(tmp_path / "zvec")
+
+    with Neo4jContainer("neo4j:5.26-community", password="password") as container:
+        client = Neo4jClient(
+            uri=container.get_connection_url(),
+            username=container.username,
+            password=container.password,
+        )
+        try:
+            bootstrap_schema(client=client)
+            index_repository(alpha, replace=False, client=client, zvec_path=zvec_path)
+            index_repository(beta, replace=False, client=client, zvec_path=zvec_path)
+            alpha_repo = scan_repository(alpha)
+
+            response = discover_symbols(
+                "calibrate target",
+                repository=alpha_repo.repo_name,
+                mode="hybrid",
+                zvec_path=zvec_path,
+                client=client,
+            )
+            assert response["status"] == "ok"
+            assert response["repository"] == alpha_repo.repo_name
+            assert response["results"]
+            assert all(
+                str(row["symbol_id"]).startswith(f"{alpha_repo.repo_name}@")
+                for row in response["results"]
+            )
+            assert set(response["results"][0]) == {
+                "symbol_id",
+                "qualified_name",
+                "file",
+                "start_line",
+                "end_line",
+                "score",
+                "matched_terms",
+            }
+
+            missing = discover_symbols(
+                "calibrate target",
+                repository="patroni",
+                mode="hybrid",
+                zvec_path=zvec_path,
+                client=client,
+            )
+            assert missing["status"] == "repository_not_found"
+            assert missing["results"] == []
+            assert set(missing["available_repositories"]) == {"alpha", "beta"}
         finally:
             client.close()

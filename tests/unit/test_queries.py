@@ -4,6 +4,7 @@ import pytest
 
 from codekg.queries.code import (
     SymbolResolutionError,
+    discover_symbols,
     find_callees,
     find_callers,
     find_dead_code,
@@ -93,9 +94,10 @@ def test_search_symbols_lexical_resolves_zvec_hits(monkeypatch) -> None:
         assert path is None
         return object()
 
-    def fake_zvec_search(collection, q, *, repo, kind, limit):
+    def fake_zvec_search(collection, q, *, repo, commit, kind, limit):
         assert q == "promote standby"
         assert repo == "patroni"
+        assert commit is None
         assert kind == "method"
         assert limit == 25
         return [
@@ -174,6 +176,186 @@ def test_search_symbols_lexical_omits_stale_hits_and_preserves_zvec_rank(monkeyp
     assert [row["key"] for row in rows] == ["two", "one"]
     assert [row["snippet"] for row in rows] == ["second result", "first result"]
     assert client.calls[0][1]["keys"] == ["stale", "two", "one"]
+    assert client.calls[0][1]["repo"] is None
+
+
+class DiscoveryClient(FakeClient):
+    def __init__(self, repositories, symbol_rows=None) -> None:  # type: ignore[no-untyped-def]
+        super().__init__()
+        self.repositories = repositories
+        self.symbol_rows = symbol_rows or []
+
+    def execute_read(self, query, params=None, *, max_rows=1000):  # type: ignore[no-untyped-def]
+        self.calls.append((query, params or {}, max_rows))
+        if "RETURN r.repo_name AS repo_name" in query:
+            return self.repositories
+        if 'db.index.fulltext.queryNodes("code_symbol_search"' in query:
+            return self.symbol_rows
+        raise AssertionError("unexpected query")
+
+
+def _repository(name="requests", commit="abc") -> dict[str, object]:
+    return {"repo_name": name, "commit": commit}
+
+
+def test_discover_symbols_requires_repository_when_multiple_are_indexed() -> None:
+    client = DiscoveryClient([_repository("click"), _repository("requests")])
+
+    response = discover_symbols("session", mode="graph", client=client)  # type: ignore[arg-type]
+
+    assert response == {
+        "status": "repository_required",
+        "available_repositories": ["click", "requests"],
+        "results": [],
+        "next_cursor": None,
+    }
+    assert len(client.calls) == 1
+
+
+def test_discover_symbols_missing_repository_does_not_search_globally() -> None:
+    client = DiscoveryClient([_repository("click"), _repository("requests")])
+
+    response = discover_symbols("promote", repository="patroni", client=client)  # type: ignore[arg-type]
+
+    assert response["status"] == "repository_not_found"
+    assert response["available_repositories"] == ["click", "requests"]
+    assert len(client.calls) == 1
+
+
+def test_discover_symbols_compacts_results_and_paginates() -> None:
+    rows = [
+        {
+            "key": f"requests@abc:sessions.py:requests.Session.{name}:{line}",
+            "name": name,
+            "qname": f"requests.Session.{name}",
+            "file": "requests/sessions.py",
+            "start_line": line,
+            "end_line": line + 1,
+            "signature": "long data that must not leak",
+            "score": 1.0,
+        }
+        for line, name in ((1, "prepare_request"), (2, "request"), (3, "send"))
+    ]
+    client = DiscoveryClient([_repository()], rows)
+
+    response = discover_symbols(
+        "prepare request", repository="requests", limit=2, mode="graph", client=client
+    )  # type: ignore[arg-type]
+
+    assert response["status"] == "ok"
+    assert response["repository"] == "requests"
+    assert len(response["results"]) == 2
+    first = response["results"][0]
+    assert set(first) == {
+        "symbol_id",
+        "qualified_name",
+        "file",
+        "start_line",
+        "end_line",
+        "score",
+        "matched_terms",
+    }
+    assert first["qualified_name"] == "requests.Session.prepare_request"
+    assert response["next_cursor"]
+    assert client.calls[1][1]["repo"] == "requests"
+    assert client.calls[1][1]["commit"] == "abc"
+    assert client.calls[1][1]["limit"] == 100
+
+    next_page = discover_symbols(
+        "prepare request",
+        repository="requests",
+        limit=2,
+        mode="graph",
+        cursor=response["next_cursor"],
+        client=client,
+    )  # type: ignore[arg-type]
+    assert [row["qualified_name"] for row in next_page["results"]] == ["requests.Session.send"]
+    assert client.calls[3][1]["limit"] == 100
+
+
+def test_discover_symbols_default_limit_and_upper_bound() -> None:
+    client = DiscoveryClient([_repository()])
+    response = discover_symbols("session", mode="graph", client=client)  # type: ignore[arg-type]
+    assert response["repository"] == "requests"
+    with pytest.raises(ValueError, match="between 1 and 20"):
+        discover_symbols("session", repository="requests", limit=21, client=client)  # type: ignore[arg-type]
+
+
+def test_discover_symbols_name_matches_outrank_doc_only_generic_match() -> None:
+    client = DiscoveryClient(
+        [_repository()],
+        [
+            {
+                "key": "doc",
+                "name": "other",
+                "qname": "other",
+                "score": 99.0,
+                "file": "x",
+                "start_line": 1,
+                "end_line": 1,
+            },
+            {
+                "key": "name",
+                "name": "promote_primary",
+                "qname": "x.promote_primary",
+                "score": 1.0,
+                "file": "x",
+                "start_line": 2,
+                "end_line": 2,
+            },
+        ],
+    )
+    response = discover_symbols(
+        "promote primary", repository="requests", mode="graph", client=client
+    )  # type: ignore[arg-type]
+    assert [row["symbol_id"] for row in response["results"]] == ["name", "doc"]
+
+
+def test_discover_hybrid_reranks_bounded_pool_for_exact_multi_term_match(monkeypatch) -> None:
+    """A weak graph hit must beat high-scoring lexical one-term descriptions."""
+
+    client = DiscoveryClient(
+        [_repository()],
+        [
+            {
+                "key": "exact",
+                "name": "prepare_request",
+                "qname": "requests.sessions.Session.prepare_request",
+                "score": 0.01,
+                "file": "requests/sessions.py",
+                "start_line": 511,
+                "end_line": 540,
+            }
+        ],
+    )
+
+    def lexical_hits(*args, **kwargs):  # type: ignore[no-untyped-def]
+        assert kwargs["limit"] == 100
+        return [
+            {
+                "key": f"generic-{index}",
+                "name": "other",
+                "qname": f"other.{index}",
+                "snippet": "primary configuration only",
+                "score": 999.0 - index,
+                "file": "other.py",
+                "start_line": index,
+                "end_line": index,
+            }
+            for index in range(10)
+        ]
+
+    monkeypatch.setattr("codekg.queries.code._search_symbols_lexical", lexical_hits)
+
+    response = discover_symbols(
+        "prepare request session cookies auth",
+        repository="requests",
+        mode="hybrid",
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert response["results"][0]["symbol_id"] == "exact"
+    assert set(response["results"][0]["matched_terms"]) == {"prepare", "request", "session"}
 
 
 def _symbol(key: str = "repo@abc:pkg.py:pkg.fn:1") -> dict[str, object]:

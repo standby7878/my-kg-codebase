@@ -147,6 +147,7 @@ def search_symbols(
     query: str,
     *,
     repo: str | None = None,
+    commit: str | None = None,
     kind: str | None = None,
     limit: int = 25,
 ) -> list[dict[str, Any]]:
@@ -156,6 +157,8 @@ def search_symbols(
     filters = []
     if repo:
         filters.append(f"repo = '{_filter_string(repo)}'")
+    if commit:
+        filters.append(f"commit = '{_filter_string(commit)}'")
     if kind:
         filters.append(f"kind = '{_filter_string(kind)}'")
     docs = collection.query(

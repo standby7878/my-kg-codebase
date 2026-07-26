@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
+import time
 from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
+from fastmcp.tools.tool import ToolResult
 from pydantic import Field
 
+from codekg.queries.code import discover_symbols as query_discover_symbols
 from codekg.queries.code import (
     find_callees as query_find_callees,
 )
@@ -28,16 +33,15 @@ from codekg.queries.code import (
     get_definition as query_get_definition,
 )
 from codekg.queries.code import (
-    search_symbols as query_search_symbols,
-)
-from codekg.queries.code import (
     trace_call_path as query_trace_call_path,
 )
 from codekg.queries.repositories import list_repositories as query_list_repositories
 
 SymbolKind = Literal["function", "method", "type"]
 HierarchyDirection = Literal["ancestors", "descendants"]
-SearchMode = Literal["graph", "lexical"]
+SearchMode = Literal["graph", "lexical", "hybrid"]
+
+logger = logging.getLogger(__name__)
 
 mcp = FastMCP(
     "codekg",
@@ -63,25 +67,90 @@ def list_repositories() -> list[dict[str, Any]]:
 
 @mcp.tool(
     description=(
-        "Search indexed code symbols. mode='graph' searches Neo4j symbol names and "
-        "qualified names. mode='lexical' searches zvec descriptions for indexed functions "
-        "and methods, then resolves exact keys in Neo4j. Use this first when you do not "
-        "know the exact symbol key. Results are capped by the limit argument and can be "
-        "restricted to one indexed commit."
+        "Discover compact, repository-scoped code-symbol candidates. Call "
+        "list_repositories first when the repository is unknown. With multiple indexed "
+        "repositories, repository is required; searches never fall back to other "
+        "repositories. mode='hybrid' combines exact graph-name matching with lexical "
+        "ranking. Use returned symbol_id values with definition and relationship tools."
     )
 )
 def search_symbols(
-    q: Annotated[str, Field(description="Case-insensitive substring to search for.")],
+    query: Annotated[
+        str, Field(description="Terms to search in indexed symbol names and descriptions.")
+    ],
+    repository: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Indexed repository name. Required when more than one repository is indexed; "
+                "omit only when exactly one repository is indexed."
+            )
+        ),
+    ] = None,
     kind: Annotated[SymbolKind | None, Field(description="Optional symbol kind filter.")] = None,
-    repo: Annotated[str | None, Field(description="Optional repository name filter.")] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     mode: Annotated[
         SearchMode,
-        Field(description="graph for Neo4j name search, lexical for zvec description search."),
-    ] = "graph",
-    limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 25,
-) -> list[dict[str, Any]]:
-    return query_search_symbols(q, kind=kind, repo=repo, commit=commit, mode=mode, limit=limit)
+        Field(description="hybrid, graph, or lexical discovery ranking mode."),
+    ] = "hybrid",
+    limit: Annotated[
+        int, Field(ge=1, le=20, description="Maximum compact candidates to return.")
+    ] = 5,
+    cursor: Annotated[
+        str | None,
+        Field(description="Opaque cursor from a previous search with the same scope and query."),
+    ] = None,
+) -> ToolResult:
+    """Return canonical structured discovery data plus a deliberately small text summary."""
+    started = time.perf_counter()
+    response = query_discover_symbols(
+        repository=repository,
+        query=query,
+        kind=kind,
+        commit=commit,
+        mode=mode,
+        limit=limit,
+        cursor=cursor,
+    )
+    structured_bytes = len(json.dumps(response, separators=(",", ":"), default=str).encode())
+    text = _search_summary(response)
+    text_bytes = len(text.encode())
+    logger.info(
+        "codekg_search_symbols %s",
+        json.dumps(
+            {
+                "repository": response.get("repository", repository),
+                "commit": response.get("commit", commit),
+                "mode": mode,
+                "requested_count": limit,
+                "returned_count": len(response.get("results", [])),
+                "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                "structured_bytes": structured_bytes,
+                "text_bytes": text_bytes,
+                "has_next_cursor": bool(response.get("next_cursor")),
+                "status": response.get("status", "ok"),
+            },
+            separators=(",", ":"),
+        ),
+    )
+    return ToolResult(content=text, structured_content=response)
+
+
+def _search_summary(response: dict[str, Any]) -> str:
+    """Human-compatible text that cannot duplicate the structured result payload."""
+    status = str(response.get("status", "ok"))
+    repository = response.get("repository")
+    if status != "ok":
+        return (
+            f"Symbol discovery status={status}; repository={repository!s}. See structured result."
+        )
+    results = response.get("results", [])
+    count = len(results) if isinstance(results, list) else 0
+    more = " More results are available." if response.get("next_cursor") else ""
+    return (
+        f"Found {count} symbol candidate(s) in repository={repository!s}.{more} "
+        "See structured result."
+    )
 
 
 @mcp.tool(

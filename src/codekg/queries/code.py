@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import re
 from typing import Literal
 
@@ -11,6 +14,11 @@ from codekg.zvec_store import search_symbols as zvec_search_symbols
 SymbolKind = Literal["function", "method", "type"]
 HierarchyDirection = Literal["ancestors", "descendants"]
 SearchMode = Literal["graph", "lexical"]
+DiscoverySearchMode = Literal["graph", "lexical", "hybrid"]
+
+_DISCOVERY_DEFAULT_LIMIT = 5
+_DISCOVERY_MAX_LIMIT = 20
+_DISCOVERY_CANDIDATE_POOL = 100
 
 
 class SymbolResolutionError(ValueError):
@@ -52,6 +60,7 @@ def search_symbols(
       AND ($repo IS NULL OR r.repo_name = $repo)
       AND ($commit IS NULL OR r.commit = $commit)
     RETURN s.key AS key,
+           score AS score,
            labels(s) AS labels,
            s.name AS name,
            s.qname AS qname,
@@ -90,7 +99,9 @@ def _search_symbols_lexical(
         return []
     try:
         collection = open_zvec_read(zvec_path)
-        hits = zvec_search_symbols(collection, q, repo=repo, kind=kind, limit=_limit(limit))
+        hits = zvec_search_symbols(
+            collection, q, repo=repo, commit=commit, kind=kind, limit=_limit(limit)
+        )
     except ZvecUnavailableError as exc:
         raise ZvecUnavailableError(
             "zvec lexical search is unavailable; run normal `codekg index`."
@@ -100,7 +111,7 @@ def _search_symbols_lexical(
         return []
     hits = hits[: _limit(limit)]
     keys = list(dict.fromkeys(str(hit["key"]) for hit in hits))
-    rows = _symbol_rows_by_key(client or get_client(), keys, limit, commit=commit)
+    rows = _symbol_rows_by_key(client or get_client(), keys, limit, repo=repo, commit=commit)
     rows_by_key = {str(row["key"]): row for row in rows}
     merged: list[dict[str, object]] = []
     for hit in hits:
@@ -115,6 +126,7 @@ def _symbol_rows_by_key(
     ids: list[str],
     limit: int,
     *,
+    repo: str | None = None,
     commit: str | None = None,
 ) -> list[dict[str, object]]:
     return db.execute_read(
@@ -123,6 +135,7 @@ def _symbol_rows_by_key(
         MATCH (r:Repository)-[:CONTAINS]->(f)
         WHERE (s:Function OR s:Method)
           AND s.key IN $keys
+          AND ($repo IS NULL OR r.repo_name = $repo)
           AND ($commit IS NULL OR r.commit = $commit)
         RETURN s.key AS key,
                labels(s) AS labels,
@@ -135,9 +148,211 @@ def _symbol_rows_by_key(
                r.repo_name AS repo,
                r.commit AS commit
         """,
-        {"keys": ids, "commit": commit},
+        {"keys": ids, "repo": repo, "commit": commit},
         max_rows=_limit(limit),
     )
+
+
+def discover_symbols(
+    query: str,
+    *,
+    repository: str | None = None,
+    commit: str | None = None,
+    kind: SymbolKind | None = None,
+    mode: DiscoverySearchMode = "hybrid",
+    limit: int = _DISCOVERY_DEFAULT_LIMIT,
+    cursor: str | None = None,
+    zvec_path: str | None = None,
+    client: Neo4jClient | None = None,
+) -> dict[str, object]:
+    """Return compact, repository-scoped symbol discovery results.
+
+    This is deliberately separate from :func:`search_symbols`, the lower-level
+    list API retained for evaluation and direct graph callers.
+    """
+
+    if not 1 <= int(limit) <= _DISCOVERY_MAX_LIMIT:
+        raise ValueError(f"limit must be between 1 and {_DISCOVERY_MAX_LIMIT}")
+    db = client or get_client()
+    repositories = _repository_snapshots(db)
+    available = sorted({str(row["repo_name"]) for row in repositories})
+    if repository is None:
+        if len(available) != 1:
+            return {
+                "status": "repository_required",
+                "available_repositories": available,
+                "results": [],
+                "next_cursor": None,
+            }
+        repository = available[0]
+    snapshots = [row for row in repositories if row["repo_name"] == repository]
+    if not snapshots:
+        return {
+            "status": "repository_not_found",
+            "repository": repository,
+            "available_repositories": available,
+            "results": [],
+            "next_cursor": None,
+        }
+    if commit is not None and not any(row["commit"] == commit for row in snapshots):
+        return {
+            "status": "repository_revision_not_found",
+            "repository": repository,
+            "commit": commit,
+            "available_commits": sorted({str(row["commit"]) for row in snapshots}),
+            "results": [],
+            "next_cursor": None,
+        }
+    if commit is None:
+        # A repository name normally identifies one snapshot.  If retention has
+        # left several snapshots, make the selection deterministic and expose it.
+        commit = str(sorted(str(row["commit"]) for row in snapshots)[-1])
+
+    offset = _decode_cursor(cursor, repository, commit, query, mode, kind)
+    # Every page reranks the same bounded, repository-scoped candidate pool.
+    # This makes cursor exhaustion deterministic rather than silently changing
+    # the candidate universe on a later page.
+    candidate_limit = _DISCOVERY_CANDIDATE_POOL
+    graph_rows: list[dict[str, object]] = []
+    lexical_rows: list[dict[str, object]] = []
+    if mode in ("graph", "hybrid"):
+        graph_rows = search_symbols(
+            query, kind=kind, repo=repository, commit=commit, limit=candidate_limit, client=db
+        )
+    if mode in ("lexical", "hybrid"):
+        lexical_rows = _search_symbols_lexical(
+            query,
+            kind=kind,
+            repo=repository,
+            commit=commit,
+            limit=candidate_limit,
+            zvec_path=zvec_path,
+            client=db,
+        )
+    ranked = _rank_discovery_rows(query, [*graph_rows, *lexical_rows])
+    page = ranked[offset : offset + limit + 1]
+    has_more = len(page) > limit
+    page = page[:limit]
+    return {
+        "status": "ok",
+        "repository": repository,
+        "commit": commit,
+        "results": [_compact_discovery_row(row, query) for row in page],
+        "next_cursor": (
+            _encode_cursor(repository, commit, query, mode, kind, offset + limit)
+            if has_more
+            else None
+        ),
+    }
+
+
+def _repository_snapshots(db: Neo4jClient) -> list[dict[str, object]]:
+    return db.execute_read(
+        """
+        MATCH (r:Repository)
+        RETURN r.repo_name AS repo_name, r.commit AS commit
+        ORDER BY repo_name, commit
+        """,
+        max_rows=100,
+    )
+
+
+def _encode_cursor(
+    repository: str,
+    commit: str,
+    query: str,
+    mode: DiscoverySearchMode,
+    kind: SymbolKind | None,
+    offset: int,
+) -> str:
+    payload = {"v": 1, "r": repository, "c": commit, "q": query, "m": mode, "k": kind, "o": offset}
+    return (
+        base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode())
+        .decode()
+        .rstrip("=")
+    )
+
+
+def _decode_cursor(
+    cursor: str | None,
+    repository: str,
+    commit: str,
+    query: str,
+    mode: DiscoverySearchMode,
+    kind: SymbolKind | None,
+) -> int:
+    if cursor is None:
+        return 0
+    try:
+        decoded = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        payload = json.loads(decoded)
+        if not isinstance(payload, dict) or (
+            payload.get("v"),
+            payload.get("r"),
+            payload.get("c"),
+            payload.get("q"),
+            payload.get("m"),
+            payload.get("k"),
+        ) != (1, repository, commit, query, mode, kind):
+            raise ValueError
+        offset = payload.get("o")
+        if not isinstance(offset, int) or offset < 0:
+            raise ValueError
+        return offset
+    except (binascii.Error, ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("cursor does not match this repository search") from exc
+
+
+def _rank_discovery_rows(query: str, rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    terms = _query_terms(query)
+    by_key: dict[str, dict[str, object]] = {}
+    for row in rows:
+        key = str(row.get("key", ""))
+        if not key:
+            continue
+        name_terms = set(_query_terms(str(row.get("name") or "")))
+        qname_terms = set(_query_terms(str(row.get("qname") or "")))
+        matched = set(terms) & (name_terms | qname_terms)
+        description_matched = set(terms) & set(_query_terms(str(row.get("snippet") or "")))
+        # Exact names and qualified names dominate description-only lexical hits.
+        score = min(float(row.get("score") or 0), 10) + len(matched) * 100
+        score += len(description_matched - matched) * 20
+        if " ".join(terms) in str(row.get("qname") or "").lower().replace("_", " "):
+            score += 200
+        row = dict(row)
+        row["_discovery_score"] = score
+        row["_matched_terms"] = sorted(matched | description_matched)
+        current = by_key.get(key)
+        if current is None or float(row["_discovery_score"]) > float(current["_discovery_score"]):
+            by_key[key] = row
+    return sorted(
+        by_key.values(),
+        key=lambda row: (
+            -float(row["_discovery_score"]),
+            str(row.get("qname", "")),
+            str(row.get("key", "")),
+        ),
+    )
+
+
+def _query_terms(value: str) -> list[str]:
+    return [
+        term.lower()
+        for term in re.findall(r"[A-Za-z0-9]+", value.replace("_", " ").replace(".", " "))
+        if len(term) > 1
+    ]
+
+
+def _compact_discovery_row(row: dict[str, object], query: str) -> dict[str, object]:
+    return {
+        "symbol_id": row["key"],
+        "qualified_name": row.get("qname"),
+        "file": row.get("file"),
+        "start_line": row.get("start_line"),
+        "end_line": row.get("end_line"),
+        "score": row.get("_discovery_score", row.get("score", 0)),
+        "matched_terms": row.get("_matched_terms", _query_terms(query)),
+    }
 
 
 def _merge_zvec_hit(

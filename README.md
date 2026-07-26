@@ -60,6 +60,22 @@ bash run-compose.sh dev-local start
 The MCP endpoint is `http://127.0.0.1:8765/mcp`. Neo4j is available locally at
 `http://127.0.0.1:7474` (Browser) and `bolt://127.0.0.1:7687` (Bolt).
 
+### MCP symbol discovery
+
+Start each investigation with `list_repositories`, then call `search_symbols`
+with the exact indexed `repository` name. When more than one repository is
+indexed, the repository argument is required and CodeKG will never substitute
+results from another repository. An absent name returns a typed
+`repository_not_found` response containing the available repository names.
+
+`search_symbols` defaults to five compact candidates (maximum 20) and uses
+`hybrid` ranking, which combines exact name matches with lexical descriptions.
+Each candidate has a stable `symbol_id`, qualified name, file, line span,
+score, and matched terms. Pass `symbol_id` to `get_definition`,
+`find_callers`, `find_callees`, or `trace_call_path`; use `next_cursor` to
+request another page with the same repository, query, and mode. The structured
+MCP result is canonical; its text companion is only a short summary.
+
 ## Index target repositories
 
 To index every configured repository independently:
