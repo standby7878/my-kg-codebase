@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from enum import StrEnum
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Annotated, Any, Literal
 
 from fastmcp import FastMCP
@@ -56,6 +57,16 @@ class SearchScope(StrEnum):
 
 logger = logging.getLogger(__name__)
 
+_WRAPPED_LIST_OUTPUT_SCHEMA = {
+    "description": "Generic wrapper for non-object return types.",
+    "properties": {
+        "result": {"items": {"additionalProperties": True, "type": "object"}, "type": "array"}
+    },
+    "required": ["result"],
+    "type": "object",
+    "x-fastmcp-wrap-result": True,
+}
+
 mcp = FastMCP(
     "codekg",
     instructions=(
@@ -72,10 +83,12 @@ mcp = FastMCP(
         "List repositories currently indexed in the graph, including commit, root path, "
         "and file count. Use this before repository-scoped queries when the repo name "
         "is unknown."
-    )
+    ),
+    output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
-def list_repositories() -> list[dict[str, Any]]:
-    return query_list_repositories()
+def list_repositories() -> ToolResult:
+    rows = _normalize_public_rows(query_list_repositories())
+    return _wrapped_list_result("list_repositories", rows)
 
 
 @mcp.tool(
@@ -138,6 +151,15 @@ def search_symbols(
             cursor=cursor,
         )
     )
+    results = response.get("results")
+    if isinstance(results, list) and all(isinstance(row, dict) for row in results):
+        response["results"] = _normalize_public_rows(
+            results,
+            repository_hint=response.get("repository")
+            if isinstance(response.get("repository"), str)
+            else None,
+            commit_hint=response.get("commit") if isinstance(response.get("commit"), str) else None,
+        )
     _add_discovery_guidance(response, scope)
     structured_bytes = len(json.dumps(response, separators=(",", ":"), default=str).encode())
     text = _search_summary(response)
@@ -201,19 +223,145 @@ def _search_summary(response: dict[str, Any]) -> str:
     )
 
 
+_SUMMARY_NOUNS = {
+    "get_definition": "definition record",
+    "find_callers": "caller",
+    "find_callees": "callee",
+    "trace_call_path": "call path",
+    "find_importers": "importer",
+    "get_class_hierarchy": "related type",
+    "find_dead_code": "unreferenced candidate",
+    "get_complexity": "complexity record",
+}
+
+
+def _wrapped_list_result(tool_name: str, rows: list[dict[str, object]]) -> ToolResult:
+    """Keep MCP list output structured while avoiding JSON duplication in text."""
+    count = len(rows)
+    if tool_name == "list_repositories":
+        text = f"Found {count} indexed {'repository' if count == 1 else 'repositories'}."
+    else:
+        noun = _SUMMARY_NOUNS[tool_name]
+        text = f"Found {count} {noun}{'' if count == 1 else 's'}."
+    structured_content = {"result": rows}
+    logger.info(
+        "codekg_%s %s",
+        tool_name,
+        json.dumps(
+            {
+                "returned_count": count,
+                "structured_bytes": len(
+                    json.dumps(structured_content, separators=(",", ":"), default=str).encode()
+                ),
+                "text_bytes": len(text.encode()),
+            },
+            separators=(",", ":"),
+        ),
+    )
+    return ToolResult(content=text, structured_content=structured_content)
+
+
+def _normalize_public_rows(
+    rows: list[dict[str, object]],
+    *,
+    repository_hint: str | None = None,
+    commit_hint: str | None = None,
+) -> list[dict[str, object]]:
+    """Remove storage-root prefixes from public file paths without changing identities."""
+    normalized = [dict(row) for row in rows]
+    if any(
+        isinstance(row.get("file"), str) and _is_absolute_public_path(row["file"])
+        for row in normalized
+    ):
+        snapshots = [
+            row
+            for row in query_list_repositories()
+            if isinstance(row.get("repo_name"), str) and isinstance(row.get("root_path"), str)
+        ]
+    else:
+        snapshots = []
+    for row in normalized:
+        if "root_path" in row:
+            row["root_path"] = "."
+        file_path = row.get("file")
+        if not isinstance(file_path, str):
+            continue
+        if not _is_absolute_public_path(file_path):
+            row["file"] = _validate_relative_public_path(file_path)
+            continue
+        row_repository = row.get("repo")
+        repository = (
+            row_repository
+            if isinstance(row_repository, str) and row_repository
+            else repository_hint
+        )
+        row_commit = row.get("commit")
+        commit = row_commit if isinstance(row_commit, str) and row_commit else commit_hint
+        root_path = _resolve_indexed_root(snapshots, repository, commit)
+        if not root_path or not _is_absolute_public_path(root_path):
+            raise ValueError("Cannot safely normalize an indexed absolute file path.")
+        try:
+            public_path = _public_path(file_path)
+            indexed_root = _public_path(root_path)
+            if type(public_path) is not type(indexed_root):
+                raise ValueError
+            relative_path = str(public_path.relative_to(indexed_root))
+        except ValueError as exc:
+            raise ValueError("Cannot safely normalize an indexed absolute file path.") from exc
+        row["file"] = _validate_relative_public_path(relative_path)
+    return normalized
+
+
+def _resolve_indexed_root(
+    snapshots: list[dict[str, object]], repository: str | None, commit: str | None
+) -> str | None:
+    if not repository:
+        return None
+    matches = [row for row in snapshots if row["repo_name"] == repository]
+    if commit is not None:
+        matches = [row for row in matches if row.get("commit") == commit]
+    roots = {str(row["root_path"]) for row in matches}
+    return next(iter(roots)) if len(roots) == 1 else None
+
+
+def _validate_relative_public_path(value: str) -> str:
+    normalized = value.replace("\\", "/")
+    if ".." in PurePosixPath(normalized).parts:
+        raise ValueError("Cannot safely normalize an indexed file path containing traversal.")
+    return normalized
+
+
+def _is_absolute_public_path(value: str) -> bool:
+    return (
+        PurePosixPath(value).is_absolute()
+        or PureWindowsPath(value).is_absolute()
+        or value.startswith("\\")
+    )
+
+
+def _public_path(value: str) -> PurePosixPath | PureWindowsPath:
+    if PureWindowsPath(value).is_absolute() or value.startswith("\\"):
+        return PureWindowsPath(value)
+    return PurePosixPath(value)
+
+
 @mcp.tool(
     description=(
         "Verify exact indexed definition metadata and line bounds for one selected symbol. "
         "Pass the symbol_id returned by search_symbols; a qualified-name fallback requires "
         "repo and fails on ambiguity."
-    )
+    ),
+    output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def get_definition(
     identifier: Annotated[str, Field(description="Symbol key or qualified name.")],
     repo: Annotated[str | None, Field(description="Required for qualified-name lookup.")] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
-) -> list[dict[str, Any]]:
-    return query_get_definition(identifier, repo=repo, commit=commit)
+) -> ToolResult:
+    return _wrapped_list_result(
+        "get_definition",
+        _normalize_public_rows(query_get_definition(identifier, repo=repo, commit=commit)),
+    )
 
 
 @mcp.tool(
@@ -221,7 +369,8 @@ def get_definition(
         "Verify bounded incoming relationships for a selected function or method. Pass its "
         "exact symbol_id when available. Depth 1 reads authoritative CallSite resolutions; "
         "deeper traversal uses the dedicated EXACT_CALLS projection."
-    )
+    ),
+    output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def find_callers(
     identifier: Annotated[str, Field(description="Function or method key, or qualified name.")],
@@ -229,8 +378,13 @@ def find_callers(
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS traversal depth.")] = 1,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
-) -> list[dict[str, Any]]:
-    return query_find_callers(identifier, repo=repo, commit=commit, depth=depth, limit=limit)
+) -> ToolResult:
+    return _wrapped_list_result(
+        "find_callers",
+        _normalize_public_rows(
+            query_find_callers(identifier, repo=repo, commit=commit, depth=depth, limit=limit)
+        ),
+    )
 
 
 @mcp.tool(
@@ -238,7 +392,8 @@ def find_callers(
         "Verify bounded outgoing relationships for a selected function or method. Pass its "
         "exact symbol_id when available. Depth 1 reads authoritative CallSite resolutions; "
         "deeper traversal uses the dedicated EXACT_CALLS projection."
-    )
+    ),
+    output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def find_callees(
     identifier: Annotated[str, Field(description="Function or method key, or qualified name.")],
@@ -246,8 +401,13 @@ def find_callees(
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS traversal depth.")] = 1,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
-) -> list[dict[str, Any]]:
-    return query_find_callees(identifier, repo=repo, commit=commit, depth=depth, limit=limit)
+) -> ToolResult:
+    return _wrapped_list_result(
+        "find_callees",
+        _normalize_public_rows(
+            query_find_callees(identifier, repo=repo, commit=commit, depth=depth, limit=limit)
+        ),
+    )
 
 
 @mcp.tool(
@@ -255,7 +415,8 @@ def find_callees(
         "Find a bounded call path between two functions or methods. Prefer exact keys; "
         "qualified-name endpoints require repo. The returned path contains exact key/qname "
         "pairs and uses only EXACT_CALLS projections."
-    )
+    ),
+    output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def trace_call_path(
     from_identifier: Annotated[str, Field(description="Source function or method key/qname.")],
@@ -264,14 +425,19 @@ def trace_call_path(
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     max_depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS path depth.")] = 8,
     limit: Annotated[int, Field(ge=1, le=10, description="Maximum paths to return.")] = 5,
-) -> list[dict[str, Any]]:
-    return query_trace_call_path(
-        from_identifier,
-        to_identifier,
-        repo=repo,
-        commit=commit,
-        max_depth=max_depth,
-        limit=limit,
+) -> ToolResult:
+    return _wrapped_list_result(
+        "trace_call_path",
+        _normalize_public_rows(
+            query_trace_call_path(
+                from_identifier,
+                to_identifier,
+                repo=repo,
+                commit=commit,
+                max_depth=max_depth,
+                limit=limit,
+            )
+        ),
     )
 
 
@@ -279,15 +445,21 @@ def trace_call_path(
     description=(
         "List files that import the selected module. Module keys are exact; module qualified "
         "names require repo. Results are capped and grouped by repository and file path."
-    )
+    ),
+    output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def find_importers(
     module_identifier: Annotated[str, Field(description="Imported module key or qualified name.")],
     repo: Annotated[str | None, Field(description="Required for qualified-name lookup.")] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 100,
-) -> list[dict[str, Any]]:
-    return query_find_importers(module_identifier, repo=repo, commit=commit, limit=limit)
+) -> ToolResult:
+    return _wrapped_list_result(
+        "find_importers",
+        _normalize_public_rows(
+            query_find_importers(module_identifier, repo=repo, commit=commit, limit=limit)
+        ),
+    )
 
 
 @mcp.tool(
@@ -295,7 +467,8 @@ def find_importers(
         "Return ancestors or descendants of a selected type through inheritance and interface "
         "relationships. Exact keys are preferred; qualified names require repo. Direction "
         "must be explicit and results are bounded."
-    )
+    ),
+    output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def get_class_hierarchy(
     identifier: Annotated[str, Field(description="Type key or qualified name.")],
@@ -307,14 +480,19 @@ def get_class_hierarchy(
     ] = "ancestors",
     depth: Annotated[int, Field(ge=1, le=10, description="Maximum hierarchy depth.")] = 5,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
-) -> list[dict[str, Any]]:
-    return query_get_class_hierarchy(
-        identifier,
-        repo=repo,
-        commit=commit,
-        direction=direction,
-        depth=depth,
-        limit=limit,
+) -> ToolResult:
+    return _wrapped_list_result(
+        "get_class_hierarchy",
+        _normalize_public_rows(
+            query_get_class_hierarchy(
+                identifier,
+                repo=repo,
+                commit=commit,
+                direction=direction,
+                depth=depth,
+                limit=limit,
+            )
+        ),
     )
 
 
@@ -323,14 +501,22 @@ def get_class_hierarchy(
         "List callable symbols in a repository with no inbound authoritative CallSite "
         "resolution. Results include incoming_resolved_calls and are unreferenced candidates, "
         "not confirmed dead code."
-    )
+    ),
+    output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def find_dead_code(
     repo: Annotated[str, Field(description="Repository name.")],
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 100,
-) -> list[dict[str, Any]]:
-    return query_find_dead_code(repo, commit=commit, limit=limit)
+) -> ToolResult:
+    return _wrapped_list_result(
+        "find_dead_code",
+        _normalize_public_rows(
+            query_find_dead_code(repo, commit=commit, limit=limit),
+            repository_hint=repo,
+            commit_hint=commit,
+        ),
+    )
 
 
 @mcp.tool(
@@ -338,7 +524,8 @@ def find_dead_code(
         "Return cyclomatic complexity for one symbol, or the most complex symbols in a "
         "repository when a top-N request is provided. An identifier is exact-key-first; "
         "qualified-name lookup requires repo."
-    )
+    ),
+    output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def get_complexity(
     identifier: Annotated[
@@ -351,8 +538,15 @@ def get_complexity(
         int | None,
         Field(ge=1, le=500, description="Return the top N most complex callables."),
     ] = 25,
-) -> list[dict[str, Any]]:
-    return query_get_complexity(identifier, repo=repo, commit=commit, top_n=top_n)
+) -> ToolResult:
+    return _wrapped_list_result(
+        "get_complexity",
+        _normalize_public_rows(
+            query_get_complexity(identifier, repo=repo, commit=commit, top_n=top_n),
+            repository_hint=repo,
+            commit_hint=commit,
+        ),
+    )
 
 
 def main() -> None:

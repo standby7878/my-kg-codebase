@@ -32,6 +32,12 @@ async def test_mcp_registers_exactly_ten_tools() -> None:
     assert "verify bounded incoming" in tools["find_callers"].description.lower()
     assert "verify bounded outgoing" in tools["find_callees"].description.lower()
     assert "unreferenced candidates" in tools["find_dead_code"].description.lower()
+    wrapped_list_tools = set(tools) - {"search_symbols"}
+    assert tools["search_symbols"].output_schema is None
+    assert all(
+        tools[name].output_schema == server._WRAPPED_LIST_OUTPUT_SCHEMA
+        for name in wrapped_list_tools
+    )
 
 
 @pytest.mark.asyncio
@@ -114,6 +120,7 @@ async def test_search_symbols_returns_concise_text_and_canonical_structured_resu
     )
     assert len(text.encode()) < len(json.dumps(response, separators=(",", ":")).encode())
     assert "Session.prepare_request" not in text
+    assert result.structured_content["next_cursor"] == "opaque-next-page"
 
 
 def test_discovery_guidance_preserves_query_diagnostics_and_recommendation() -> None:
@@ -146,3 +153,256 @@ def test_search_symbols_error_summary_does_not_duplicate_available_repositories(
         "See structured result."
     )
     assert "click" not in text
+
+
+@pytest.mark.asyncio
+async def test_list_repositories_uses_structured_rows_and_hides_storage_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "query_list_repositories",
+        lambda: [
+            {
+                "repo_name": "requests",
+                "commit": "f361ead047be",
+                "root_path": "/repos/requests",
+                "files": 37,
+            }
+        ],
+    )
+
+    result = await (await mcp.get_tools())["list_repositories"].run({})
+
+    assert result.structured_content == {
+        "result": [
+            {
+                "repo_name": "requests",
+                "commit": "f361ead047be",
+                "root_path": ".",
+                "files": 37,
+            }
+        ]
+    }
+    text = result.content[0].text
+    assert text == "Found 1 indexed repository."
+    assert "/repos/requests" not in text
+    assert text != json.dumps(result.structured_content)
+    assert server._wrapped_list_result("list_repositories", [{}, {}, {}, {}, {}]).content[
+        0
+    ].text == ("Found 5 indexed repositories.")
+
+
+@pytest.mark.asyncio
+async def test_definition_normalizes_only_file_and_preserves_stable_row_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = {
+        "key": "requests@f361ead047be:sessions.py:Session.prepare_request:511",
+        "qname": "src.requests.sessions.Session.prepare_request",
+        "signature": "def prepare_request(self, request)",
+        "file": "/repos/requests/src/requests/sessions.py",
+        "start_line": 511,
+        "end_line": 555,
+        "repo": "requests",
+        "commit": "f361ead047be",
+    }
+    monkeypatch.setattr(server, "query_get_definition", lambda *_args, **_kwargs: [row])
+    monkeypatch.setattr(
+        server,
+        "query_list_repositories",
+        lambda: [
+            {
+                "repo_name": "requests",
+                "commit": "f361ead047be",
+                "root_path": "/repos/requests",
+            }
+        ],
+    )
+
+    result = await (await mcp.get_tools())["get_definition"].run({"identifier": row["key"]})
+    normalized = result.structured_content["result"][0]
+
+    assert normalized == {**row, "file": "src/requests/sessions.py"}
+    assert result.content[0].text == "Found 1 definition record."
+    assert json.dumps(normalized) not in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_relationship_rows_gain_no_file_field_and_unrelativizable_paths_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller = {"key": "requests@commit:caller.py:caller:1", "qname": "caller", "depth": 1}
+    monkeypatch.setattr(server, "query_find_callers", lambda *_args, **_kwargs: [caller])
+
+    result = await (await mcp.get_tools())["find_callers"].run(
+        {"identifier": "requests@commit:target.py:target:1"}
+    )
+
+    assert result.structured_content == {"result": [caller]}
+    assert "file" not in result.structured_content["result"][0]
+    monkeypatch.setattr(
+        server,
+        "query_list_repositories",
+        lambda: [{"repo_name": "requests", "root_path": "/repos/requests"}],
+    )
+    with pytest.raises(ValueError, match="Cannot safely normalize"):
+        server._normalize_public_rows([{"repo": "requests", "file": "/unrelated/private.py"}])
+
+
+@pytest.mark.asyncio
+async def test_dead_code_normalizes_absolute_paths_using_tool_scope_hints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "query_find_dead_code",
+        lambda *_args, **_kwargs: [
+            {"key": "requests@abc:dead.py:dead:1", "file": "/repos/requests/dead.py"}
+        ],
+    )
+    monkeypatch.setattr(
+        server,
+        "query_list_repositories",
+        lambda: [{"repo_name": "requests", "commit": "abc", "root_path": "/repos/requests"}],
+    )
+
+    result = await (await mcp.get_tools())["find_dead_code"].run(
+        {"repo": "requests", "commit": "abc"}
+    )
+
+    assert result.structured_content["result"][0]["file"] == "dead.py"
+
+
+@pytest.mark.asyncio
+async def test_complexity_normalizes_absolute_paths_using_commit_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "query_get_complexity",
+        lambda *_args, **_kwargs: [{"file": "/repos/new-requests/complex.py", "repo": "requests"}],
+    )
+    monkeypatch.setattr(
+        server,
+        "query_list_repositories",
+        lambda: [
+            {"repo_name": "requests", "commit": "old", "root_path": "/repos/old-requests"},
+            {"repo_name": "requests", "commit": "new", "root_path": "/repos/new-requests"},
+        ],
+    )
+
+    result = await (await mcp.get_tools())["get_complexity"].run(
+        {"repo": "requests", "commit": "new", "top_n": 1}
+    )
+
+    assert result.structured_content["result"][0]["file"] == "complex.py"
+
+
+@pytest.mark.asyncio
+async def test_path_normalization_supports_windows_paths_and_search_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "query_list_repositories",
+        lambda: [
+            {
+                "repo_name": "requests",
+                "commit": "f361ead047be",
+                "root_path": r"C:\repos\requests",
+            }
+        ],
+    )
+    normalized = server._normalize_public_rows(
+        [{"repo": "requests", "file": r"C:\repos\requests\src\requests\sessions.py"}]
+    )
+
+    assert normalized == [{"repo": "requests", "file": "src/requests/sessions.py"}]
+
+    monkeypatch.setattr(
+        server,
+        "query_list_repositories",
+        lambda: [
+            {"repo_name": "requests", "commit": "old", "root_path": r"C:\old\requests"},
+            {
+                "repo_name": "requests",
+                "commit": "f361ead047be",
+                "root_path": r"C:\repos\requests",
+            },
+        ],
+    )
+
+    response = {
+        "status": "ok",
+        "repository": "requests",
+        "commit": "f361ead047be",
+        "results": [
+            {
+                "symbol_id": "requests@f361ead047be:sessions.py:Session.prepare_request:511",
+                "qualified_name": "src.requests.sessions.Session.prepare_request",
+                "file": r"C:\repos\requests\src\requests\sessions.py",
+                "start_line": 511,
+                "end_line": 555,
+                "score": 1.0,
+                "matched_terms": ["prepare"],
+            }
+        ],
+        "next_cursor": "stable-cursor",
+    }
+    monkeypatch.setattr(server, "query_discover_symbols", lambda **_kwargs: response)
+
+    result = await (await mcp.get_tools())["search_symbols"].run(
+        {"repository": "requests", "query": "prepare"}
+    )
+
+    hit = result.structured_content["results"][0]
+    assert hit["file"] == "src/requests/sessions.py"
+    assert "\\" not in hit["file"]
+    assert hit["symbol_id"] == response["results"][0]["symbol_id"]
+    assert result.structured_content["next_cursor"] == "stable-cursor"
+
+
+@pytest.mark.parametrize(
+    ("path", "root"),
+    [
+        ("src/../private.py", None),
+        (r"src\..\private.py", None),
+        ("/repos/requests/src/../private.py", "/repos/requests"),
+        (r"C:\repos\requests\src\..\private.py", r"C:\repos\requests"),
+    ],
+)
+def test_path_normalization_rejects_traversal_in_relative_and_absolute_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    root: str | None,
+) -> None:
+    if root is not None:
+        monkeypatch.setattr(
+            server,
+            "query_list_repositories",
+            lambda: [{"repo_name": "requests", "root_path": root}],
+        )
+    with pytest.raises(ValueError, match="traversal"):
+        server._normalize_public_rows([{"repo": "requests", "file": path}])
+
+
+def test_path_normalization_rejects_ambiguous_snapshot_roots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+
+    monkeypatch.setattr(
+        server,
+        "query_list_repositories",
+        lambda: [
+            {"repo_name": "requests", "commit": "old", "root_path": "/repos/old-requests"},
+            {"repo_name": "requests", "commit": "new", "root_path": "/repos/new-requests"},
+        ],
+    )
+    with pytest.raises(ValueError, match="absolute file path"):
+        server._normalize_public_rows(
+            [{"repo": "requests", "file": "/repos/new-requests/sessions.py"}]
+        )
+    assert server._normalize_public_rows(
+        [{"repo": "requests", "commit": "new", "file": "/repos/new-requests/sessions.py"}]
+    ) == [{"repo": "requests", "commit": "new", "file": "sessions.py"}]
