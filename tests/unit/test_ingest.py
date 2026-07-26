@@ -80,6 +80,16 @@ def test_scan_repository_extracts_python_symbols(tmp_path: Path) -> None:
         "none",
     ]
     assert [call.ordinal for call in worker_file.calls] == [1, 2, 3, 4, 5]
+    assert [
+        (
+            binding.owner_qname,
+            binding.target_name,
+            binding.value_kind,
+            binding.value_name,
+            binding.guarded,
+        )
+        for binding in worker_file.local_bindings
+    ] == [("worker.build", "worker", "call", "Worker", False)]
 
 
 def test_scan_repository_extracts_docstrings_and_markdown_descriptions(tmp_path: Path) -> None:

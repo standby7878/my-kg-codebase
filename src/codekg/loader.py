@@ -133,6 +133,7 @@ def load_repository(
                 "end_line": symbol.end_line,
                 "cyclomatic": symbol.cyclomatic,
                 "parent_qname": symbol.parent_qname,
+                "return_annotation": symbol.return_annotation,
             }
             if symbol.kind == "type":
                 type_rows.append({**row, "kind": "class"})
@@ -672,6 +673,9 @@ def _symbol_ref(row: dict[str, object], *, kind: str) -> SymbolRef:
         path=str(row["path"]),
         kind=kind,
         parent_qname=str(row["parent_qname"]) if row.get("parent_qname") is not None else None,
+        return_annotation=(
+            str(row["return_annotation"]) if row.get("return_annotation") is not None else None
+        ),
     )
 
 

@@ -27,6 +27,21 @@ class CallIR:
 
 
 @dataclass(frozen=True)
+class LocalBindingIR:
+    """One source-ordered function-local name binding relevant to receiver typing."""
+
+    owner_qname: str
+    target_name: str
+    value_kind: Literal["call", "name", "annotation", "unknown"]
+    value_name: str | None
+    value_qname_hint: str | None
+    annotation: str | None
+    start_line: int
+    start_column: int
+    guarded: bool = False
+
+
+@dataclass(frozen=True)
 class InheritanceIR:
     type_qname: str
     base_name: str
@@ -44,6 +59,7 @@ class SymbolIR:
     cyclomatic: int = 1
     parent_qname: str | None = None
     docstring: str | None = None
+    return_annotation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +93,7 @@ class FileIR:
     symbols: tuple[SymbolIR, ...] = ()
     inheritance: tuple[InheritanceIR, ...] = ()
     calls: tuple[CallIR, ...] = ()
+    local_bindings: tuple[LocalBindingIR, ...] = ()
 
 
 @dataclass(frozen=True)

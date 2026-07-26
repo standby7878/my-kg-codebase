@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from codekg.bulk_export import export_repositories, load_bulk_export
-from codekg.ir import CallIR, FileIR, ImportIR, RepositoryIR, SymbolIR
+from codekg.ir import CallIR, FileIR, ImportIR, LocalBindingIR, RepositoryIR, SymbolIR
 
 pytestmark = pytest.mark.unit
 
@@ -56,6 +56,61 @@ def _repo(
                 )
                 if with_call
                 else (),
+            ),
+        ),
+    )
+
+
+def _local_receiver_repo() -> RepositoryIR:
+    return RepositoryIR(
+        repo_name="sample",
+        commit="abc",
+        root_path="/repos/sample",
+        files=(
+            FileIR(
+                path="mod.py",
+                language="python",
+                loc=10,
+                module_qname="mod",
+                symbols=(
+                    SymbolIR("type", "Worker", "mod.Worker", "class Worker", 1, 3),
+                    SymbolIR(
+                        "method",
+                        "run",
+                        "mod.Worker.run",
+                        "def run()",
+                        2,
+                        2,
+                        parent_qname="mod.Worker",
+                    ),
+                    SymbolIR("function", "build", "mod.build", "def build()", 5, 8),
+                ),
+                calls=(
+                    CallIR(
+                        owner_qname="mod.build",
+                        raw_callee="worker.run",
+                        callee_name="run",
+                        callee_qname_hint="mod.worker.run",
+                        receiver_kind="attribute",
+                        start_line=7,
+                        start_column=4,
+                        end_line=7,
+                        end_column=16,
+                        ordinal=1,
+                    ),
+                ),
+                local_bindings=(
+                    LocalBindingIR(
+                        owner_qname="mod.build",
+                        target_name="worker",
+                        value_kind="call",
+                        value_name="Worker",
+                        value_qname_hint="mod.Worker",
+                        annotation=None,
+                        start_line=6,
+                        start_column=21,
+                    ),
+                ),
             ),
         ),
     )
@@ -119,6 +174,18 @@ def test_projected_relationship_keys_equal_callsite_key(tmp_path: Path) -> None:
         with exported.relationship_files[relationship].open(newline="", encoding="utf-8") as handle:
             assert next(csv.reader(handle))[0] == "key"
             assert next(csv.reader(handle))[0] == callsite_key
+
+
+def test_bulk_export_projects_exact_local_receiver_call(tmp_path: Path) -> None:
+    exported = export_repositories([_local_receiver_repo()], tmp_path / "export")
+
+    with exported.relationship_files["EXACT_CALLS"].open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert len(rows) == 1
+    assert rows[0]["resolution"] == "local_receiver"
+    assert rows[0][":START_ID(CodeKG)"] == "sample@abc:mod.py:mod.build:5"
+    assert rows[0][":END_ID(CodeKG)"] == "sample@abc:mod.py:mod.Worker.run:2"
 
 
 def test_duplicate_node_keys_are_rejected_before_manifest(tmp_path: Path) -> None:

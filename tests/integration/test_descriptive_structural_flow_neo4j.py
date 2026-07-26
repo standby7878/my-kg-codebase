@@ -182,6 +182,9 @@ def test_descriptive_discovery_returns_an_exact_key_for_snapshot_safe_navigation
                     "key": expected_caller_key,
                     "qname": "api.dispatch_temperature",
                     "signature": "def dispatch_temperature()",
+                    "file": "api.py",
+                    "start_line": 9,
+                    "end_line": 10,
                     "depth": 1,
                     "resolution": "exact_local",
                 }
@@ -192,6 +195,9 @@ def test_descriptive_discovery_returns_an_exact_key_for_snapshot_safe_navigation
                     "key": target_key,
                     "qname": "api.calibrate_target",
                     "signature": "def calibrate_target()",
+                    "file": "api.py",
+                    "start_line": 4,
+                    "end_line": 6,
                     "depth": 1,
                     "resolution": "exact_local",
                 }
@@ -322,6 +328,8 @@ def test_compact_discovery_is_repository_scoped_and_returns_typed_missing_repo(
                 "end_line",
                 "score",
                 "matched_terms",
+                "match_type",
+                "scope",
             }
 
             missing = discover_symbols(

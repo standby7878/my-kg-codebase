@@ -205,6 +205,9 @@ def test_structural_queries_are_key_first_snapshot_safe_and_callsite_authoritati
             "key": alpha_caller,
             "qname": "shared.caller",
             "signature": "def caller()",
+            "file": "shared.py",
+            "start_line": 2,
+            "end_line": 5,
             "depth": 1,
             "resolution": "exact_local",
         }
@@ -214,6 +217,9 @@ def test_structural_queries_are_key_first_snapshot_safe_and_callsite_authoritati
             "key": alpha_target,
             "qname": "shared.target",
             "signature": "def target()",
+            "file": "shared.py",
+            "start_line": 7,
+            "end_line": 8,
             "depth": 1,
             "resolution": "exact_local",
         }
@@ -223,6 +229,9 @@ def test_structural_queries_are_key_first_snapshot_safe_and_callsite_authoritati
             "key": alpha_caller,
             "qname": "shared.caller",
             "signature": "def caller()",
+            "file": "shared.py",
+            "start_line": 2,
+            "end_line": 5,
             "depth": 1,
         }
     ]
@@ -231,6 +240,9 @@ def test_structural_queries_are_key_first_snapshot_safe_and_callsite_authoritati
             "key": alpha_target,
             "qname": "shared.target",
             "signature": "def target()",
+            "file": "shared.py",
+            "start_line": 7,
+            "end_line": 8,
             "depth": 1,
         }
     ]

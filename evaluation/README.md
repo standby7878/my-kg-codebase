@@ -79,3 +79,149 @@ line, direct local calls, `cls`, `self`, `super`, dynamic receivers, nested
 scopes, and definition-time decorator/default/annotation calls. It is a
 correctness gate, not an attempt to claim semantic coverage of framework
 registration or reflection.
+
+## Requests Codex benchmark
+
+This directory is also the sole canonical package for the paired Requests
+agent benchmark. The benchmark is intentionally separate from `codekg
+evaluate`: it compares a four-tool CodeKG investigation with a native
+repository-search investigation while holding the model, reasoning effort,
+output schema, sandbox, rules, and run order constant.
+
+The frozen benchmark inputs are:
+
+* [`benchmark-manifest.json`](benchmark-manifest.json), which pins the Requests
+  commit, model (`gpt-5.4-mini`), reasoning effort (`low`), seed, trial counts,
+  arms, and package paths;
+* [`gold/requests-intent-001.gold.json`](gold/requests-intent-001.gold.json),
+  which records exact definition ranges for the primary symbol, caller, and
+  delegated helper at that commit;
+* [`codex-answer.schema.json`](codex-answer.schema.json), which requires
+  positive non-null line numbers and repository-relative POSIX paths;
+* the CodeKG and native prompts under [`prompts/`](prompts/).
+
+The measured CodeKG task can use only `search_symbols`, `get_definition`,
+`find_callers`, and `find_callees`. Repository/index discovery is a batch
+preflight operation and is not part of a measured task. The CodeKG prompt
+allows no shell or web use, caps search at two calls, and limits conclusions to
+structural evidence available from definition and relationship metadata.
+
+### Plan and preflight
+
+The runner defaults to a free plan operation. It verifies the frozen Requests
+checkout and package files, freezes their SHA-256 hashes, and prints the seeded
+schedule without launching a task. It also records `codex --version` and
+validates the readable model, reasoning, web, multi-agent, and CodeKG tool
+contract from the benchmark profile:
+
+```bash
+python3 evaluation/run_benchmark.py plan \
+  --requests /media/alex/MYSSD/BACKUP/workspace/codekg-corpus/requests
+```
+
+`--profile benchmark` always loads
+`$CODEX_HOME/benchmark.config.toml` (or `~/.codex/benchmark.config.toml` when
+`CODEX_HOME` is unset). Consequently, `--profile-path` is an integrity-check
+argument, not an alternate profile loader: when supplied, it must resolve to
+that exact path. The frozen runner likewise rejects a manifest whose `profile`
+field is anything other than `benchmark`.
+
+A real batch run requires the explicit `--execute` acknowledgement:
+
+```bash
+python3 evaluation/run_benchmark.py run \
+  --execute \
+  --requests /media/alex/MYSSD/BACKUP/workspace/codekg-corpus/requests \
+  --output runs/requests-20260726
+```
+
+Do not reuse an output directory. The runner refuses to overwrite it or any
+trial artifact. It uses the `benchmark` profile, `--strict-config`,
+`--ignore-user-config`, `--ephemeral`, sequential execution, disabled
+multi-agent behavior, and a fresh `codex exec` process for every trial. The
+profile remains explicitly selected, hashed, and contract-validated; ignoring
+the unrelated base user config prevents other MCP servers and settings from
+entering the benchmark. Batch preflight temporarily exposes
+only `list_repositories` for repository/commit discovery, then uses the four
+measured tools for a graph smoke test. The smoke test requires the exact
+`Session.prepare_request` definition plus its `Session.request` caller and
+`PreparedRequest.prepare` callee, including complete locations. Measured
+CodeKG trials expose exactly those same four tools, while native trials set the
+CodeKG server to both disabled and not required.
+
+Immediately before and after each repository preflight, graph preflight,
+warm-up, and measured trial, the runner rechecks every frozen input hash plus
+the Requests Git root, pinned commit, and clean working tree. Any drift aborts
+the batch before another Codex process starts. This is especially important for
+the native arm's `danger-full-access` execution: a repository write leaves the
+partial immutable artifacts in place for diagnosis but cannot contaminate a
+later trial.
+
+The schedule contains one excluded warm-up per arm followed by ten paired,
+measured repetitions per arm. Exactly half of the measured pairs run CodeKG
+first and half native first; the manifest seed deterministically randomizes
+which repetitions use each ordering. Failed or invalid trials remain in place
+and are never replaced.
+
+The repository checkout must be trusted: both arms use
+`danger-full-access` because the benchmark host may not support the read-only
+Bubblewrap network namespace. The prompts prohibit writes, but that instruction
+is not a security boundary.
+
+### Artifacts, validation, and aggregation
+
+Each trial directory contains:
+
+```text
+answer.json
+events.jsonl
+stderr.log
+metadata.json
+validation.json
+metrics.json
+```
+
+Validation checks the JSONL/final-answer match, schema rules, exact Git-relative
+paths, complete ranges, required tool order and arguments, native command
+evidence, and CodeKG provenance. Every CodeKG symbol, file, and range in the
+answer must occur in a successful structured MCP result. The two relationship
+calls must both succeed for the selected symbol, with at least one nonempty
+relationship result. Every trial must have one nonempty thread ID, and
+aggregation rejects a reused thread ID. Aggregation also requires the exact
+seeded `(ordinal, arm, repetition, warmup)` schedule rather than accepting a
+batch merely because it has the expected total number of results.
+
+To validate an independently captured trial:
+
+```bash
+python3 evaluation/validate_benchmark.py \
+  runs/requests-20260726/trials/02-rep-01-codekg \
+  --requests /media/alex/MYSSD/BACKUP/workspace/codekg-corpus/requests
+```
+
+To aggregate a completed immutable batch:
+
+```bash
+python3 evaluation/aggregate_benchmark.py \
+  runs/requests-20260726 \
+  --output runs/requests-20260726-summary.json
+```
+
+The report separates infrastructure status, retrieval, and agent outcomes. It
+includes raw samples, medians, nearest-rank p95, bootstrap 95% confidence
+intervals for medians, paired CodeKG-minus-native deltas, success rate, and
+evidence-compliance rate. It reports both intention-to-treat and valid-only
+views. Token metrics distinguish total, cached, and uncached input plus output,
+reasoning, and cache-hit ratio. MCP response bytes are measured from emitted
+results. Unsupported-claim count is the number of reported symbols, files, or
+ranges that lack tool provenance; it does not pretend to semantically grade
+free-form behavioral prose. MCP latency is deliberately omitted because current
+JSONL tool events do not provide reliable timestamps; it must only be added
+from correlated server telemetry.
+
+No benchmark command in this package launches paid trials during normal tests.
+Focused tests use fixtures and a fake Codex process:
+
+```bash
+.venv/bin/python -m pytest -q evaluation/tests
+```

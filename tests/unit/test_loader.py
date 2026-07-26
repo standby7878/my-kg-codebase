@@ -6,6 +6,7 @@ from codekg.ir import (
     CallIR,
     FileIR,
     ImportIR,
+    LocalBindingIR,
     ModuleInitIR,
     ParseDiagnosticIR,
     RepositoryIR,
@@ -91,6 +92,63 @@ def _repo(*, parse_error: bool = False) -> RepositoryIR:
                     _call("worker.build", "factory()", None, receiver_kind="dynamic", ordinal=2),
                     _call("worker.build", "target", "worker.target", ordinal=3),
                     _call("worker.__module__", "run", "worker.Worker.run", ordinal=4),
+                ),
+            ),
+        ),
+    )
+
+
+def _local_receiver_repo() -> RepositoryIR:
+    return RepositoryIR(
+        repo_name="sample",
+        commit="abc123",
+        root_path="/repos/sample",
+        files=(
+            FileIR(
+                path="worker.py",
+                language="python",
+                loc=12,
+                module_qname="worker",
+                module_init=ModuleInitIR("worker.__module__", 1, 12),
+                symbols=(
+                    SymbolIR("type", "Worker", "worker.Worker", "class Worker", 1, 5),
+                    SymbolIR(
+                        "method",
+                        "run",
+                        "worker.Worker.run",
+                        "def run(self)",
+                        2,
+                        3,
+                        parent_qname="worker.Worker",
+                    ),
+                    SymbolIR("function", "build", "worker.build", "def build()", 7, 10),
+                ),
+                calls=(
+                    _call("worker.build", "Worker", "worker.Worker", ordinal=1),
+                    CallIR(
+                        owner_qname="worker.build",
+                        raw_callee="worker.run",
+                        callee_name="run",
+                        callee_qname_hint="worker.run",
+                        receiver_kind="attribute",
+                        start_line=9,
+                        start_column=4,
+                        end_line=9,
+                        end_column=16,
+                        ordinal=2,
+                    ),
+                ),
+                local_bindings=(
+                    LocalBindingIR(
+                        owner_qname="worker.build",
+                        target_name="worker",
+                        value_kind="call",
+                        value_name="Worker",
+                        value_qname_hint="worker.Worker",
+                        annotation=None,
+                        start_line=8,
+                        start_column=21,
+                    ),
                 ),
             ),
         ),
@@ -235,6 +293,25 @@ def test_load_repository_import_rows_use_a_non_nullable_relationship_key() -> No
             "key": "sample@abc123:worker.py:import:pathlib:Path:P",
         },
     ]
+
+
+def test_load_repository_projects_exact_local_receiver_call() -> None:
+    client = FakeClient()
+
+    result = load_repository(
+        _local_receiver_repo(),
+        replace=False,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert result["callsite_statuses"] == {
+        "constructor_exact_local": 1,
+        "local_receiver": 1,
+    }
+    resolved = _rows_for_query(client, "rel:EXACT_CALLS")
+    local_receiver = next(row for row in resolved if row["resolution"] == "local_receiver")
+    assert local_receiver["caller_key"] == "sample@abc123:worker.py:worker.build:7"
+    assert local_receiver["callee_key"] == "sample@abc123:worker.py:worker.Worker.run:2"
 
 
 def test_load_repository_rejects_invalid_batch_size() -> None:

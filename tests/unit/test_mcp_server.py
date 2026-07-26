@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -68,6 +69,7 @@ async def test_search_symbols_has_compact_repository_scoped_schema() -> None:
 @pytest.mark.asyncio
 async def test_search_symbols_returns_concise_text_and_canonical_structured_result(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     response = {
         "status": "ok",
@@ -82,9 +84,19 @@ async def test_search_symbols_returns_concise_text_and_canonical_structured_resu
                 "end_line": 500,
                 "score": 12.34,
                 "matched_terms": ["prepare", "session"],
+                "match_type": "exact_qualified_name",
+                "scope": "source",
             }
         ],
         "next_cursor": "opaque-next-page",
+        "diagnostics": {
+            "candidate_pool": 100,
+            "scoped_candidate_count": 7,
+            "ranked_count": 7,
+            "exact_match_count": 1,
+            "query_terms": ["prepare", "session"],
+            "ignored_terms": [],
+        },
     }
     captured: dict[str, object] = {}
 
@@ -93,6 +105,7 @@ async def test_search_symbols_returns_concise_text_and_canonical_structured_resu
         return response
 
     monkeypatch.setattr(server, "query_discover_symbols", fake_discover_symbols)
+    caplog.set_level(logging.INFO, logger=server.__name__)
     tool = (await mcp.get_tools())["search_symbols"]
     result = await tool.run({"repository": "requests", "query": "prepare session"})
 
@@ -107,9 +120,23 @@ async def test_search_symbols_returns_concise_text_and_canonical_structured_resu
         "cursor": None,
     }
     assert result.structured_content == {
-        **response,
+        "status": "ok",
+        "repository": "requests",
+        "commit": "f361ead047be",
+        "results": [
+            {
+                "symbol_id": "requests@f361ead047be:sessions.py:Session.prepare_request:450",
+                "qualified_name": "requests.sessions.Session.prepare_request",
+                "file": "requests/sessions.py",
+                "start_line": 450,
+                "end_line": 500,
+                "score": 12.34,
+                "matched_terms": ["prepare", "session"],
+                "match_type": "exact_qualified_name",
+            }
+        ],
+        "next_cursor": "opaque-next-page",
         "scope": "source",
-        "diagnostics": {"scope": "source", "candidate_count": 1},
         "recommended_next_tool": "get_definition",
         "recommended_symbol_id": "requests@f361ead047be:sessions.py:Session.prepare_request:450",
     }
@@ -121,6 +148,14 @@ async def test_search_symbols_returns_concise_text_and_canonical_structured_resu
     assert len(text.encode()) < len(json.dumps(response, separators=(",", ":")).encode())
     assert "Session.prepare_request" not in text
     assert result.structured_content["next_cursor"] == "opaque-next-page"
+    assert "diagnostics" not in result.structured_content
+    assert "scope" not in result.structured_content["results"][0]
+    log = next(
+        record.message for record in caplog.records if record.message.startswith("codekg_search")
+    )
+    assert '"candidate_pool":100' in log
+    assert '"query_terms_count":2' in log
+    assert "prepare session" not in log
 
 
 def test_discovery_guidance_preserves_query_diagnostics_and_recommendation() -> None:
@@ -229,18 +264,37 @@ async def test_definition_normalizes_only_file_and_preserves_stable_row_fields(
 
 
 @pytest.mark.asyncio
-async def test_relationship_rows_gain_no_file_field_and_unrelativizable_paths_fail_closed(
+async def test_relationship_rows_use_symbol_identity_to_normalize_paths_and_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    caller = {"key": "requests@commit:caller.py:caller:1", "qname": "caller", "depth": 1}
+    caller = {
+        "key": "requests@commit:caller.py:caller:1",
+        "qname": "caller",
+        "file": "/repos/requests/caller.py",
+        "start_line": 1,
+        "end_line": 2,
+        "depth": 1,
+    }
     monkeypatch.setattr(server, "query_find_callers", lambda *_args, **_kwargs: [caller])
+    monkeypatch.setattr(
+        server,
+        "query_list_repositories",
+        lambda: [
+            {
+                "repo_name": "requests",
+                "commit": "commit",
+                "root_path": "/repos/requests",
+            }
+        ],
+    )
 
     result = await (await mcp.get_tools())["find_callers"].run(
         {"identifier": "requests@commit:target.py:target:1"}
     )
 
-    assert result.structured_content == {"result": [caller]}
-    assert "file" not in result.structured_content["result"][0]
+    assert result.structured_content == {
+        "result": [{**caller, "file": "caller.py"}],
+    }
     monkeypatch.setattr(
         server,
         "query_list_repositories",

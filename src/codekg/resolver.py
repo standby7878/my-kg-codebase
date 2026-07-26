@@ -9,11 +9,15 @@ the loader turns successful resolutions into graph relationships.
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
-from codekg.ir import CallIR, FileIR, RepositoryIR
+from codekg.ir import CallIR, FileIR, LocalBindingIR, RepositoryIR
+
+_IDENTIFIER = re.compile(r"[A-Za-z_]\w*")
+_DOTTED_IDENTIFIER = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
 
 EXACT_RESOLUTION_STATUSES = frozenset(
     {
@@ -23,6 +27,8 @@ EXACT_RESOLUTION_STATUSES = frozenset(
         "cls_direct",
         "inherited_method",
         "super_method",
+        "local_receiver",
+        "local_receiver_inherited",
     }
 )
 CONSTRUCTOR_RESOLUTION_STATUSES = frozenset(
@@ -43,6 +49,7 @@ class SymbolRef:
     path: str
     kind: str
     parent_qname: str | None = None
+    return_annotation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -130,7 +137,184 @@ class _Resolver:
             return self._resolve_receiver_method(file, call, owner, is_super=False)
         if call.receiver_kind == "super":
             return self._resolve_receiver_method(file, call, owner, is_super=True)
+        if call.receiver_kind == "attribute":
+            local = self._resolve_local_receiver(file, call, owner)
+            if local is not None:
+                return local
         return self._resolve_direct(file, call, owner)
+
+    def _resolve_local_receiver(
+        self,
+        file: FileIR,
+        call: CallIR,
+        owner: SymbolRef,
+    ) -> CallResolution | None:
+        parts = call.raw_callee.split(".")
+        if len(parts) != 2 or not all(_IDENTIFIER.fullmatch(part) for part in parts):
+            return None
+        receiver_type = self._local_receiver_type(file, call, owner, parts[0])
+        if receiver_type is None:
+            return None
+
+        direct = self._methods_for_type(receiver_type, call.callee_name)
+        if len(direct) == 1:
+            return CallResolution(
+                call,
+                file.path,
+                owner.key,
+                "local_receiver",
+                (direct[0].key,),
+                direct[0].key,
+            )
+        if len(direct) > 1:
+            return CallResolution(
+                call,
+                file.path,
+                owner.key,
+                "ambiguous",
+                tuple(ref.key for ref in direct),
+            )
+        mro = self._mro(receiver_type)
+        if mro is None:
+            return CallResolution(call, file.path, owner.key, "mro_incomplete", ())
+        for type_qname in mro[1:]:
+            inherited = self._methods_for_type(type_qname, call.callee_name)
+            if len(inherited) == 1:
+                return CallResolution(
+                    call,
+                    file.path,
+                    owner.key,
+                    "local_receiver_inherited",
+                    (inherited[0].key,),
+                    inherited[0].key,
+                )
+            if len(inherited) > 1:
+                return CallResolution(
+                    call,
+                    file.path,
+                    owner.key,
+                    "ambiguous",
+                    tuple(ref.key for ref in inherited),
+                )
+        return CallResolution(call, file.path, owner.key, "unresolved", ())
+
+    def _local_receiver_type(
+        self,
+        file: FileIR,
+        call: CallIR,
+        owner: SymbolRef,
+        receiver_name: str,
+    ) -> str | None:
+        state: dict[str, str | None] = {}
+        call_position = (call.start_line, call.start_column)
+        bindings = sorted(
+            (
+                binding
+                for binding in file.local_bindings
+                if binding.owner_qname == call.owner_qname
+                and (binding.start_line, binding.start_column) < call_position
+            ),
+            key=lambda binding: (
+                binding.start_line,
+                binding.start_column,
+                binding.target_name,
+            ),
+        )
+        for binding in bindings:
+            if binding.guarded:
+                state[binding.target_name] = None
+                continue
+            annotation_type = self._annotation_type(file, binding.annotation)
+            if binding.annotation is not None:
+                if annotation_type is None:
+                    state[binding.target_name] = None
+                elif binding.value_kind == "annotation":
+                    state[binding.target_name] = annotation_type
+                elif binding.value_kind == "name":
+                    value_type = state.get(str(binding.value_name))
+                    state[binding.target_name] = (
+                        annotation_type if value_type == annotation_type else None
+                    )
+                elif binding.value_kind == "call":
+                    value_type = self._call_result_type(file, binding, owner)
+                    state[binding.target_name] = (
+                        annotation_type if value_type == annotation_type else None
+                    )
+                else:
+                    state[binding.target_name] = None
+                continue
+            if binding.value_kind == "name":
+                state[binding.target_name] = state.get(str(binding.value_name))
+                continue
+            if binding.value_kind == "call":
+                state[binding.target_name] = self._call_result_type(file, binding, owner)
+                continue
+            state[binding.target_name] = None
+        return state.get(receiver_name)
+
+    def _call_result_type(
+        self,
+        file: FileIR,
+        binding: LocalBindingIR,
+        owner: SymbolRef,
+    ) -> str | None:
+        candidates, _ = self._binding_call_candidates(file, binding, owner)
+        type_refs = self._type_candidates(candidates)
+        if len(type_refs) == 1:
+            return type_refs[0].qname
+        if type_refs:
+            return None
+        factories = self._callable_candidates(candidates)
+        if len(factories) != 1 or factories[0].return_annotation is None:
+            return None
+        factory_file = self.file_by_path.get(factories[0].path)
+        if factory_file is None:
+            return None
+        return self._annotation_type(factory_file, factories[0].return_annotation)
+
+    def _binding_call_candidates(
+        self,
+        file: FileIR,
+        binding: LocalBindingIR,
+        owner: SymbolRef,
+    ) -> tuple[tuple[str, ...], frozenset[str]]:
+        candidates: list[str] = []
+        imported: set[str] = set()
+        if binding.value_qname_hint:
+            candidates.append(binding.value_qname_hint)
+        if binding.value_name:
+            candidates.extend(
+                _lexical_candidates(owner.qname, file.module_qname, binding.value_name)
+            )
+        raw = binding.value_qname_hint or binding.value_name or ""
+        root, dot, rest = raw.partition(".")
+        bindings = _import_bindings(file)
+        if root in bindings:
+            target = f"{bindings[root]}.{rest}" if dot else bindings[root]
+            candidates.append(target)
+            imported.add(target)
+        if binding.value_name and binding.value_name in bindings:
+            candidates.append(bindings[binding.value_name])
+            imported.add(bindings[binding.value_name])
+        return tuple(dict.fromkeys(candidates)), frozenset(imported)
+
+    def _annotation_type(self, file: FileIR, annotation: str | None) -> str | None:
+        if annotation is None:
+            return None
+        value = annotation.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1].strip()
+        if not _DOTTED_IDENTIFIER.fullmatch(value):
+            return None
+        candidates = [value]
+        bindings = _import_bindings(file)
+        root, dot, rest = value.partition(".")
+        if root in bindings:
+            candidates.append(f"{bindings[root]}.{rest}" if dot else bindings[root])
+        if not dot:
+            candidates.append(f"{file.module_qname}.{value}")
+        refs = self._type_candidates(dict.fromkeys(candidates))
+        return refs[0].qname if len(refs) == 1 else None
 
     def _resolve_direct(self, file: FileIR, call: CallIR, owner: SymbolRef) -> CallResolution:
         candidates, import_candidate = self._direct_candidates(file, call, owner)

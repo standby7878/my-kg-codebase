@@ -62,10 +62,12 @@ The MCP endpoint is `http://127.0.0.1:8765/mcp`. Neo4j is available locally at
 
 ### MCP symbol discovery
 
-Start each investigation with `list_repositories`, then call `search_symbols`
-with the exact indexed `repository` name. When more than one repository is
-indexed, the repository argument is required and CodeKG will never substitute
-results from another repository. An absent name returns a typed
+Use `list_repositories` when the indexed repository name or revision is
+unknown, then call `search_symbols` with the exact indexed `repository` name.
+For benchmark batches, perform that repository check once as an unmeasured
+preflight instead of repeating it in every task. When more than one repository
+is indexed, the repository argument is required and CodeKG will never
+substitute results from another repository. An absent name returns a typed
 `repository_not_found` response containing the available repository names.
 
 `search_symbols` defaults to five compact candidates (maximum 20) and uses
@@ -77,12 +79,14 @@ candidate pool. It keeps default source discovery narrow, but it is not a
 guarantee of strict scope-recall beyond that pool; strict backend scope
 filtering and re-indexing are deferred. Each candidate has a stable
 `symbol_id`, qualified name, file, line span, score, matched terms, and match
-type. Search also returns compact
-scope diagnostics and, for a plausible first result, recommends
-`get_definition` with its exact symbol ID. Use that definition call to verify
-indexed metadata and line bounds, then use `find_callers` or `find_callees` to
-verify relationships. Use `next_cursor` only when no candidate is plausible,
-with the same repository, query, mode, and scope. The structured MCP result is
+type. Internal candidate-pool and ranking diagnostics are logged for
+operations and evaluation but omitted from the normal agent-facing response.
+For a plausible first result, search recommends `get_definition` with its
+exact symbol ID. Use that definition call to verify indexed metadata and line
+bounds, then use `find_callers` or `find_callees` to verify relationships;
+relationship rows include repository-relative definition paths and complete
+line bounds. Use `next_cursor` only when no candidate is plausible, with the
+same repository, query, mode, and scope. The structured MCP result is
 canonical; its text companion is only a short summary.
 
 ## Index target repositories

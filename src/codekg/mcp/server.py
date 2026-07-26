@@ -56,6 +56,8 @@ class SearchScope(StrEnum):
 
 
 logger = logging.getLogger(__name__)
+_LOG_LEVEL = os.getenv("CODEKG_LOG_LEVEL", "INFO").upper()
+logger.setLevel(getattr(logging, _LOG_LEVEL, logging.INFO))
 
 _WRAPPED_LIST_OUTPUT_SCHEMA = {
     "description": "Generic wrapper for non-object return types.",
@@ -151,8 +153,13 @@ def search_symbols(
             cursor=cursor,
         )
     )
+    # Query diagnostics remain available to direct callers and internal logging,
+    # but discovery's public MCP response is intentionally selection-focused.
+    diagnostics = response.pop("diagnostics", {})
     results = response.get("results")
     if isinstance(results, list) and all(isinstance(row, dict) for row in results):
+        for row in results:
+            row.pop("scope", None)
         response["results"] = _normalize_public_rows(
             results,
             repository_hint=response.get("repository")
@@ -179,6 +186,7 @@ def search_symbols(
                 "text_bytes": text_bytes,
                 "has_next_cursor": bool(response.get("next_cursor")),
                 "status": response.get("status", "ok"),
+                "diagnostics": _safe_search_diagnostics(diagnostics, scope),
             },
             separators=(",", ":"),
         ),
@@ -186,15 +194,26 @@ def search_symbols(
     return ToolResult(content=text, structured_content=response)
 
 
+def _safe_search_diagnostics(diagnostics: object, scope: SearchScope) -> dict[str, object]:
+    """Retain aggregate ranking observability without logging query text or paths."""
+    if not isinstance(diagnostics, dict):
+        return {"scope": scope.value}
+    safe = {"scope": diagnostics.get("scope", scope.value)}
+    for key in ("candidate_pool", "scoped_candidate_count", "ranked_count", "exact_match_count"):
+        value = diagnostics.get(key)
+        if isinstance(value, int):
+            safe[key] = value
+    for key in ("query_terms", "ignored_terms"):
+        value = diagnostics.get(key)
+        if isinstance(value, list):
+            safe[f"{key}_count"] = len(value)
+    return safe
+
+
 def _add_discovery_guidance(response: dict[str, object], scope: SearchScope) -> None:
     """Keep scope and the discovery-to-evidence workflow visible to MCP clients."""
     response.setdefault("scope", scope.value)
     results = response.get("results")
-    result_count = len(results) if isinstance(results, list) else 0
-    response.setdefault(
-        "diagnostics",
-        {"scope": scope.value, "candidate_count": result_count},
-    )
     if response.get("status", "ok") != "ok" or not isinstance(results, list) or not results:
         return
     first = results[0]
@@ -345,6 +364,19 @@ def _public_path(value: str) -> PurePosixPath | PureWindowsPath:
     return PurePosixPath(value)
 
 
+def _symbol_identity_hints(
+    identifier: str, repo: str | None, commit: str | None
+) -> tuple[str | None, str | None]:
+    """Use an exact stable symbol ID to normalize paths without exposing identity fields."""
+    if repo is not None and commit is not None:
+        return repo, commit
+    repository_part, separator, remainder = identifier.partition("@")
+    indexed_commit, commit_separator, _ = remainder.partition(":")
+    if separator and commit_separator and repository_part and indexed_commit:
+        return repo or repository_part, commit or indexed_commit
+    return repo, commit
+
+
 @mcp.tool(
     description=(
         "Verify exact indexed definition metadata and line bounds for one selected symbol. "
@@ -379,10 +411,13 @@ def find_callers(
     depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS traversal depth.")] = 1,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
 ) -> ToolResult:
+    repository_hint, commit_hint = _symbol_identity_hints(identifier, repo, commit)
     return _wrapped_list_result(
         "find_callers",
         _normalize_public_rows(
-            query_find_callers(identifier, repo=repo, commit=commit, depth=depth, limit=limit)
+            query_find_callers(identifier, repo=repo, commit=commit, depth=depth, limit=limit),
+            repository_hint=repository_hint,
+            commit_hint=commit_hint,
         ),
     )
 
@@ -402,10 +437,13 @@ def find_callees(
     depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS traversal depth.")] = 1,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
 ) -> ToolResult:
+    repository_hint, commit_hint = _symbol_identity_hints(identifier, repo, commit)
     return _wrapped_list_result(
         "find_callees",
         _normalize_public_rows(
-            query_find_callees(identifier, repo=repo, commit=commit, depth=depth, limit=limit)
+            query_find_callees(identifier, repo=repo, commit=commit, depth=depth, limit=limit),
+            repository_hint=repository_hint,
+            commit_hint=commit_hint,
         ),
     )
 

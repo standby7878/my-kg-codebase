@@ -13,6 +13,7 @@ from codekg.ir import (
     FileIR,
     ImportIR,
     InheritanceIR,
+    LocalBindingIR,
     ModuleInitIR,
     ParseDiagnosticIR,
     RepositoryIR,
@@ -65,10 +66,14 @@ class _PythonExtractor(ast.NodeVisitor):
         self.symbols: list[SymbolIR] = []
         self.inheritance: list[InheritanceIR] = []
         self.calls: list[CallIR] = []
+        self.local_bindings: list[LocalBindingIR] = []
         self._scope_stack: list[_LexicalScope] = []
         self._module_callable_qname = f"{module_qname}.__module__"
         self._callable_stack: list[str] = [self._module_callable_qname]
         self._call_ordinal = 0
+        self._guard_depth = 0
+        self._comprehension_scopes: list[set[str]] = []
+        self._loop_rebound_scopes: list[set[str]] = []
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -149,6 +154,155 @@ class _PythonExtractor(ast.NodeVisitor):
             )
         self.generic_visit(node)
 
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        # Lambda defaults execute in the enclosing context, but the body has no
+        # graph owner of its own.  Omitting body calls is conservative and
+        # prevents lambda parameters from inheriting enclosing local types.
+        for default in node.args.defaults:
+            self.visit(default)
+        for default in node.args.kw_defaults:
+            if default is not None:
+                self.visit(default)
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node.generators, (node.elt,))
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node.generators, (node.elt,))
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node.generators, (node.key, node.value))
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node.generators, (node.elt,))
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        for target in node.targets:
+            self.visit(target)
+        if not self._in_function_body():
+            return
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            self._record_local_binding(node.targets[0].id, node.value, node)
+            return
+        for name in _bound_names(node.targets):
+            self._record_unknown_binding(name, node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.visit(node.annotation)
+        if node.value is not None:
+            self.visit(node.value)
+        self.visit(node.target)
+        if not self._in_function_body() or not isinstance(node.target, ast.Name):
+            return
+        annotation = self._source_for(node.annotation)
+        if node.value is None:
+            return
+        value_kind, value_name, value_hint = self._binding_value(node.value)
+        self._append_local_binding(
+            node.target.id,
+            value_kind,
+            value_name,
+            value_hint,
+            annotation,
+            node,
+        )
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self.generic_visit(node)
+        if self._in_function_body() and isinstance(node.target, ast.Name):
+            self._record_unknown_binding(node.target.id, node)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.generic_visit(node)
+        if self._in_function_body() and isinstance(node.target, ast.Name):
+            self._record_unknown_binding(node.target.id, node)
+
+    def visit_Delete(self, node: ast.Delete) -> None:
+        self.generic_visit(node)
+        if not self._in_function_body():
+            return
+        for name in _bound_names(node.targets):
+            self._record_unknown_binding(name, node)
+
+    def visit_If(self, node: ast.If) -> None:
+        self.visit(node.test)
+        self._visit_guarded(node.body)
+        self._visit_guarded(node.orelse)
+
+    def visit_For(self, node: ast.For) -> None:
+        self.visit(node.iter)
+        rebound_names = set(_bound_names((node.target,)))
+        rebound_names.update(_loop_rebound_names(node.body))
+        self._loop_rebound_scopes.append(rebound_names)
+        self._guard_depth += 1
+        try:
+            for name in _bound_names((node.target,)):
+                self._record_unknown_binding(name, node.target)
+            self.visit(node.target)
+            for child in (*node.body, *node.orelse):
+                self.visit(child)
+        finally:
+            self._guard_depth -= 1
+            self._loop_rebound_scopes.pop()
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self.visit_For(node)
+
+    def visit_While(self, node: ast.While) -> None:
+        self._loop_rebound_scopes.append(_loop_rebound_names((node.test, *node.body)))
+        try:
+            self.visit(node.test)
+            self._visit_guarded((*node.body, *node.orelse))
+        finally:
+            self._loop_rebound_scopes.pop()
+
+    def visit_With(self, node: ast.With) -> None:
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self.visit(item.optional_vars)
+                for name in _bound_names((item.optional_vars,)):
+                    self._record_unknown_binding(name, item.optional_vars)
+        for child in node.body:
+            self.visit(child)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+        self.visit_With(node)
+
+    def visit_Try(self, node: ast.Try) -> None:
+        guarded_nodes: list[ast.AST] = [*node.body, *node.orelse, *node.finalbody]
+        for handler in node.handlers:
+            if handler.type is not None:
+                self.visit(handler.type)
+            if handler.name:
+                self._guard_depth += 1
+                try:
+                    self._record_unknown_binding(handler.name, handler)
+                finally:
+                    self._guard_depth -= 1
+            guarded_nodes.extend(handler.body)
+        self._visit_guarded(guarded_nodes)
+
+    def visit_TryStar(self, node: ast.TryStar) -> None:
+        self.visit_Try(node)
+
+    def visit_Match(self, node: ast.Match) -> None:
+        self.visit(node.subject)
+        guarded_nodes: list[ast.AST] = []
+        for case in node.cases:
+            guarded_nodes.append(case.pattern)
+            self._guard_depth += 1
+            try:
+                for name in _pattern_bound_names(case.pattern):
+                    self._record_unknown_binding(name, case.pattern)
+            finally:
+                self._guard_depth -= 1
+            if case.guard is not None:
+                guarded_nodes.append(case.guard)
+            guarded_nodes.extend(case.body)
+        self._visit_guarded(guarded_nodes)
+
     def _visit_function(
         self,
         node: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -171,6 +325,7 @@ class _PythonExtractor(ast.NodeVisitor):
                 cyclomatic=_cyclomatic(node),
                 parent_qname=parent_qname,
                 docstring=ast.get_docstring(node, clean=True),
+                return_annotation=self._source_for(node.returns) if node.returns else None,
             )
         )
         # These expressions execute when the function is defined.  Visiting
@@ -187,6 +342,7 @@ class _PythonExtractor(ast.NodeVisitor):
 
         self._scope_stack.append(_LexicalScope(kind="function", qname=qname))
         self._callable_stack.append(qname)
+        self._record_parameter_bindings(node, qname)
         for statement in node.body:
             self.visit(statement)
         self._callable_stack.pop()
@@ -213,6 +369,8 @@ class _PythonExtractor(ast.NodeVisitor):
         str,
     ]:
         if isinstance(node, ast.Name):
+            if self._is_locally_shadowed_or_rebound(node.id):
+                return node.id, None, "dynamic"
             return node.id, f"{self.module_qname}.{node.id}", "none"
         if not isinstance(node, ast.Attribute):
             return None, None, "dynamic"
@@ -224,6 +382,8 @@ class _PythonExtractor(ast.NodeVisitor):
             return node.attr, None, "dynamic"
 
         receiver = chain[0]
+        if self._is_locally_shadowed_or_rebound(receiver):
+            return node.attr, None, "dynamic"
         if receiver in {"self", "cls"}:
             owner_qname = self._nearest_class_qname()
             qname = f"{owner_qname}.{node.attr}" if owner_qname else None
@@ -232,6 +392,48 @@ class _PythonExtractor(ast.NodeVisitor):
         if len(chain) == 2 and receiver in self._imported_names():
             return node.attr, ".".join(chain), "name"
         return node.attr, ".".join(chain), "attribute"
+
+    def _visit_comprehension(
+        self,
+        generators: list[ast.comprehension],
+        result_expressions: tuple[ast.expr, ...],
+    ) -> None:
+        if not generators:
+            for expression in result_expressions:
+                self.visit(expression)
+            return
+
+        self.visit(generators[0].iter)
+        repeating_nodes: list[ast.AST] = [*result_expressions]
+        for index, generator in enumerate(generators):
+            if index:
+                repeating_nodes.append(generator.iter)
+            repeating_nodes.extend(generator.ifs)
+        self._loop_rebound_scopes.append(_loop_rebound_names(repeating_nodes))
+        scopes_added = 0
+        try:
+            for index, generator in enumerate(generators):
+                # The iterable is evaluated before this generator's target is
+                # bound, but after all preceding generator targets are bound.
+                if index:
+                    self.visit(generator.iter)
+                self._comprehension_scopes.append(set(_bound_names((generator.target,))))
+                scopes_added += 1
+                self.visit(generator.target)
+                for condition in generator.ifs:
+                    self.visit(condition)
+            for expression in result_expressions:
+                self.visit(expression)
+        finally:
+            if scopes_added:
+                del self._comprehension_scopes[-scopes_added:]
+            self._loop_rebound_scopes.pop()
+
+    def _is_locally_shadowed_or_rebound(self, name: str) -> bool:
+        return any(
+            name in scope
+            for scope in reversed((*self._comprehension_scopes, *self._loop_rebound_scopes))
+        )
 
     def _imported_names(self) -> set[str]:
         names: set[str] = set()
@@ -253,6 +455,103 @@ class _PythonExtractor(ast.NodeVisitor):
             ),
         )
         return tuple(replace(call, ordinal=index) for index, call in enumerate(ordered, start=1))
+
+    def ordered_local_bindings(self) -> tuple[LocalBindingIR, ...]:
+        return tuple(
+            sorted(
+                self.local_bindings,
+                key=lambda binding: (
+                    binding.start_line,
+                    binding.start_column,
+                    binding.target_name,
+                ),
+            )
+        )
+
+    def _in_function_body(self) -> bool:
+        return bool(self._scope_stack and self._scope_stack[-1].kind == "function")
+
+    def _record_parameter_bindings(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        owner_qname: str,
+    ) -> None:
+        arguments = [
+            *node.args.posonlyargs,
+            *node.args.args,
+            *node.args.kwonlyargs,
+        ]
+        for argument in arguments:
+            if argument.annotation is None:
+                continue
+            self.local_bindings.append(
+                LocalBindingIR(
+                    owner_qname=owner_qname,
+                    target_name=argument.arg,
+                    value_kind="annotation",
+                    value_name=None,
+                    value_qname_hint=None,
+                    annotation=self._source_for(argument.annotation),
+                    start_line=node.lineno,
+                    start_column=-1,
+                )
+            )
+
+    def _record_local_binding(self, target_name: str, value: ast.expr, node: ast.AST) -> None:
+        value_kind, value_name, value_hint = self._binding_value(value)
+        self._append_local_binding(
+            target_name,
+            value_kind,
+            value_name,
+            value_hint,
+            None,
+            node,
+        )
+
+    def _record_unknown_binding(self, target_name: str, node: ast.AST) -> None:
+        if not self._in_function_body():
+            return
+        self._append_local_binding(target_name, "unknown", None, None, None, node)
+
+    def _append_local_binding(
+        self,
+        target_name: str,
+        value_kind: str,
+        value_name: str | None,
+        value_qname_hint: str | None,
+        annotation: str | None,
+        node: ast.AST,
+    ) -> None:
+        self.local_bindings.append(
+            LocalBindingIR(
+                owner_qname=self._callable_stack[-1],
+                target_name=target_name,
+                value_kind=value_kind,  # type: ignore[arg-type]
+                value_name=value_name,
+                value_qname_hint=value_qname_hint,
+                annotation=annotation,
+                start_line=getattr(node, "end_lineno", node.lineno),
+                start_column=getattr(node, "end_col_offset", node.col_offset),
+                guarded=self._guard_depth > 0,
+            )
+        )
+
+    def _binding_value(self, value: ast.expr) -> tuple[str, str | None, str | None]:
+        if isinstance(value, ast.Name):
+            return "name", value.id, None
+        if isinstance(value, ast.Call):
+            name, hint, receiver_kind = self._callee_from_expr(value.func)
+            if receiver_kind in {"none", "name"}:
+                return "call", name, hint
+        return "unknown", None, None
+
+    def _visit_guarded(self, nodes: Iterable[ast.AST]) -> None:
+        self._guard_depth += 1
+        try:
+            for node in nodes:
+                self.visit(node)
+        finally:
+            self._guard_depth -= 1
 
     def _source_for(self, node: ast.AST) -> str:
         source = ast.get_source_segment(self.source, node)
@@ -436,6 +735,7 @@ def _scan_file(root: Path, path: Path) -> FileIR:
         symbols=tuple(extractor.symbols),
         inheritance=tuple(extractor.inheritance),
         calls=extractor.call_sites(),
+        local_bindings=extractor.ordered_local_bindings(),
     )
 
 
@@ -470,6 +770,182 @@ def _attribute_chain(node: ast.expr) -> list[str]:
     else:
         return []
     return list(reversed(parts))
+
+
+def _bound_names(nodes: Iterable[ast.AST]) -> tuple[str, ...]:
+    names: list[str] = []
+
+    def collect(node: ast.AST) -> None:
+        if isinstance(node, ast.Name):
+            names.append(node.id)
+        elif isinstance(node, ast.Starred):
+            collect(node.value)
+        elif isinstance(node, (ast.Tuple, ast.List)):
+            for element in node.elts:
+                collect(element)
+
+    for node in nodes:
+        collect(node)
+    return tuple(dict.fromkeys(names))
+
+
+def _pattern_bound_names(pattern: ast.pattern) -> tuple[str, ...]:
+    names: list[str] = []
+
+    class _PatternNames(ast.NodeVisitor):
+        def visit_MatchAs(self, node: ast.MatchAs) -> None:
+            if node.name:
+                names.append(node.name)
+            self.generic_visit(node)
+
+        def visit_MatchStar(self, node: ast.MatchStar) -> None:
+            if node.name:
+                names.append(node.name)
+
+        def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+            if node.rest:
+                names.append(node.rest)
+            self.generic_visit(node)
+
+    _PatternNames().visit(pattern)
+    return tuple(dict.fromkeys(names))
+
+
+def _loop_rebound_names(nodes: Iterable[ast.AST]) -> set[str]:
+    class _RebindingVisitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.names: set[str] = set()
+
+        def record(self, target: ast.AST) -> None:
+            self.names.update(_bound_names((target,)))
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            self.visit(node.value)
+            for target in node.targets:
+                self.record(target)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            self.visit(node.annotation)
+            if node.value is not None:
+                self.visit(node.value)
+            self.record(node.target)
+
+        def visit_AugAssign(self, node: ast.AugAssign) -> None:
+            self.visit(node.value)
+            self.record(node.target)
+
+        def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+            self.visit(node.value)
+            self.record(node.target)
+
+        def visit_Delete(self, node: ast.Delete) -> None:
+            for target in node.targets:
+                self.record(target)
+
+        def visit_For(self, node: ast.For) -> None:
+            self.visit(node.iter)
+            self.record(node.target)
+            for child in (*node.body, *node.orelse):
+                self.visit(child)
+
+        def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+            self.visit_For(node)
+
+        def visit_With(self, node: ast.With) -> None:
+            for item in node.items:
+                self.visit(item.context_expr)
+                if item.optional_vars is not None:
+                    self.record(item.optional_vars)
+            for child in node.body:
+                self.visit(child)
+
+        def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+            self.visit_With(node)
+
+        def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+            if node.type is not None:
+                self.visit(node.type)
+            if node.name:
+                self.names.add(node.name)
+            for child in node.body:
+                self.visit(child)
+
+        def visit_Match(self, node: ast.Match) -> None:
+            self.visit(node.subject)
+            for case in node.cases:
+                self.names.update(_pattern_bound_names(case.pattern))
+                if case.guard is not None:
+                    self.visit(case.guard)
+                for child in case.body:
+                    self.visit(child)
+
+        def visit_Import(self, node: ast.Import) -> None:
+            for alias in node.names:
+                self.names.add(alias.asname or alias.name.split(".", maxsplit=1)[0])
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            for alias in node.names:
+                self.names.add(alias.asname or alias.name)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.names.add(node.name)
+            self._visit_definition_expressions(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self.names.add(node.name)
+            self._visit_definition_expressions(node)
+
+        def _visit_definition_expressions(
+            self, node: ast.FunctionDef | ast.AsyncFunctionDef
+        ) -> None:
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+            for default in (*node.args.defaults, *node.args.kw_defaults):
+                if default is not None:
+                    self.visit(default)
+            if node.returns is not None:
+                self.visit(node.returns)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.names.add(node.name)
+            for expression in (*node.decorator_list, *node.bases):
+                self.visit(expression)
+            for keyword in node.keywords:
+                self.visit(keyword.value)
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            for default in (*node.args.defaults, *node.args.kw_defaults):
+                if default is not None:
+                    self.visit(default)
+
+        def _visit_comprehension(
+            self,
+            generators: list[ast.comprehension],
+            result_expressions: tuple[ast.expr, ...],
+        ) -> None:
+            for generator in generators:
+                self.visit(generator.iter)
+                for condition in generator.ifs:
+                    self.visit(condition)
+            for expression in result_expressions:
+                self.visit(expression)
+
+        def visit_ListComp(self, node: ast.ListComp) -> None:
+            self._visit_comprehension(node.generators, (node.elt,))
+
+        def visit_SetComp(self, node: ast.SetComp) -> None:
+            self._visit_comprehension(node.generators, (node.elt,))
+
+        def visit_DictComp(self, node: ast.DictComp) -> None:
+            self._visit_comprehension(node.generators, (node.key, node.value))
+
+        def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+            self._visit_comprehension(node.generators, (node.elt,))
+
+    visitor = _RebindingVisitor()
+    for node in nodes:
+        visitor.visit(node)
+    return visitor.names
 
 
 def _is_super_call(node: ast.expr) -> bool:

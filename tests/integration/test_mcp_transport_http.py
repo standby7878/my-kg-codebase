@@ -323,7 +323,7 @@ async def test_http_mcp_transport_supports_protocol_client_session(
             assert first_structured["repository"] == REPOSITORY
             assert first_structured["commit"] == COMMIT
             assert first_structured["scope"] == "source"
-            assert first_structured["diagnostics"]["scope"] == "source"
+            assert "diagnostics" not in first_structured
             assert len(first_structured["results"]) == 2
             assert set(first_structured["results"][0]) == {
                 "symbol_id",
@@ -334,7 +334,6 @@ async def test_http_mcp_transport_supports_protocol_client_session(
                 "score",
                 "matched_terms",
                 "match_type",
-                "scope",
             }
             assert first_structured["results"][0]["symbol_id"] == (
                 f"{REPOSITORY}@{COMMIT}:src/requests/candidates.py:"
@@ -411,11 +410,16 @@ async def test_http_mcp_transport_supports_protocol_client_session(
                 "key",
                 "qname",
                 "signature",
+                "file",
+                "start_line",
+                "end_line",
                 "depth",
                 "resolution",
             }
             assert caller_row["key"] == CALLER_ID
             assert caller_row["signature"] == REQUEST_SIGNATURE
+            assert caller_row["file"] == "src/requests/sessions.py"
+            assert (caller_row["start_line"], caller_row["end_line"]) == (557, 653)
             assert caller_row["resolution"] == "self_direct"
 
             callees = await client.call_tool_mcp("find_callees", {"identifier": CALLER_ID})
@@ -429,11 +433,16 @@ async def test_http_mcp_transport_supports_protocol_client_session(
                 "key",
                 "qname",
                 "signature",
+                "file",
+                "start_line",
+                "end_line",
                 "depth",
                 "resolution",
             }
             assert callee_row["key"] == CALLEE_ID
             assert callee_row["signature"] == "def prepare_request(self, request)"
+            assert callee_row["file"] == "src/requests/sessions.py"
+            assert (callee_row["start_line"], callee_row["end_line"]) == (511, 555)
             assert callee_row["resolution"] == "self_direct"
 
             # Exercise FastMCP's parsed convenience path as well as raw MCP results.

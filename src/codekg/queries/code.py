@@ -658,12 +658,16 @@ def find_callers(
             """
             MATCH (callee {key: $key})<-[res:RESOLVES_TO]-(site:CallSite)
             MATCH (caller)-[:HAS_CALLSITE]->(site)
+            MATCH (caller_file:File)-[:CONTAINS]->(caller)
             WHERE caller:Function OR caller:Method
               AND caller.key STARTS WITH $snapshot_prefix
               AND site.key STARTS WITH $snapshot_prefix
             RETURN DISTINCT caller.key AS key,
                    caller.qname AS qname,
                    caller.signature AS signature,
+                   caller_file.path AS file,
+                   caller.start_line AS start_line,
+                   caller.end_line AS end_line,
                    1 AS depth,
                    res.strategy AS resolution
             ORDER BY qname, key
@@ -680,11 +684,15 @@ def find_callers(
         f"""
         MATCH (callee {{key: $key}})
         MATCH path = (caller)-[:EXACT_CALLS*1..{_depth(depth)}]->(callee)
+        MATCH (caller_file:File)-[:CONTAINS]->(caller)
         WHERE caller:Function OR caller:Method
           AND ALL(node IN nodes(path) WHERE node.key STARTS WITH $snapshot_prefix)
         RETURN DISTINCT caller.key AS key,
                caller.qname AS qname,
                caller.signature AS signature,
+               caller_file.path AS file,
+               caller.start_line AS start_line,
+               caller.end_line AS end_line,
                length(path) AS depth
         ORDER BY depth, qname, key
         LIMIT $limit
@@ -719,12 +727,16 @@ def find_callees(
         return db.execute_read(
             """
             MATCH (caller {key: $key})-[:HAS_CALLSITE]->(site:CallSite)-[res:RESOLVES_TO]->(callee)
+            MATCH (callee_file:File)-[:CONTAINS]->(callee)
             WHERE callee:Function OR callee:Method
               AND callee.key STARTS WITH $snapshot_prefix
               AND site.key STARTS WITH $snapshot_prefix
             RETURN DISTINCT callee.key AS key,
                    callee.qname AS qname,
                    callee.signature AS signature,
+                   callee_file.path AS file,
+                   callee.start_line AS start_line,
+                   callee.end_line AS end_line,
                    1 AS depth,
                    res.strategy AS resolution
             ORDER BY qname, key
@@ -741,11 +753,15 @@ def find_callees(
         f"""
         MATCH (caller {{key: $key}})
         MATCH path = (caller)-[:EXACT_CALLS*1..{_depth(depth)}]->(callee)
+        MATCH (callee_file:File)-[:CONTAINS]->(callee)
         WHERE callee:Function OR callee:Method
           AND ALL(node IN nodes(path) WHERE node.key STARTS WITH $snapshot_prefix)
         RETURN DISTINCT callee.key AS key,
                callee.qname AS qname,
                callee.signature AS signature,
+               callee_file.path AS file,
+               callee.start_line AS start_line,
+               callee.end_line AS end_line,
                length(path) AS depth
         ORDER BY depth, qname, key
         LIMIT $limit

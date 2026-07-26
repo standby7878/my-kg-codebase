@@ -308,6 +308,7 @@ def _build_graph(repositories: tuple[RepositoryIR, ...]) -> dict[str, Any]:
                     "start_line": symbol.start_line,
                     "end_line": symbol.end_line,
                     "cyclomatic": symbol.cyclomatic,
+                    "return_annotation": symbol.return_annotation,
                 }
                 if symbol.kind == "type":
                     row["kind"] = "class"
