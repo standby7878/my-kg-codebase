@@ -159,10 +159,11 @@ $RUN_DIR/tasks/02-requests-environment-settings/{codekg,native}/
 $RUN_DIR/tasks/10-sql-compose-select-body/{codekg,native}/
 ```
 
-The runner also launches one repository preflight and one graph preflight, for
-22 Codex processes in a complete run. Output directories are immutable and
-must not be reused. The full contract, task list, validation command, and
-artifact contents are documented in `evaluation/README.md`.
+The runner also performs one direct local MCP repository preflight and launches
+one Codex graph preflight, for 21 Codex processes in a complete run. Output
+directories are immutable and must not be reused. The full contract, task
+list, validation command, and artifact contents are documented in
+`evaluation/README.md`.
 
 ### Manual single-pair commands
 

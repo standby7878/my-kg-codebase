@@ -9,6 +9,7 @@ batch preflight and one CodeKG/native pair for each of ten indexed tasks.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import subprocess
@@ -307,30 +308,6 @@ def trial_command(
     return command
 
 
-def preflight_command(
-    *, codex: str, profile: str, contract: dict[str, Any], repository: Path
-) -> list[str]:
-    command = base_codex_command(
-        codex=codex,
-        profile=profile,
-        contract=contract,
-        repository=repository,
-        schema_path=None,
-        answer_path=None,
-    )
-    command.extend(
-        [
-            "-c",
-            "mcp_servers.codekg.enabled=true",
-            "-c",
-            "mcp_servers.codekg.required=true",
-            "-c",
-            'mcp_servers.codekg.enabled_tools=["list_repositories"]',
-        ]
-    )
-    return command
-
-
 def graph_preflight_command(
     *, codex: str, profile: str, contract: dict[str, Any], repository: Path
 ) -> list[str]:
@@ -406,6 +383,72 @@ def _launch_with_frozen_state(
         )
     finally:
         assert_frozen_state(**frozen_state_arguments)
+
+
+def _direct_repository_preflight(
+    *,
+    url: str,
+    events_path: Path,
+    stderr_path: Path,
+    frozen_state_arguments: dict[str, Any],
+) -> tuple[int, float]:
+    """Call repository discovery directly so deferred-tool routing cannot hide it."""
+    assert_frozen_state(**frozen_state_arguments)
+    events_path.parent.mkdir(parents=True, exist_ok=False)
+    started = time.perf_counter()
+    exit_code = 0
+    item: dict[str, Any]
+    error_text = ""
+    try:
+        from fastmcp import Client
+
+        async def call() -> Any:
+            async with Client(url) as client:
+                return await client.call_tool("list_repositories", {})
+
+        result = asyncio.run(call())
+        item = {
+            "id": "repository-preflight",
+            "type": "mcp_tool_call",
+            "server": "codekg",
+            "tool": "list_repositories",
+            "arguments": {},
+            "result": {
+                "content": [
+                    value.model_dump(mode="json", exclude_none=True)
+                    for value in result.content
+                ],
+                "structured_content": result.structured_content,
+            },
+            "error": None,
+            "status": "completed",
+        }
+    except Exception as exc:  # pragma: no cover - exercised only by live infrastructure
+        exit_code = 1
+        error_text = f"{type(exc).__name__}: {exc}\n"
+        item = {
+            "id": "repository-preflight",
+            "type": "mcp_tool_call",
+            "server": "codekg",
+            "tool": "list_repositories",
+            "arguments": {},
+            "result": None,
+            "error": error_text.strip(),
+            "status": "failed",
+        }
+    events = [
+        {"type": "thread.started", "thread_id": "direct-mcp-repository-preflight"},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": item},
+        {"type": "turn.completed", "usage": {}},
+    ]
+    events_path.write_text(
+        "".join(json.dumps(event, separators=(",", ":")) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    stderr_path.write_text(error_text, encoding="utf-8")
+    assert_frozen_state(**frozen_state_arguments)
+    return exit_code, time.perf_counter() - started
 
 
 def validate_preflight(
@@ -559,20 +602,10 @@ def execute(args: argparse.Namespace) -> int:
     preflight_dir = run_dir / "preflight"
     repository_preflight_dir = preflight_dir / "repository"
     preflight_events = repository_preflight_dir / "events.jsonl"
-    preflight_exit, preflight_wall = _launch_with_frozen_state(
-        command=preflight_command(
-            codex=args.codex,
-            profile=manifest["profile"],
-            contract=local["profile_contract"],
-            repository=first_repository,
-        ),
-        prompt=(
-            "Call codekg.list_repositories exactly once. Verify that these repositories "
-            f"are indexed: {', '.join(repository_paths)}. Do not call any other tool."
-        ),
+    preflight_exit, preflight_wall = _direct_repository_preflight(
+        url=local["profile_contract"]["codekg_url"],
         events_path=preflight_events,
         stderr_path=repository_preflight_dir / "stderr.log",
-        timeout=args.timeout,
         frozen_state_arguments=frozen_state_arguments,
     )
     expected_repositories = {

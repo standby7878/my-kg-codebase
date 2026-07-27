@@ -140,8 +140,9 @@ Then start the complete sequential suite:
   --output "$RUN_DIR"
 ```
 
-The run performs repository and graph preflight before the 20 measured trials,
-so it launches 22 Codex processes in total. This can consume paid model usage.
+The run performs a direct local MCP repository preflight and one Codex graph
+preflight before the 20 measured trials, so it launches 21 Codex processes in
+total. This can consume paid model usage.
 Do not reuse an output directory: artifacts are immutable and the runner
 refuses to overwrite them.
 
