@@ -1,0 +1,26 @@
+Task index: 07
+Task ID: pool-intent-001
+Repository under evaluation: pool
+
+Objective:
+Identify the connection-record checkout method that obtains the DBAPI
+connection associated with a pool record and creates the temporary proxy/fairy
+object used to manage that checked-out connection.
+
+Mandatory CodeKG protocol:
+1. Preflight already verified the repository. Do not call `list_repositories`.
+2. Use only `search_symbols`, `get_definition`, `find_callers`, and
+   `find_callees`, in that sequence.
+3. Use CodeKG only; do not use shell, filesystem, web, or prior knowledge.
+4. Search only repository `pool` with `scope: "source"`, hybrid mode, exactly
+   one initial search, and `limit` no greater than 5.
+5. Immediately verify a plausible candidate or recommended ID through
+   `get_definition` with the exact ID. Search twice only after no plausible
+   candidate.
+6. Call both relationship tools with the same ID and require at least one
+   relevant nonempty result.
+7. Report only MCP-returned structural evidence and complete exact ranges.
+8. On required MCP failure, return `INFRA_ERROR: mcp_call_failed`.
+
+Return the primary symbol and one relevant caller or delegated helper, explain
+the responsibility boundary, and conform to the supplied JSON schema.

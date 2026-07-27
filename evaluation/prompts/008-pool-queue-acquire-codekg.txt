@@ -1,0 +1,26 @@
+Task index: 08
+Task ID: pool-intent-002
+Repository under evaluation: pool
+
+Objective:
+Identify the QueuePool acquisition method that attempts to obtain a queued
+connection record, applies timeout and overflow limits, and creates a new
+record only when overflow capacity permits.
+
+Mandatory CodeKG protocol:
+1. Preflight already verified the repository. Do not call `list_repositories`.
+2. Use only `search_symbols`, `get_definition`, `find_callers`, and
+   `find_callees`, in that sequence.
+3. Use CodeKG only; shell, filesystem, web, and prior knowledge are forbidden.
+4. Search only repository `pool`, `scope: "source"`, hybrid mode, with exactly
+   one initial search and `limit` no greater than 5.
+5. If the first search provides a plausible candidate or recommended ID, call
+   `get_definition` immediately with the exact ID. Search twice only if it does
+   not.
+6. Call both relationship tools using that ID. At least one relevant
+   relationship must be nonempty.
+7. Report only MCP-returned structural evidence with complete exact ranges.
+8. On required MCP failure, return `INFRA_ERROR: mcp_call_failed`.
+
+Return the primary acquisition symbol plus one overflow-related caller or
+helper, explain the boundary concisely, and use the supplied JSON schema.

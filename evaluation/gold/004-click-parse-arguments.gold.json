@@ -1,0 +1,32 @@
+{
+  "task_id": "click-intent-002",
+  "repository": "click",
+  "commit": "333c28d79cd9",
+  "identity": "git",
+  "category": "intent_symbol_discovery",
+  "primary": {
+    "symbol": "src.click.core.Command.parse_args",
+    "accepted_suffixes": ["Command.parse_args", "core.Command.parse_args"],
+    "file": "src/click/core.py",
+    "start_line": 1358,
+    "end_line": 1392
+  },
+  "relevant": [
+    {
+      "symbol": "src.click.core.Command.make_context",
+      "accepted_suffixes": ["Command.make_context", "core.Command.make_context"],
+      "file": "src/click/core.py",
+      "start_line": 1321,
+      "end_line": 1356,
+      "relationship": "caller"
+    },
+    {
+      "symbol": "src.click.core.Command.make_parser",
+      "accepted_suffixes": ["Command.make_parser", "core.Command.make_parser"],
+      "file": "src/click/core.py",
+      "start_line": 1219,
+      "end_line": 1224,
+      "relationship": "callee"
+    }
+  ]
+}

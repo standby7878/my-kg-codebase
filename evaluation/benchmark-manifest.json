@@ -1,14 +1,10 @@
 {
-  "version": 1,
-  "task_id": "requests-intent-001",
-  "repository": "requests",
-  "repository_commit": "f361ead047be5cb873174218582f7d8b9fcd9f49",
+  "version": 2,
+  "suite_id": "codekg-native-intent-suite-001",
   "profile": "benchmark",
   "model": "gpt-5.4-mini",
   "model_reasoning_effort": "low",
-  "seed": 20260726,
-  "warmups_per_arm": 1,
-  "measured_repetitions": 10,
+  "seed": 20260727,
   "arms": [
     "codekg",
     "native"
@@ -19,10 +15,154 @@
     "find_callers",
     "find_callees"
   ],
-  "prompt_files": {
-    "codekg": "prompts/requests-intent-001-codekg.txt",
-    "native": "prompts/requests-intent-001-native.txt"
-  },
   "schema_file": "codex-answer.schema.json",
-  "gold_file": "gold/requests-intent-001.gold.json"
+  "repositories": [
+    {
+      "name": "requests",
+      "source_path": "requests",
+      "identity": "git",
+      "indexed_commit": "f361ead047be",
+      "git_commit": "f361ead047be5cb873174218582f7d8b9fcd9f49"
+    },
+    {
+      "name": "click",
+      "source_path": "click",
+      "identity": "git",
+      "indexed_commit": "333c28d79cd9",
+      "git_commit": "333c28d79cd982990ee98eef61ec20ab1a4f38ba"
+    },
+    {
+      "name": "engine",
+      "source_path": "sqlalchemy/lib/sqlalchemy/engine",
+      "identity": "content",
+      "indexed_commit": "48d85015f44c",
+      "git_commit": "13cbc1af77e11c908ddd798be6941e995356e1a1"
+    },
+    {
+      "name": "pool",
+      "source_path": "sqlalchemy/lib/sqlalchemy/pool",
+      "identity": "content",
+      "indexed_commit": "814c2342b1cf",
+      "git_commit": "13cbc1af77e11c908ddd798be6941e995356e1a1"
+    },
+    {
+      "name": "sql",
+      "source_path": "sqlalchemy/lib/sqlalchemy/sql",
+      "identity": "content",
+      "indexed_commit": "24b988e6a06d",
+      "git_commit": "13cbc1af77e11c908ddd798be6941e995356e1a1"
+    }
+  ],
+  "tasks": [
+    {
+      "index": 1,
+      "task_id": "requests-intent-001",
+      "slug": "requests-prepare-request",
+      "repository": "requests",
+      "prompt_files": {
+        "codekg": "prompts/001-requests-prepare-request-codekg.txt",
+        "native": "prompts/001-requests-prepare-request-native.txt"
+      },
+      "gold_file": "gold/001-requests-prepare-request.gold.json"
+    },
+    {
+      "index": 2,
+      "task_id": "requests-intent-002",
+      "slug": "requests-environment-settings",
+      "repository": "requests",
+      "prompt_files": {
+        "codekg": "prompts/002-requests-environment-settings-codekg.txt",
+        "native": "prompts/002-requests-environment-settings-native.txt"
+      },
+      "gold_file": "gold/002-requests-environment-settings.gold.json"
+    },
+    {
+      "index": 3,
+      "task_id": "click-intent-001",
+      "slug": "click-command-context",
+      "repository": "click",
+      "prompt_files": {
+        "codekg": "prompts/003-click-command-context-codekg.txt",
+        "native": "prompts/003-click-command-context-native.txt"
+      },
+      "gold_file": "gold/003-click-command-context.gold.json"
+    },
+    {
+      "index": 4,
+      "task_id": "click-intent-002",
+      "slug": "click-parse-arguments",
+      "repository": "click",
+      "prompt_files": {
+        "codekg": "prompts/004-click-parse-arguments-codekg.txt",
+        "native": "prompts/004-click-parse-arguments-native.txt"
+      },
+      "gold_file": "gold/004-click-parse-arguments.gold.json"
+    },
+    {
+      "index": 5,
+      "task_id": "engine-intent-001",
+      "slug": "engine-connect",
+      "repository": "engine",
+      "prompt_files": {
+        "codekg": "prompts/005-engine-connect-codekg.txt",
+        "native": "prompts/005-engine-connect-native.txt"
+      },
+      "gold_file": "gold/005-engine-connect.gold.json"
+    },
+    {
+      "index": 6,
+      "task_id": "engine-intent-002",
+      "slug": "engine-execute-context",
+      "repository": "engine",
+      "prompt_files": {
+        "codekg": "prompts/006-engine-execute-context-codekg.txt",
+        "native": "prompts/006-engine-execute-context-native.txt"
+      },
+      "gold_file": "gold/006-engine-execute-context.gold.json"
+    },
+    {
+      "index": 7,
+      "task_id": "pool-intent-001",
+      "slug": "pool-record-checkout",
+      "repository": "pool",
+      "prompt_files": {
+        "codekg": "prompts/007-pool-record-checkout-codekg.txt",
+        "native": "prompts/007-pool-record-checkout-native.txt"
+      },
+      "gold_file": "gold/007-pool-record-checkout.gold.json"
+    },
+    {
+      "index": 8,
+      "task_id": "pool-intent-002",
+      "slug": "pool-queue-acquire",
+      "repository": "pool",
+      "prompt_files": {
+        "codekg": "prompts/008-pool-queue-acquire-codekg.txt",
+        "native": "prompts/008-pool-queue-acquire-native.txt"
+      },
+      "gold_file": "gold/008-pool-queue-acquire.gold.json"
+    },
+    {
+      "index": 9,
+      "task_id": "sql-intent-001",
+      "slug": "sql-visit-select",
+      "repository": "sql",
+      "prompt_files": {
+        "codekg": "prompts/009-sql-visit-select-codekg.txt",
+        "native": "prompts/009-sql-visit-select-native.txt"
+      },
+      "gold_file": "gold/009-sql-visit-select.gold.json"
+    },
+    {
+      "index": 10,
+      "task_id": "sql-intent-002",
+      "slug": "sql-compose-select-body",
+      "repository": "sql",
+      "prompt_files": {
+        "codekg": "prompts/010-sql-compose-select-body-codekg.txt",
+        "native": "prompts/010-sql-compose-select-body-native.txt"
+      },
+      "gold_file": "gold/010-sql-compose-select-body.gold.json"
+    }
+  ]
 }

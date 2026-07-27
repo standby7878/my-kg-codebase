@@ -1,0 +1,24 @@
+Task index: 10
+Task ID: sql-intent-002
+Repository under evaluation: sql
+
+Objective:
+Identify the SQL compiler helper that composes the body of an already-prepared
+Select statement by rendering FROM, WHERE, GROUP BY, HAVING, ORDER BY, row
+limits, and locking clauses.
+
+Mandatory native protocol:
+1. First execute a shell command that prints the working directory and Git
+   root, then searches the current repository.
+2. Use only current-repository shell evidence; no MCP, web, external docs, or
+   prior knowledge.
+3. Inspect search output and read complete numbered source for the strongest
+   candidate plus its compiler caller or one clause helper.
+4. Every reported symbol and range must be fully covered by successful
+   numbered output naming the exact relative file.
+5. `end_line` is the final syntax line, excluding blank separators.
+6. Do not modify files. On required command failure, return
+   `INFRA_ERROR: native_search_failed`.
+
+Return the body-composition helper plus its compiler caller or one clause
+helper, explain the boundary concisely, and use the supplied JSON schema.

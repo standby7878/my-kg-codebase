@@ -1,0 +1,27 @@
+Task index: 02
+Task ID: requests-intent-002
+Repository under evaluation: requests
+
+Objective:
+Identify the session method that combines request-provided proxy, stream,
+certificate, and TLS verification settings with environment-derived proxies
+and session defaults before a prepared request is sent.
+
+Mandatory native protocol:
+1. The first action must be a shell command that prints the working directory
+   and Git root, then searches the current repository for likely symbols.
+2. Investigate only the current repository. Do not use MCP, web search,
+   external documentation, or prior model knowledge as evidence.
+3. Run at least one repository search and inspect its completed output.
+4. Read the complete numbered source definition of the strongest candidate and
+   at least one directly relevant caller or delegated helper.
+5. Every reported symbol and range must be backed by a successful command that
+   names the repository-relative file and emits every numbered source line.
+6. `end_line` must be the last syntax line, excluding trailing blank lines.
+7. Do not modify files.
+8. If repository access or a required command fails, return
+   `INFRA_ERROR: native_search_failed` in the answer field.
+
+Return the primary symbol plus one directly relevant caller or delegated
+helper, explain the responsibility boundary concisely, and conform to the
+supplied JSON schema.

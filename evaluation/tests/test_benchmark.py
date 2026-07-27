@@ -21,6 +21,7 @@ PRIMARY_ID = (
 CALLER_ID = (
     "requests@f361ead047be:src/requests/sessions.py:src.requests.sessions.Session.request:557"
 )
+GOLD_PATH = EVALUATION_DIR / "gold" / "001-requests-prepare-request.gold.json"
 
 
 def _tool(tool: str, arguments: dict[str, object], rows: list[dict[str, object]]) -> dict:
@@ -115,33 +116,66 @@ def _events(answer: dict | None = None) -> list[dict]:
     ]
 
 
-def test_balanced_schedule_is_deterministic_and_paired() -> None:
-    first = benchmark_lib.balanced_schedule(arms=["codekg", "native"], repetitions=10, seed=123)
-    second = benchmark_lib.balanced_schedule(arms=["codekg", "native"], repetitions=10, seed=123)
+def test_suite_schedule_is_deterministic_balanced_and_paired() -> None:
+    manifest = benchmark_lib.load_manifest()
+    arguments = {
+        "tasks": manifest["tasks"],
+        "arms": manifest["arms"],
+        "seed": manifest["seed"],
+    }
+    first = benchmark_lib.suite_schedule(**arguments)
+    second = benchmark_lib.suite_schedule(**arguments)
     assert first == second
-    assert len(first) == 22
-    assert sum(entry.warmup for entry in first) == 2
-    measured = [entry for entry in first if not entry.warmup]
-    assert sum(entry.arm == "codekg" for entry in measured) == 10
-    assert sum(entry.arm == "native" for entry in measured) == 10
-    assert sum(measured[index].arm == "codekg" for index in range(0, len(measured), 2)) == 5
+    assert len(first) == 20
+    assert sum(entry.arm == "codekg" for entry in first) == 10
+    assert sum(entry.arm == "native" for entry in first) == 10
+    assert sum(first[index].arm == "codekg" for index in range(0, len(first), 2)) == 5
+    assert {entry.task_index for entry in first} == set(range(1, 11))
+    assert all(
+        sum(entry.task_index == task_index for entry in first) == 2 for task_index in range(1, 11)
+    )
 
 
 def test_codekg_prompt_matches_measured_tool_contract() -> None:
-    prompt = (EVALUATION_DIR / "prompts" / "requests-intent-001-codekg.txt").read_text(
-        encoding="utf-8"
-    )
+    manifest = benchmark_lib.load_manifest()
     expected_tools = "`search_symbols`, `get_definition`, `find_callers`, and `find_callees`"
-    expected_sequence = (
-        "`search_symbols`, `get_definition`, then both `find_callers` and `find_callees`"
-    )
+    for task in manifest["tasks"]:
+        prompt_path = benchmark_lib.resolve_manifest_file(
+            EVALUATION_DIR / "benchmark-manifest.json",
+            task["prompt_files"]["codekg"],
+        )
+        prompt = prompt_path.read_text(encoding="utf-8")
+        normalized = " ".join(prompt.split())
+        assert "preflight" in prompt.lower()
+        assert expected_tools in normalized
+        assert "in that sequence" in normalized or "in this sequence" in normalized
+        assert "search_symbols" in prompt
+        assert "Do not call `list_repositories`" in prompt
+        assert "Use `list_repositories`" not in prompt
+        assert f"repository `{task['repository']}`" in prompt
 
-    assert "Batch preflight has already verified" in prompt
-    assert f"exposes exactly these four tools: {expected_tools}" in prompt
-    assert f"in this sequence: {expected_sequence}" in prompt
-    assert "The measured task begins with `search_symbols`" in prompt
-    assert "Do not call `list_repositories`" in prompt
-    assert "Use `list_repositories`" not in prompt
+
+def test_manifest_has_ten_indexed_tasks_across_multiple_repositories() -> None:
+    manifest = benchmark_lib.load_manifest()
+    assert [task["index"] for task in manifest["tasks"]] == list(range(1, 11))
+    assert {task["repository"] for task in manifest["tasks"]} == {
+        "requests",
+        "click",
+        "engine",
+        "pool",
+        "sql",
+    }
+    for task in manifest["tasks"]:
+        prefix = f"{task['index']:03d}-"
+        for prompt_file in task["prompt_files"].values():
+            assert Path(prompt_file).name.startswith(prefix)
+            assert benchmark_lib.resolve_manifest_file(
+                EVALUATION_DIR / "benchmark-manifest.json", prompt_file
+            ).is_file()
+        assert Path(task["gold_file"]).name.startswith(prefix)
+        assert benchmark_lib.resolve_manifest_file(
+            EVALUATION_DIR / "benchmark-manifest.json", task["gold_file"]
+        ).is_file()
 
 
 def test_schema_validation_rejects_null_and_unsafe_paths() -> None:
@@ -210,14 +244,14 @@ def test_valid_codekg_trial_and_metrics(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         benchmark_lib,
         "validate_repository_identity_and_paths",
-        lambda answer, repository, expected_commit: [],
+        lambda answer, repository, expected_commit, identity: [],
     )
     validation, metrics = benchmark_lib.validate_trial(
         arm="codekg",
         events_path=events_path,
         answer_path=answer_path,
         repository=tmp_path,
-        gold_path=EVALUATION_DIR / "gold" / "requests-intent-001.gold.json",
+        gold_path=GOLD_PATH,
         wall_seconds=1.25,
         exit_code=0,
     )
@@ -252,7 +286,7 @@ def test_protocol_rejects_disallowed_tool_and_shell() -> None:
             "item": {"type": "web_search", "status": "completed"},
         },
     )
-    errors, _ = benchmark_lib.validate_codekg_protocol(events)
+    errors, _ = benchmark_lib.validate_codekg_protocol(events, "requests")
     assert "CodeKG arm used a shell command" in errors
     assert "CodeKG arm used web search" in errors
     assert any("disallowed tools" in error for error in errors)
@@ -264,7 +298,7 @@ def test_protocol_requires_definition_id_from_search() -> None:
         event["item"] for event in events if event.get("item", {}).get("tool") == "get_definition"
     )
     definition["arguments"]["identifier"] = "invented"
-    errors, _ = benchmark_lib.validate_codekg_protocol(events)
+    errors, _ = benchmark_lib.validate_codekg_protocol(events, "requests")
     assert "get_definition identifier was not returned by search_symbols" in errors
 
 
@@ -440,20 +474,9 @@ def test_frozen_state_detects_input_drift_and_dirty_checkout(tmp_path: Path, mon
     expected_hashes = benchmark_lib.snapshot_hashes(
         EVALUATION_DIR / "benchmark-manifest.json", profile
     )
-    state = {"dirty": ""}
-
-    def fake_git(repository: Path, *arguments: str) -> str:
-        if arguments == ("rev-parse", "--show-toplevel"):
-            return str(repository.resolve())
-        if arguments == ("rev-parse", "HEAD"):
-            return "f361ead047be5cb873174218582f7d8b9fcd9f49"
-        if arguments == ("status", "--porcelain"):
-            return state["dirty"]
-        raise AssertionError(arguments)
-
-    monkeypatch.setattr(run_benchmark, "_git", fake_git)
+    monkeypatch.setattr(run_benchmark, "repository_states", lambda corpus_root, manifest: {})
     arguments = {
-        "repository": tmp_path,
+        "corpus_root": tmp_path,
         "manifest_path": EVALUATION_DIR / "benchmark-manifest.json",
         "profile_path": profile,
         "expected_hashes": expected_hashes,
@@ -467,7 +490,13 @@ def test_frozen_state_detects_input_drift_and_dirty_checkout(tmp_path: Path, mon
     else:
         raise AssertionError("frozen profile drift was accepted")
     profile.write_text("version = 1\n", encoding="utf-8")
-    state["dirty"] = " M src/requests/sessions.py"
+    monkeypatch.setattr(
+        run_benchmark,
+        "repository_states",
+        lambda corpus_root, manifest: (_ for _ in ()).throw(
+            RuntimeError("repository checkout was modified")
+        ),
+    )
     try:
         run_benchmark.assert_frozen_state(**arguments)
     except RuntimeError as exc:
@@ -523,28 +552,29 @@ def test_launch_rechecks_frozen_state_before_and_after(tmp_path: Path, monkeypat
     assert checks == [frozen, frozen]
 
 
-def test_aggregator_excludes_warmups_and_pairs_repetitions(tmp_path: Path, monkeypatch) -> None:
+def test_aggregator_requires_complete_indexed_task_pairs(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         aggregate_benchmark,
         "summarize_values",
         lambda values, seed: {"samples": list(values), "median": None},
     )
     manifest = benchmark_lib.load_manifest()
-    schedule = benchmark_lib.balanced_schedule(
+    schedule = benchmark_lib.suite_schedule(
+        tasks=manifest["tasks"],
         arms=manifest["arms"],
-        repetitions=manifest["measured_repetitions"],
         seed=manifest["seed"],
     )
     for entry in schedule:
-        trial = tmp_path / "trials" / f"{entry.ordinal:02d}-{entry.trial_name}"
+        trial = tmp_path / "tasks" / entry.trial_name / entry.arm
         trial.mkdir(parents=True)
         (trial / "metadata.json").write_text(
             json.dumps(
                 {
                     "ordinal": entry.ordinal,
                     "arm": entry.arm,
-                    "repetition": entry.repetition,
-                    "warmup": entry.warmup,
+                    "task_index": entry.task_index,
+                    "task_id": entry.task_id,
+                    "repository": entry.repository,
                 }
             ),
             encoding="utf-8",
@@ -555,7 +585,7 @@ def test_aggregator_excludes_warmups_and_pairs_repetitions(tmp_path: Path, monke
             "success": True,
             "evidence_compliant": True,
             "infrastructure_success": True,
-            "wall_seconds": float(entry.repetition),
+            "wall_seconds": float(entry.task_index),
             "tokens": {},
         }
         (trial / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
@@ -574,7 +604,7 @@ def test_aggregator_excludes_warmups_and_pairs_repetitions(tmp_path: Path, monke
     assert report["observed_measured_trials"] == 20
     assert report["intention_to_treat"]["codekg"]["count"] == 10
     assert report["paired_deltas"]["complete_pairs"] == 10
-    first_metadata = next((tmp_path / "trials").glob("*/metadata.json"))
+    first_metadata = next((tmp_path / "tasks").glob("*/*/metadata.json"))
     changed = json.loads(first_metadata.read_text())
     changed["arm"] = "wrong"
     first_metadata.write_text(json.dumps(changed), encoding="utf-8")
@@ -612,13 +642,13 @@ def test_trial_requires_one_nonempty_thread_id(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setattr(
         benchmark_lib,
         "validate_repository_identity_and_paths",
-        lambda answer, repository, expected_commit: [],
+        lambda answer, repository, expected_commit, identity: [],
     )
     validation, _ = benchmark_lib.validate_trial(
         arm="codekg",
         events_path=tmp_path / "events.jsonl",
         answer_path=tmp_path / "answer.json",
         repository=tmp_path,
-        gold_path=EVALUATION_DIR / "gold" / "requests-intent-001.gold.json",
+        gold_path=GOLD_PATH,
     )
     assert any("thread.started" in error for error in validation["errors"])

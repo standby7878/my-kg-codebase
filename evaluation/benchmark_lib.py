@@ -1,4 +1,4 @@
-"""Shared, dependency-free helpers for the Requests Codex benchmark."""
+"""Shared, dependency-free helpers for the multi-repository Codex benchmark."""
 
 from __future__ import annotations
 
@@ -24,6 +24,23 @@ ALLOWED_CODEKG_TOOLS = {
     "find_callers",
     "find_callees",
 }
+SNAPSHOT_SUFFIXES = {".py", ".md"}
+SNAPSHOT_SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "env",
+    "node_modules",
+    "venv",
+    "vendor",
+}
 
 
 def read_json(path: Path) -> Any:
@@ -48,8 +65,29 @@ def write_text_new(path: Path, value: str) -> None:
 
 def load_manifest(path: Path = MANIFEST_PATH) -> dict[str, Any]:
     value = read_json(path)
-    if not isinstance(value, dict) or value.get("version") != 1:
+    if not isinstance(value, dict) or value.get("version") != 2:
         raise ValueError(f"unsupported benchmark manifest: {path}")
+    repositories = value.get("repositories")
+    tasks = value.get("tasks")
+    if not isinstance(repositories, list) or not repositories:
+        raise ValueError("benchmark manifest must contain repositories")
+    if not isinstance(tasks, list) or len(tasks) != 10:
+        raise ValueError("benchmark manifest must contain exactly ten tasks")
+    repository_names = [item.get("name") for item in repositories if isinstance(item, dict)]
+    invalid_repository_names = len(repository_names) != len(repositories)
+    duplicate_repository_names = len(set(repository_names)) != len(repositories)
+    if invalid_repository_names or duplicate_repository_names:
+        raise ValueError("benchmark repository names must be unique strings")
+    expected_indices = list(range(1, len(tasks) + 1))
+    indices = [item.get("index") for item in tasks if isinstance(item, dict)]
+    if indices != expected_indices:
+        raise ValueError(f"benchmark task indices must be contiguous: {expected_indices}")
+    task_ids = [item.get("task_id") for item in tasks if isinstance(item, dict)]
+    slugs = [item.get("slug") for item in tasks if isinstance(item, dict)]
+    if len(set(task_ids)) != len(tasks) or len(set(slugs)) != len(tasks):
+        raise ValueError("benchmark task IDs and slugs must be unique")
+    if any(item.get("repository") not in repository_names for item in tasks):
+        raise ValueError("benchmark task references an unknown repository")
     return value
 
 
@@ -67,13 +105,44 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def source_snapshot_hash(root: Path) -> str:
+    """Match CodeKG's content identity for mounted non-Git source subtrees."""
+    digest = hashlib.sha256()
+    paths = [
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in SNAPSHOT_SUFFIXES
+        and not any(part in SNAPSHOT_SKIP_DIRS for part in path.relative_to(root).parts)
+    ]
+    for path in sorted(paths):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
+def repository_snapshot_commit(repository: Path, identity: str) -> str:
+    if identity == "content":
+        return source_snapshot_hash(repository)
+    if identity != "git":
+        raise ValueError(f"unsupported repository identity: {identity}")
+    process = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode:
+        return ""
+    return process.stdout.strip()
+
+
 def snapshot_hashes(manifest_path: Path, profile_path: Path) -> dict[str, str]:
     manifest = load_manifest(manifest_path)
-    relative_files = [
-        manifest["schema_file"],
-        manifest["gold_file"],
-        *manifest["prompt_files"].values(),
-    ]
+    relative_files = [manifest["schema_file"]]
+    for task in manifest["tasks"]:
+        relative_files.append(task["gold_file"])
+        relative_files.extend(task["prompt_files"].values())
     files = [
         manifest_path,
         *(resolve_manifest_file(manifest_path, item) for item in relative_files),
@@ -93,35 +162,42 @@ def snapshot_hashes(manifest_path: Path, profile_path: Path) -> dict[str, str]:
 @dataclass(frozen=True)
 class ScheduleEntry:
     ordinal: int
+    task_index: int
+    task_id: str
+    slug: str
+    repository: str
     arm: str
-    repetition: int
-    warmup: bool
 
     @property
     def trial_name(self) -> str:
-        if self.warmup:
-            return f"warmup-{self.arm}"
-        return f"rep-{self.repetition:02d}-{self.arm}"
+        return f"{self.task_index:02d}-{self.slug}"
 
 
-def balanced_schedule(*, arms: Sequence[str], repetitions: int, seed: int) -> list[ScheduleEntry]:
+def suite_schedule(
+    *, tasks: Sequence[Mapping[str, Any]], arms: Sequence[str], seed: int
+) -> list[ScheduleEntry]:
     if list(arms) != ["codekg", "native"]:
-        raise ValueError("the Requests benchmark requires codekg and native arms")
-    if repetitions <= 0 or repetitions % 2:
-        raise ValueError("measured repetitions must be a positive even integer")
+        raise ValueError("the benchmark requires codekg and native arms")
+    if not tasks or len(tasks) % 2:
+        raise ValueError("the benchmark requires a positive even task count")
 
     randomizer = random.Random(seed)
-    warmup_order = list(arms)
-    randomizer.shuffle(warmup_order)
-    first_arms = ["codekg"] * (repetitions // 2) + ["native"] * (repetitions // 2)
+    first_arms = ["codekg"] * (len(tasks) // 2) + ["native"] * (len(tasks) // 2)
     randomizer.shuffle(first_arms)
     entries: list[ScheduleEntry] = []
-    for arm in warmup_order:
-        entries.append(ScheduleEntry(len(entries), arm, 0, True))
-    for repetition, first in enumerate(first_arms, start=1):
+    for task, first in zip(tasks, first_arms, strict=True):
         second = "native" if first == "codekg" else "codekg"
         for arm in (first, second):
-            entries.append(ScheduleEntry(len(entries), arm, repetition, False))
+            entries.append(
+                ScheduleEntry(
+                    ordinal=len(entries),
+                    task_index=int(task["index"]),
+                    task_id=str(task["task_id"]),
+                    slug=str(task["slug"]),
+                    repository=str(task["repository"]),
+                    arm=arm,
+                )
+            )
     return entries
 
 
@@ -293,17 +369,14 @@ def validate_answer_schema(answer: object) -> list[str]:
 
 
 def validate_repository_identity_and_paths(
-    answer: Mapping[str, Any], repository: Path, expected_commit: str
+    answer: Mapping[str, Any],
+    repository: Path,
+    expected_commit: str,
+    identity: str,
 ) -> list[str]:
     errors: list[str] = []
-    process = subprocess.run(
-        ["git", "-C", str(repository), "rev-parse", "HEAD"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    observed_commit = process.stdout.strip()
-    if process.returncode or observed_commit != expected_commit:
+    observed_commit = repository_snapshot_commit(repository, identity)
+    if not observed_commit or not observed_commit.startswith(expected_commit):
         errors.append(
             f"repository commit mismatch: expected {expected_commit}, "
             f"got {observed_commit or '<unavailable>'}"
@@ -356,7 +429,9 @@ def _identifier(arguments: object) -> str | None:
     return None
 
 
-def validate_codekg_protocol(events: Sequence[dict[str, Any]]) -> tuple[list[str], dict[str, Any]]:
+def validate_codekg_protocol(
+    events: Sequence[dict[str, Any]], repository: str
+) -> tuple[list[str], dict[str, Any]]:
     errors: list[str] = []
     all_items = completed_items(events)
     mcp_items = [item for item in all_items if item.get("type") == "mcp_tool_call"]
@@ -392,8 +467,8 @@ def validate_codekg_protocol(events: Sequence[dict[str, Any]]) -> tuple[list[str
         if not isinstance(arguments, Mapping):
             errors.append("search_symbols arguments are missing")
             continue
-        if arguments.get("repository") != "requests":
-            errors.append("search_symbols must use repository=requests")
+        if arguments.get("repository") != repository:
+            errors.append(f"search_symbols must use repository={repository}")
         if arguments.get("scope") != "source":
             errors.append("search_symbols must use scope=source")
         limit = arguments.get("limit")
@@ -812,20 +887,20 @@ def validate_trial(
     except (OSError, json.JSONDecodeError) as exc:
         answer = {}
         event_errors.append(f"cannot read answer.json: {exc}")
+    gold = read_json(gold_path)
     errors = [*event_errors, *validate_answer_schema(answer)]
-    if isinstance(answer, Mapping) and answer.get("task_id") != "requests-intent-001":
-        errors.append("answer task_id does not match requests-intent-001")
+    if isinstance(answer, Mapping) and answer.get("task_id") != gold["task_id"]:
+        errors.append(f"answer task_id does not match {gold['task_id']}")
     final_answer = _answer_from_final_message(events)
     if final_answer is None:
         errors.append("final JSONL agent message is not a JSON object")
     elif final_answer != answer:
         errors.append("final JSONL agent message does not match answer.json")
-    gold = read_json(gold_path)
     protocol: dict[str, Any] = {}
     provenance_errors: list[str] = []
     if isinstance(answer, Mapping):
         if arm == "codekg":
-            protocol_errors, protocol = validate_codekg_protocol(events)
+            protocol_errors, protocol = validate_codekg_protocol(events, gold["repository"])
             errors.extend(protocol_errors)
             provenance_errors = validate_codekg_provenance(answer, events)
             errors.extend(
@@ -841,7 +916,14 @@ def validate_trial(
             errors.append(f"unknown arm: {arm}")
     errors.extend(provenance_errors)
     if isinstance(answer, Mapping):
-        errors.extend(validate_repository_identity_and_paths(answer, repository, gold["commit"]))
+        errors.extend(
+            validate_repository_identity_and_paths(
+                answer,
+                repository,
+                gold["commit"],
+                gold["identity"],
+            )
+        )
     if arm == "codekg" and isinstance(answer, Mapping):
         relationship_strings = {
             value

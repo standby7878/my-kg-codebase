@@ -1,0 +1,27 @@
+Task index: 05
+Task ID: engine-intent-001
+Repository under evaluation: engine
+
+Objective:
+Identify the Engine method that returns a new high-level Connection object and
+serves as the connection-producing boundary used by Engine transaction and raw
+connection workflows.
+
+Mandatory CodeKG protocol:
+1. Preflight already verified the repository. Do not call `list_repositories`.
+2. Use only `search_symbols`, `get_definition`, `find_callers`, and
+   `find_callees`, in that sequence.
+3. Use CodeKG only; do not use shell, filesystem, web, or prior knowledge.
+4. Search only repository `engine` with `scope: "source"`, hybrid mode,
+   exactly one initial call, and `limit` no greater than 5.
+5. Follow a plausible candidate or recommended ID immediately with
+   `get_definition` using the exact ID. Search twice only if the first result
+   has no plausible candidate.
+6. Call both relationship tools with the selected ID and require at least one
+   relevant nonempty relationship.
+7. Report only returned structural evidence with exact relative paths and
+   complete positive ranges.
+8. On required MCP failure, return `INFRA_ERROR: mcp_call_failed`.
+
+Return the primary symbol and one directly relevant caller or helper, explain
+the boundary concisely, and conform to the supplied JSON schema.

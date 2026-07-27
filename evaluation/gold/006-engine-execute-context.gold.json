@@ -1,0 +1,38 @@
+{
+  "task_id": "engine-intent-002",
+  "repository": "engine",
+  "commit": "48d85015f44c",
+  "identity": "content",
+  "category": "intent_symbol_discovery",
+  "primary": {
+    "symbol": "base.Connection._execute_context",
+    "accepted_suffixes": ["Connection._execute_context", "base.Connection._execute_context"],
+    "file": "base.py",
+    "start_line": 1767,
+    "end_line": 1824
+  },
+  "relevant": [
+    {
+      "symbol": "base.Connection._execute_clauseelement",
+      "accepted_suffixes": [
+        "Connection._execute_clauseelement",
+        "base.Connection._execute_clauseelement"
+      ],
+      "file": "base.py",
+      "start_line": 1618,
+      "end_line": 1690,
+      "relationship": "caller"
+    },
+    {
+      "symbol": "base.Connection._exec_single_context",
+      "accepted_suffixes": [
+        "Connection._exec_single_context",
+        "base.Connection._exec_single_context"
+      ],
+      "file": "base.py",
+      "start_line": 1826,
+      "end_line": 1966,
+      "relationship": "callee"
+    }
+  ]
+}

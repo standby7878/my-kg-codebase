@@ -1,0 +1,27 @@
+Task index: 06
+Task ID: engine-intent-002
+Repository under evaluation: engine
+
+Objective:
+Identify the internal Connection execution stage that receives a dialect and
+execution-context constructor, establishes the DBAPI cursor context, and
+dispatches into single-row or insert-many execution paths.
+
+Mandatory CodeKG protocol:
+1. Preflight already verified the repository. Do not call `list_repositories`.
+2. Use only `search_symbols`, `get_definition`, `find_callers`, and
+   `find_callees`, in that sequence.
+3. Use CodeKG only; shell, filesystem, web, and prior knowledge are forbidden.
+4. Search only repository `engine`, `scope: "source"`, hybrid mode, starting
+   with exactly one call and `limit` no greater than 5.
+5. Follow a plausible result or recommended ID immediately with
+   `get_definition` using the exact ID. A second search requires no plausible
+   first result.
+6. Call both relationship tools with that exact ID; at least one relationship
+   must be nonempty and directly relevant.
+7. Report only returned symbols, relative paths, and complete positive line
+   ranges. Keep conclusions structural.
+8. On required MCP failure, return `INFRA_ERROR: mcp_call_failed`.
+
+Return the primary execution-stage symbol plus one caller or delegated helper,
+with a concise boundary explanation and the supplied JSON schema.

@@ -1,0 +1,35 @@
+{
+  "task_id": "requests-intent-002",
+  "repository": "requests",
+  "commit": "f361ead047be",
+  "identity": "git",
+  "category": "intent_symbol_discovery",
+  "primary": {
+    "symbol": "src.requests.sessions.Session.merge_environment_settings",
+    "accepted_suffixes": [
+      "Session.merge_environment_settings",
+      "sessions.Session.merge_environment_settings"
+    ],
+    "file": "src/requests/sessions.py",
+    "start_line": 831,
+    "end_line": 868
+  },
+  "relevant": [
+    {
+      "symbol": "src.requests.sessions.Session.request",
+      "accepted_suffixes": ["Session.request", "sessions.Session.request"],
+      "file": "src/requests/sessions.py",
+      "start_line": 557,
+      "end_line": 653,
+      "relationship": "caller"
+    },
+    {
+      "symbol": "src.requests.utils.get_environ_proxies",
+      "accepted_suffixes": ["get_environ_proxies", "utils.get_environ_proxies"],
+      "file": "src/requests/utils.py",
+      "start_line": 873,
+      "end_line": 882,
+      "relationship": "callee"
+    }
+  ]
+}

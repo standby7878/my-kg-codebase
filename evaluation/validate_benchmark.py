@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate one immutable Requests benchmark trial and emit metrics."""
+"""Validate one immutable multi-repository benchmark trial and emit metrics."""
 
 from __future__ import annotations
 
@@ -22,7 +22,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("trial", type=Path)
     parser.add_argument("--arm", choices=("codekg", "native"))
-    parser.add_argument("--requests", type=Path, required=True)
+    parser.add_argument("--task-index", type=int)
+    parser.add_argument("--corpus-root", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument(
         "--write",
@@ -38,12 +39,24 @@ def main() -> None:
     if arm not in {"codekg", "native"}:
         parser.error("--arm is required when metadata.json does not identify the arm")
     manifest = load_manifest(args.manifest)
+    task_index = args.task_index or metadata.get("task_index")
+    task = next(
+        (item for item in manifest["tasks"] if item["index"] == task_index),
+        None,
+    )
+    if task is None:
+        parser.error("--task-index is required when metadata.json does not identify the task")
+    repository_config = next(
+        item for item in manifest["repositories"] if item["name"] == task["repository"]
+    )
+    repository = (args.corpus_root.resolve() / repository_config["source_path"]).resolve()
+    repository.relative_to(args.corpus_root.resolve())
     validation, metrics = validate_trial(
         arm=arm,
         events_path=trial / "events.jsonl",
         answer_path=trial / "answer.json",
-        repository=args.requests.resolve(),
-        gold_path=resolve_manifest_file(args.manifest, manifest["gold_file"]),
+        repository=repository,
+        gold_path=resolve_manifest_file(args.manifest, task["gold_file"]),
         wall_seconds=metadata.get("wall_seconds"),
         exit_code=metadata.get("exit_code"),
     )

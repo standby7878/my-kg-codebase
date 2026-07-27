@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate measured Requests benchmark trials (warm-ups are always excluded)."""
+"""Aggregate the ten-task multi-repository CodeKG/native benchmark suite."""
 
 from __future__ import annotations
 
@@ -13,10 +13,10 @@ from typing import Any
 
 from benchmark_lib import (
     MANIFEST_PATH,
-    balanced_schedule,
     load_manifest,
     read_events,
     read_json,
+    suite_schedule,
     summarize_values,
     write_json_new,
 )
@@ -82,18 +82,18 @@ def _summary(trials: Sequence[dict[str, Any]], seed: int) -> dict[str, Any]:
 
 
 def _paired_deltas(trials: Sequence[dict[str, Any]], seed: int) -> dict[str, Any]:
-    by_repetition: dict[int, dict[str, dict[str, Any]]] = defaultdict(dict)
+    by_task: dict[int, dict[str, dict[str, Any]]] = defaultdict(dict)
     for trial in trials:
-        by_repetition[trial["metadata"]["repetition"]][trial["metadata"]["arm"]] = trial
+        by_task[trial["metadata"]["task_index"]][trial["metadata"]["arm"]] = trial
     result: dict[str, Any] = {
         "direction": "codekg_minus_native",
-        "complete_pairs": sum(set(pair) == {"codekg", "native"} for pair in by_repetition.values()),
+        "complete_pairs": sum(set(pair) == {"codekg", "native"} for pair in by_task.values()),
         "metrics": {},
         "tokens": {},
     }
     for offset, name in enumerate(SCALAR_METRICS):
         values = []
-        for pair in by_repetition.values():
+        for pair in by_task.values():
             if set(pair) != {"codekg", "native"}:
                 continue
             codekg = _number(pair["codekg"]["metrics"].get(name))
@@ -103,7 +103,7 @@ def _paired_deltas(trials: Sequence[dict[str, Any]], seed: int) -> dict[str, Any
         result["metrics"][name] = summarize_values(values, seed=seed + offset)
     for offset, name in enumerate(TOKEN_METRICS, start=len(SCALAR_METRICS)):
         values = []
-        for pair in by_repetition.values():
+        for pair in by_task.values():
             if set(pair) != {"codekg", "native"}:
                 continue
             codekg = _number(pair["codekg"]["metrics"].get("tokens", {}).get(name))
@@ -117,7 +117,7 @@ def _paired_deltas(trials: Sequence[dict[str, Any]], seed: int) -> dict[str, Any
 def aggregate(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
     all_trials = []
-    for metadata_path in sorted((run_dir / "trials").glob("*/metadata.json")):
+    for metadata_path in sorted((run_dir / "tasks").glob("*/*/metadata.json")):
         metadata = read_json(metadata_path)
         metrics_path = metadata_path.parent / "metrics.json"
         validation_path = metadata_path.parent / "validation.json"
@@ -139,31 +139,40 @@ def aggregate(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
                 "thread_id": thread_ids[0],
             }
         )
-    expected_entries = balanced_schedule(
+    expected_entries = suite_schedule(
+        tasks=manifest["tasks"],
         arms=manifest["arms"],
-        repetitions=manifest["measured_repetitions"],
         seed=manifest["seed"],
     )
     expected_membership = sorted(
-        (entry.ordinal, entry.arm, entry.repetition, entry.warmup) for entry in expected_entries
+        (
+            entry.ordinal,
+            entry.task_index,
+            entry.task_id,
+            entry.repository,
+            entry.arm,
+        )
+        for entry in expected_entries
     )
     observed_membership = []
     for trial in all_trials:
         metadata = trial["metadata"]
         ordinal = metadata.get("ordinal")
         arm = metadata.get("arm")
-        repetition = metadata.get("repetition")
-        warmup = metadata.get("warmup")
+        task_index = metadata.get("task_index")
+        task_id = metadata.get("task_id")
+        repository = metadata.get("repository")
         if (
             isinstance(ordinal, bool)
             or not isinstance(ordinal, int)
             or not isinstance(arm, str)
-            or isinstance(repetition, bool)
-            or not isinstance(repetition, int)
-            or not isinstance(warmup, bool)
+            or isinstance(task_index, bool)
+            or not isinstance(task_index, int)
+            or not isinstance(task_id, str)
+            or not isinstance(repository, str)
         ):
             raise ValueError(f"trial has malformed schedule metadata: {metadata}")
-        observed_membership.append((ordinal, arm, repetition, warmup))
+        observed_membership.append((ordinal, task_index, task_id, repository, arm))
     observed_membership.sort()
     if observed_membership != expected_membership:
         raise ValueError(
@@ -173,8 +182,8 @@ def aggregate(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
     thread_ids = [trial["thread_id"] for trial in all_trials]
     if len(thread_ids) != len(set(thread_ids)):
         raise ValueError("trials reused a Codex thread_id")
-    trials = [trial for trial in all_trials if not trial["metadata"]["warmup"]]
-    expected = len(manifest["arms"]) * manifest["measured_repetitions"]
+    trials = all_trials
+    expected = len(manifest["arms"]) * len(manifest["tasks"])
     if len(trials) != expected:
         raise ValueError(f"expected {expected} measured trials, found {len(trials)}")
     by_arm = {
@@ -187,9 +196,8 @@ def aggregate(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
     }
     seed = int(manifest["seed"])
     return {
-        "task_id": manifest["task_id"],
-        "repository_commit": manifest["repository_commit"],
-        "warmups_excluded": True,
+        "suite_id": manifest["suite_id"],
+        "repositories": manifest["repositories"],
         "expected_measured_trials": expected,
         "observed_measured_trials": len(trials),
         "intention_to_treat": {
@@ -204,7 +212,9 @@ def aggregate(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
         "trial_outcomes": [
             {
                 "arm": trial["metadata"]["arm"],
-                "repetition": trial["metadata"]["repetition"],
+                "task_index": trial["metadata"]["task_index"],
+                "task_id": trial["metadata"]["task_id"],
+                "repository": trial["metadata"]["repository"],
                 "valid": trial["metrics"].get("valid"),
                 "correct": trial["metrics"].get("correct"),
                 "success": trial["metrics"].get("success"),

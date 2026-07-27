@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run the paired Requests CodeKG/native benchmark.
+"""Run the paired multi-repository CodeKG/native benchmark.
 
 The default ``plan`` command is free and side-effect-light. ``run`` refuses to
 launch Codex unless ``--execute`` is supplied; a complete run performs one
-batch preflight, one warm-up per arm, and ten measured repetitions per arm.
+batch preflight and one CodeKG/native pair for each of ten indexed tasks.
 """
 
 from __future__ import annotations
@@ -21,16 +21,17 @@ from typing import Any
 from benchmark_lib import (
     ALLOWED_CODEKG_TOOLS,
     MANIFEST_PATH,
-    balanced_schedule,
     completed_items,
     load_manifest,
     read_events,
     read_json,
+    repository_snapshot_commit,
     resolve_manifest_file,
     result_rows,
     snapshot_hashes,
     structured_content,
     successful_mcp_items,
+    suite_schedule,
     validate_codekg_protocol,
     validate_trial,
     write_json_new,
@@ -116,42 +117,75 @@ def enforce_profile_path(profile_path: Path) -> Path:
 
 def enforce_manifest_profile(manifest: dict[str, Any]) -> None:
     if manifest.get("profile") != "benchmark":
-        raise RuntimeError("the frozen Requests runner requires manifest profile='benchmark'")
+        raise RuntimeError("the frozen suite runner requires manifest profile='benchmark'")
+
+
+def repository_states(corpus_root: Path, manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    corpus_root = corpus_root.resolve()
+    states: dict[str, dict[str, Any]] = {}
+    checked_git_roots: set[Path] = set()
+    for config in manifest["repositories"]:
+        repository = (corpus_root / config["source_path"]).resolve()
+        try:
+            repository.relative_to(corpus_root)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"repository source_path escapes corpus root: {config['source_path']}"
+            ) from exc
+        if not repository.is_dir():
+            raise RuntimeError(f"repository path does not exist: {repository}")
+        git_root = Path(_git(repository, "rev-parse", "--show-toplevel")).resolve()
+        git_commit = _git(git_root, "rev-parse", "HEAD")
+        if git_commit != config["git_commit"]:
+            raise RuntimeError(
+                f"{config['name']} Git commit mismatch: "
+                f"expected {config['git_commit']}, got {git_commit}"
+            )
+        if git_root not in checked_git_roots:
+            checked_git_roots.add(git_root)
+            if _git(git_root, "status", "--porcelain"):
+                raise RuntimeError(
+                    f"checkout is dirty; benchmark requires a frozen corpus: {git_root}"
+                )
+        indexed_commit = repository_snapshot_commit(repository, config["identity"])
+        if not indexed_commit.startswith(config["indexed_commit"]):
+            raise RuntimeError(
+                f"{config['name']} indexed identity mismatch: "
+                f"expected {config['indexed_commit']}, got {indexed_commit}"
+            )
+        states[config["name"]] = {
+            "repository_root": str(repository),
+            "git_root": str(git_root),
+            "git_commit": git_commit,
+            "identity": config["identity"],
+            "indexed_commit": config["indexed_commit"],
+        }
+    return states
 
 
 def local_preflight(
-    *, repository: Path, manifest_path: Path, profile_path: Path, codex: str
+    *, corpus_root: Path, manifest_path: Path, profile_path: Path, codex: str
 ) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
     enforce_manifest_profile(manifest)
     profile_path = enforce_profile_path(profile_path)
-    root = Path(_git(repository, "rev-parse", "--show-toplevel")).resolve()
-    if root != repository.resolve():
-        raise RuntimeError(f"Requests path is not its Git root: {repository} != {root}")
-    commit = _git(repository, "rev-parse", "HEAD")
-    if commit != manifest["repository_commit"]:
-        raise RuntimeError(
-            f"Requests commit mismatch: expected {manifest['repository_commit']}, got {commit}"
-        )
-    if _git(repository, "status", "--porcelain"):
-        raise RuntimeError("Requests checkout is dirty; benchmark requires the frozen checkout")
+    repositories = repository_states(corpus_root, manifest)
     if not profile_path.is_file():
         raise RuntimeError(f"benchmark profile does not exist: {profile_path}")
     contract = profile_contract(profile_path, manifest)
-    expected_files = [
-        resolve_manifest_file(manifest_path, manifest["schema_file"]),
-        resolve_manifest_file(manifest_path, manifest["gold_file"]),
-        *(
+    expected_files = [resolve_manifest_file(manifest_path, manifest["schema_file"])]
+    for task in manifest["tasks"]:
+        expected_files.append(resolve_manifest_file(manifest_path, task["gold_file"]))
+        expected_files.extend(
             resolve_manifest_file(manifest_path, relative)
-            for relative in manifest["prompt_files"].values()
-        ),
-    ]
+            for relative in task["prompt_files"].values()
+        )
     missing = [str(path) for path in expected_files if not path.is_file()]
     if missing:
         raise RuntimeError(f"benchmark package is incomplete: {missing}")
     return {
-        "repository_root": str(root),
-        "repository_commit": commit,
+        "corpus_root": str(corpus_root.resolve()),
+        "repositories": repositories,
         "profile_path": str(profile_path.resolve()),
         "profile_contract": contract,
         "codex_version": codex_version(codex),
@@ -161,26 +195,13 @@ def local_preflight(
 
 def assert_frozen_state(
     *,
-    repository: Path,
+    corpus_root: Path,
     manifest_path: Path,
     profile_path: Path,
     expected_hashes: dict[str, str],
 ) -> None:
     manifest = load_manifest(manifest_path)
-    root = Path(_git(repository, "rev-parse", "--show-toplevel")).resolve()
-    if root != repository.resolve():
-        raise RuntimeError(f"Requests path is no longer its Git root: {repository} != {root}")
-    commit = _git(repository, "rev-parse", "HEAD")
-    if commit != manifest["repository_commit"]:
-        raise RuntimeError(
-            "Requests commit drifted during the benchmark: "
-            f"expected {manifest['repository_commit']}, got {commit}"
-        )
-    dirty = _git(repository, "status", "--porcelain")
-    if dirty:
-        raise RuntimeError(
-            "Requests checkout was modified during the benchmark; aborting before another run"
-        )
+    repository_states(corpus_root, manifest)
     observed_hashes = snapshot_hashes(manifest_path, profile_path)
     if observed_hashes != expected_hashes:
         changed = sorted(
@@ -387,7 +408,9 @@ def _launch_with_frozen_state(
         assert_frozen_state(**frozen_state_arguments)
 
 
-def validate_preflight(events_path: Path, expected_commit: str, exit_code: int) -> list[str]:
+def validate_preflight(
+    events_path: Path, expected_repositories: dict[str, str], exit_code: int
+) -> list[str]:
     errors: list[str] = []
     if exit_code:
         errors.append(f"Codex preflight exited with {exit_code}")
@@ -405,18 +428,15 @@ def validate_preflight(events_path: Path, expected_commit: str, exit_code: int) 
     rows: list[dict[str, Any]] = []
     if isinstance(payload, dict) and isinstance(payload.get("result"), list):
         rows = [row for row in payload["result"] if isinstance(row, dict)]
-    requests_rows = [row for row in rows if row.get("repo_name") == "requests"]
-    if len(requests_rows) != 1:
-        errors.append("preflight did not find exactly one indexed requests repository")
-    else:
-        indexed = requests_rows[0].get("commit")
-        if (
-            not isinstance(indexed, str)
-            or len(indexed) < 12
-            or not expected_commit.startswith(indexed)
-        ):
+    for repository, expected_commit in expected_repositories.items():
+        matching = [row for row in rows if row.get("repo_name") == repository]
+        if len(matching) != 1:
+            errors.append(f"preflight did not find exactly one indexed {repository} repository")
+            continue
+        indexed = matching[0].get("commit")
+        if not isinstance(indexed, str) or indexed != expected_commit:
             errors.append(
-                f"indexed Requests commit mismatch: expected {expected_commit}, got {indexed}"
+                f"indexed {repository} commit mismatch: expected {expected_commit}, got {indexed}"
             )
     return errors
 
@@ -427,7 +447,7 @@ def validate_graph_preflight(events_path: Path, gold: dict[str, Any], exit_code:
         errors.append(f"Codex graph preflight exited with {exit_code}")
     events, parse_errors = read_events(events_path)
     errors.extend(parse_errors)
-    protocol_errors, _ = validate_codekg_protocol(events)
+    protocol_errors, _ = validate_codekg_protocol(events, gold["repository"])
     errors.extend(protocol_errors)
     by_tool = {str(item.get("tool")): item for item in successful_mcp_items(events)}
     expected = [
@@ -454,11 +474,11 @@ def validate_graph_preflight(events_path: Path, gold: dict[str, Any], exit_code:
     if (caller["file"], caller["start_line"], caller["end_line"]) not in {
         (row.get("file"), row.get("start_line"), row.get("end_line")) for row in caller_rows
     }:
-        errors.append("graph preflight is missing Session.request caller edge")
+        errors.append(f"graph preflight is missing caller edge for {caller['symbol']}")
     if (callee["file"], callee["start_line"], callee["end_line"]) not in {
         (row.get("file"), row.get("start_line"), row.get("end_line")) for row in callee_rows
     }:
-        errors.append("graph preflight is missing PreparedRequest.prepare callee edge")
+        errors.append(f"graph preflight is missing callee edge for {callee['symbol']}")
     return errors
 
 
@@ -467,13 +487,15 @@ def _frozen_schedule(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         {
             "ordinal": entry.ordinal,
             "trial_name": entry.trial_name,
+            "task_index": entry.task_index,
+            "task_id": entry.task_id,
+            "slug": entry.slug,
+            "repository": entry.repository,
             "arm": entry.arm,
-            "repetition": entry.repetition,
-            "warmup": entry.warmup,
         }
-        for entry in balanced_schedule(
+        for entry in suite_schedule(
+            tasks=manifest["tasks"],
             arms=manifest["arms"],
-            repetitions=manifest["measured_repetitions"],
             seed=manifest["seed"],
         )
     ]
@@ -482,12 +504,21 @@ def _frozen_schedule(manifest: dict[str, Any]) -> list[dict[str, Any]]:
 def execute(args: argparse.Namespace) -> int:
     manifest_path = args.manifest.resolve()
     manifest = load_manifest(manifest_path)
-    repository = args.requests.resolve()
+    corpus_root = args.corpus_root.resolve()
     local = local_preflight(
-        repository=repository,
+        corpus_root=corpus_root,
         manifest_path=manifest_path,
         profile_path=args.profile_path.resolve(),
         codex=args.codex,
+    )
+    repository_paths = {
+        name: Path(state["repository_root"]) for name, state in local["repositories"].items()
+    }
+    tasks = {int(task["index"]): task for task in manifest["tasks"]}
+    schedule_entries = suite_schedule(
+        tasks=manifest["tasks"],
+        arms=manifest["arms"],
+        seed=manifest["seed"],
     )
     schedule = _frozen_schedule(manifest)
     if args.command == "plan":
@@ -517,12 +548,14 @@ def execute(args: argparse.Namespace) -> int:
         },
     )
     frozen_state_arguments = {
-        "repository": repository,
+        "corpus_root": corpus_root,
         "manifest_path": manifest_path,
         "profile_path": Path(local["profile_path"]),
         "expected_hashes": local["hashes"],
     }
 
+    first_task = manifest["tasks"][0]
+    first_repository = repository_paths[first_task["repository"]]
     preflight_dir = run_dir / "preflight"
     repository_preflight_dir = preflight_dir / "repository"
     preflight_events = repository_preflight_dir / "events.jsonl"
@@ -531,19 +564,24 @@ def execute(args: argparse.Namespace) -> int:
             codex=args.codex,
             profile=manifest["profile"],
             contract=local["profile_contract"],
-            repository=repository,
+            repository=first_repository,
         ),
         prompt=(
-            "Call codekg.list_repositories exactly once. Return only whether repository "
-            "'requests' is indexed. Do not call any other tool."
+            "Call codekg.list_repositories exactly once. Verify that these repositories "
+            f"are indexed: {', '.join(repository_paths)}. Do not call any other tool."
         ),
         events_path=preflight_events,
         stderr_path=repository_preflight_dir / "stderr.log",
         timeout=args.timeout,
         frozen_state_arguments=frozen_state_arguments,
     )
+    expected_repositories = {
+        config["name"]: config["indexed_commit"] for config in manifest["repositories"]
+    }
     preflight_errors = validate_preflight(
-        preflight_events, manifest["repository_commit"], preflight_exit
+        preflight_events,
+        expected_repositories,
+        preflight_exit,
     )
     write_json_new(
         repository_preflight_dir / "result.json",
@@ -559,8 +597,8 @@ def execute(args: argparse.Namespace) -> int:
         return 2
 
     schema_path = resolve_manifest_file(manifest_path, manifest["schema_file"])
-    gold_path = resolve_manifest_file(manifest_path, manifest["gold_file"])
-    gold = read_json(gold_path)
+    graph_gold_path = resolve_manifest_file(manifest_path, first_task["gold_file"])
+    graph_gold = read_json(graph_gold_path)
     graph_preflight_dir = preflight_dir / "graph"
     graph_events = graph_preflight_dir / "events.jsonl"
     graph_exit, graph_wall = _launch_with_frozen_state(
@@ -568,21 +606,22 @@ def execute(args: argparse.Namespace) -> int:
             codex=args.codex,
             profile=manifest["profile"],
             contract=local["profile_contract"],
-            repository=repository,
+            repository=first_repository,
         ),
         prompt=(
-            "Preflight the indexed Requests graph using exactly these calls in order: "
-            "search_symbols(repository='requests', scope='source', limit=1) for "
-            "Session.prepare_request; get_definition for its returned exact symbol ID; "
-            "then both find_callers and find_callees for that same ID. Do not use shell, "
-            "web, or other tools. Return a terse structural status only."
+            "Preflight the indexed graph using exactly these calls in order: "
+            f"search_symbols(repository='{graph_gold['repository']}', scope='source', "
+            f"limit=1) for {graph_gold['primary']['symbol']}; get_definition for its "
+            "returned exact symbol ID; then both find_callers and find_callees for that "
+            "same ID. Do not use shell, web, or other tools. Return a terse structural "
+            "status only."
         ),
         events_path=graph_events,
         stderr_path=graph_preflight_dir / "stderr.log",
         timeout=args.timeout,
         frozen_state_arguments=frozen_state_arguments,
     )
-    graph_errors = validate_graph_preflight(graph_events, gold, graph_exit)
+    graph_errors = validate_graph_preflight(graph_events, graph_gold, graph_exit)
     write_json_new(
         graph_preflight_dir / "result.json",
         {
@@ -604,14 +643,13 @@ def execute(args: argparse.Namespace) -> int:
         print("graph preflight failed; measured trials were not started", file=sys.stderr)
         return 2
 
-    for entry in balanced_schedule(
-        arms=manifest["arms"],
-        repetitions=manifest["measured_repetitions"],
-        seed=manifest["seed"],
-    ):
-        trial_dir = run_dir / "trials" / f"{entry.ordinal:02d}-{entry.trial_name}"
+    for entry in schedule_entries:
+        task = tasks[entry.task_index]
+        repository = repository_paths[entry.repository]
+        trial_dir = run_dir / "tasks" / entry.trial_name / entry.arm
         answer_path = trial_dir / "answer.json"
-        prompt_path = resolve_manifest_file(manifest_path, manifest["prompt_files"][entry.arm])
+        prompt_path = resolve_manifest_file(manifest_path, task["prompt_files"][entry.arm])
+        gold_path = resolve_manifest_file(manifest_path, task["gold_file"])
         command = trial_command(
             arm=entry.arm,
             codex=args.codex,
@@ -631,9 +669,11 @@ def execute(args: argparse.Namespace) -> int:
         )
         metadata = {
             "ordinal": entry.ordinal,
+            "task_index": entry.task_index,
+            "task_id": entry.task_id,
+            "slug": entry.slug,
+            "repository": entry.repository,
             "arm": entry.arm,
-            "repetition": entry.repetition,
-            "warmup": entry.warmup,
             "exit_code": exit_code,
             "wall_seconds": wall_seconds,
             "command": command,
@@ -660,7 +700,7 @@ def parser() -> argparse.ArgumentParser:
     subparsers = value.add_subparsers(dest="command", required=True)
     for name in ("plan", "run"):
         command = subparsers.add_parser(name)
-        command.add_argument("--requests", type=Path, required=True)
+        command.add_argument("--corpus-root", type=Path, required=True)
         command.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
         command.add_argument(
             "--profile-path",
@@ -669,7 +709,11 @@ def parser() -> argparse.ArgumentParser:
         )
         command.add_argument("--codex", default="codex")
         command.add_argument("--timeout", type=float, default=300.0)
-        command.add_argument("--output", type=Path, default=Path("runs/requests-benchmark"))
+        command.add_argument(
+            "--output",
+            type=Path,
+            default=Path("runs/codekg-native-intent-suite"),
+        )
         command.add_argument(
             "--execute",
             action="store_true",

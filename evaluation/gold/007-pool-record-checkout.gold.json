@@ -1,0 +1,38 @@
+{
+  "task_id": "pool-intent-001",
+  "repository": "pool",
+  "commit": "814c2342b1cf",
+  "identity": "content",
+  "category": "intent_symbol_discovery",
+  "primary": {
+    "symbol": "base._ConnectionRecord.checkout",
+    "accepted_suffixes": [
+      "_ConnectionRecord.checkout",
+      "base._ConnectionRecord.checkout"
+    ],
+    "file": "base.py",
+    "start_line": 706,
+    "end_line": 739
+  },
+  "relevant": [
+    {
+      "symbol": "base._ConnectionFairy.__init__",
+      "accepted_suffixes": [
+        "_ConnectionFairy.__init__",
+        "base._ConnectionFairy.__init__"
+      ],
+      "file": "base.py",
+      "start_line": 1232,
+      "end_line": 1243,
+      "relationship": "callee"
+    },
+    {
+      "symbol": "base._finalize_fairy",
+      "accepted_suffixes": ["_finalize_fairy", "base._finalize_fairy"],
+      "file": "base.py",
+      "start_line": 915,
+      "end_line": 1044,
+      "relationship": "callee"
+    }
+  ]
+}

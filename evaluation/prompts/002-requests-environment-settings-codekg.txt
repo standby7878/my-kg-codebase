@@ -1,0 +1,31 @@
+Task index: 02
+Task ID: requests-intent-002
+Repository under evaluation: requests
+
+Objective:
+Identify the session method that combines request-provided proxy, stream,
+certificate, and TLS verification settings with environment-derived proxies
+and session defaults before a prepared request is sent.
+
+Mandatory CodeKG protocol:
+1. Preflight already verified the repository. Do not call `list_repositories`.
+2. Use only `search_symbols`, `get_definition`, `find_callers`, and
+   `find_callees`, in that sequence.
+3. Use CodeKG as the only repository-investigation mechanism. Do not use shell,
+   filesystem, web, or prior model knowledge as evidence.
+4. Search only repository `requests` with `scope: "source"`. Start with exactly
+   one hybrid search and `limit` no greater than 5.
+5. Search is candidate discovery only. If the first result has a plausible
+   candidate or `recommended_symbol_id`, immediately call `get_definition`
+   with that exact ID. A second search is allowed only if no candidate is
+   plausible.
+6. Call both relationship tools with the same exact selected ID. At least one
+   relationship result must be nonempty and directly relevant.
+7. Report only symbols, paths, and complete positive line ranges returned by
+   successful MCP results. Keep conclusions structural.
+8. If a required MCP call fails, return `INFRA_ERROR: mcp_call_failed` in the
+   answer field.
+
+Return the primary symbol plus one directly relevant caller or delegated
+helper, explain the responsibility boundary concisely, and conform to the
+supplied JSON schema.

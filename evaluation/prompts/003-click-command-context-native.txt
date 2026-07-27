@@ -1,0 +1,24 @@
+Task index: 03
+Task ID: click-intent-001
+Repository under evaluation: click
+
+Objective:
+Identify the command method that creates a Click context for a command-line
+invocation, applies extra context settings, and delegates argument processing
+before returning the initialized context.
+
+Mandatory native protocol:
+1. First run a shell command that prints the working directory and Git root,
+   then searches the current repository for likely symbols.
+2. Use only current-repository shell inspection; no MCP, web, external docs, or
+   prior knowledge.
+3. Inspect completed search output, then read the strongest candidate's entire
+   numbered definition and one relevant caller or delegated helper.
+4. Every reported symbol and range must have a successful command naming the
+   relative file and emitting all numbered lines.
+5. Use the last syntax line as `end_line`, excluding blank separators.
+6. Do not modify files. On a required command failure, return
+   `INFRA_ERROR: native_search_failed`.
+
+Return the primary symbol and one caller or delegated helper, with a concise
+boundary explanation, using the supplied JSON schema.

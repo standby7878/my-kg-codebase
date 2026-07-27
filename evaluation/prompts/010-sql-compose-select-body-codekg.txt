@@ -1,0 +1,27 @@
+Task index: 10
+Task ID: sql-intent-002
+Repository under evaluation: sql
+
+Objective:
+Identify the SQL compiler helper that composes the body of an already-prepared
+Select statement by rendering FROM, WHERE, GROUP BY, HAVING, ORDER BY, row
+limits, and locking clauses.
+
+Mandatory CodeKG protocol:
+1. Preflight already verified the repository. Do not call `list_repositories`.
+2. Use only `search_symbols`, `get_definition`, `find_callers`, and
+   `find_callees`, in that sequence.
+3. Use CodeKG only; shell, filesystem, web, and prior knowledge are forbidden.
+4. Search only repository `sql`, `scope: "source"`, hybrid mode, starting with
+   exactly one call and `limit` no greater than 5.
+5. Immediately verify a plausible candidate or recommended ID using
+   `get_definition` with that exact ID. A second search is allowed only when
+   the first has no plausible candidate.
+6. Call both relationship tools with the selected ID; require at least one
+   relevant nonempty relationship.
+7. Report only MCP-returned symbols, relative paths, and complete ranges. Keep
+   claims structural.
+8. On required MCP failure, return `INFRA_ERROR: mcp_call_failed`.
+
+Return the body-composition helper plus its compiler caller or one clause
+helper, explain the boundary concisely, and use the supplied JSON schema.

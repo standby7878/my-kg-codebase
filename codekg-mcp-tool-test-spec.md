@@ -128,6 +128,44 @@ payload.
 
 ## Paired Codex benchmark reproduction
 
+The canonical benchmark now contains ten indexed tasks across the `requests`,
+`click`, `engine`, `pool`, and `sql` CodeKG repositories. Each task runs once
+through CodeKG and once through native search. The seeded order balances which
+arm runs first. From the `my-kg-codebase` root, run the complete suite with:
+
+```bash
+CORPUS_ROOT=/media/alex/MYSSD/BACKUP/workspace/codekg-corpus
+RUN_DIR="$PWD/runs/codekg-native-intent-suite-$(date +%Y%m%d-%H%M%S)"
+
+.venv/bin/python evaluation/run_benchmark.py plan \
+  --corpus-root "$CORPUS_ROOT"
+
+.venv/bin/python evaluation/run_benchmark.py run \
+  --execute \
+  --corpus-root "$CORPUS_ROOT" \
+  --output "$RUN_DIR"
+
+.venv/bin/python evaluation/aggregate_benchmark.py \
+  "$RUN_DIR" \
+  --output "$RUN_DIR-summary.json"
+```
+
+The 20 measured outputs are grouped by prompt index:
+
+```text
+$RUN_DIR/tasks/01-requests-prepare-request/{codekg,native}/
+$RUN_DIR/tasks/02-requests-environment-settings/{codekg,native}/
+...
+$RUN_DIR/tasks/10-sql-compose-select-body/{codekg,native}/
+```
+
+The runner also launches one repository preflight and one graph preflight, for
+22 Codex processes in a complete run. Output directories are immutable and
+must not be reused. The full contract, task list, validation command, and
+artifact contents are documented in `evaluation/README.md`.
+
+### Manual single-pair commands
+
 The following commands capture one CodeKG arm and one native-search arm for
 task `requests-intent-001`. Run them from the `my-kg-codebase` root after
 setting `REQUESTS_DIR` to the frozen Requests checkout and `RUN_DIR` to a new
@@ -172,7 +210,7 @@ time codex --ask-for-approval never exec \
   -c 'mcp_servers.codekg.enabled_tools=["search_symbols","get_definition","find_callers","find_callees"]' \
   --output-schema "$BENCHMARK_EVAL_DIR/codex-answer.schema.json" \
   -o "$RUN_DIR/codekg/answer.json" \
-  "$(< "$BENCHMARK_EVAL_DIR/prompts/requests-intent-001-codekg.txt")" \
+  "$(< "$BENCHMARK_EVAL_DIR/prompts/001-requests-prepare-request-codekg.txt")" \
   > "$RUN_DIR/codekg/events.jsonl" \
   2> "$RUN_DIR/codekg/stderr.log"
 ```
@@ -202,7 +240,7 @@ time codex --ask-for-approval never exec \
   -c 'mcp_servers.codekg.required=false' \
   --output-schema "$BENCHMARK_EVAL_DIR/codex-answer.schema.json" \
   -o "$RUN_DIR/native/answer.json" \
-  "$(< "$BENCHMARK_EVAL_DIR/prompts/requests-intent-001-native.txt")" \
+  "$(< "$BENCHMARK_EVAL_DIR/prompts/001-requests-prepare-request-native.txt")" \
   > "$RUN_DIR/native/events.jsonl" \
   2> "$RUN_DIR/native/stderr.log"
 ```
@@ -264,8 +302,7 @@ The CodeKG arm instead completed the required
 `search_symbols` → `get_definition` → `find_callers` → `find_callees`
 sequence with bounded structured results.
 
-This observation establishes correctness and cost for one paired trial only.
-Use the frozen warm-up plus ten paired repetitions in
-`evaluation/run_benchmark.py` for aggregate conclusions and confidence
-intervals. The JSONL events do not contain reliable per-tool timestamps, so
-this observation does not compare MCP latency.
+This observation establishes correctness and cost for one historical paired
+trial only. Use the frozen ten-task suite in `evaluation/run_benchmark.py` for
+multi-repository paired conclusions. The JSONL events do not contain reliable
+per-tool timestamps, so this observation does not compare MCP latency.

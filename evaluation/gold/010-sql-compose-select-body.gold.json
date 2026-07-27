@@ -1,0 +1,38 @@
+{
+  "task_id": "sql-intent-002",
+  "repository": "sql",
+  "commit": "24b988e6a06d",
+  "identity": "content",
+  "category": "intent_symbol_discovery",
+  "primary": {
+    "symbol": "compiler.SQLCompiler._compose_select_body",
+    "accepted_suffixes": [
+      "SQLCompiler._compose_select_body",
+      "compiler.SQLCompiler._compose_select_body"
+    ],
+    "file": "compiler.py",
+    "start_line": 5260,
+    "end_line": 5358
+  },
+  "relevant": [
+    {
+      "symbol": "compiler.SQLCompiler.visit_select",
+      "accepted_suffixes": ["SQLCompiler.visit_select", "compiler.SQLCompiler.visit_select"],
+      "file": "compiler.py",
+      "start_line": 4973,
+      "end_line": 5194,
+      "relationship": "caller"
+    },
+    {
+      "symbol": "compiler.SQLCompiler.order_by_clause",
+      "accepted_suffixes": [
+        "SQLCompiler.order_by_clause",
+        "compiler.SQLCompiler.order_by_clause"
+      ],
+      "file": "compiler.py",
+      "start_line": 5456,
+      "end_line": 5466,
+      "relationship": "callee"
+    }
+  ]
+}
