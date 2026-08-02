@@ -3,8 +3,9 @@
 # Project to Single TXT File Converter with Git Integration
 # Usage: ./convert2txt.sh [project_directory] [output_file]
 # 
-# This script exports tracked and untracked project files to a single text file,
-# while respecting .gitignore and excluding local temp/input data.
+# This script exports project source files to a single text file while
+# respecting .gitignore. Tests, benchmark/evaluation inputs, run artifacts,
+# reports, and generated output are intentionally excluded.
 
 # Verbose mode (set to 1 to enable, 0 to disable)
 VERBOSE=1
@@ -43,6 +44,22 @@ EXTENSIONS=(
     "Dockerfile"
 )
 
+# Project-owned implementation and runtime/build inputs. Keep this allowlist
+# narrow so test output and other generated artifacts cannot enter the export
+# merely because they have a text-file extension.
+PROJECT_SOURCE_PATTERNS=(
+    "src/*"
+    "compose/*"
+    "docker/*"
+    ".dockerignore"
+    ".env.example"
+    ".gitignore"
+    "pyproject.toml"
+    "convert2txt.sh"
+    "init-neo4j-data.sh"
+    "run-compose.sh"
+)
+
 # Additional patterns to exclude even if tracked by git (optional)
 # These will be filtered out from git ls-files results
 ADDITIONAL_EXCLUDE_PATTERNS=(
@@ -64,25 +81,6 @@ ADDITIONAL_EXCLUDE_PATTERNS=(
     "*.egg-info/*"
 )
 
-should_exclude_third_party_nested() {
-    local file="$1"
-
-    if [[ "$file" != third_party/* ]]; then
-        return 1
-    fi
-
-    IFS='/' read -r -a parts <<< "$file"
-
-    # Keep only files directly under a directly vendored dependency, such as
-    # third_party/CodeGraphContext/README.md. Exclude nested modules/content.
-    if (( ${#parts[@]} > 3 )); then
-        log_verbose "Excluding nested third-party file: $file"
-        return 0
-    fi
-
-    return 1
-}
-
 echo "Converting project to single TXT file..."
 echo "Project Directory: $PROJECT_DIR"
 echo "Output File: $OUTPUT_FILE"
@@ -100,7 +98,7 @@ PROJECT EXPORT - CodeKG
 Generated on: $(date)
 Project Directory: $PROJECT_DIR
 Export File: $OUTPUT_FILE_ABS
-Source: Git-tracked and untracked non-ignored files
+Source: Project implementation and runtime/build source files
 ================================================================================
 
 TABLE OF CONTENTS:
@@ -123,10 +121,6 @@ should_exclude_additional() {
         return 0
     fi
 
-    if should_exclude_third_party_nested "$file"; then
-        return 0
-    fi
-    
     if [ ${#ADDITIONAL_EXCLUDE_PATTERNS[@]} -eq 0 ]; then
         return 1
     fi
@@ -137,6 +131,20 @@ should_exclude_additional() {
             return 0
         fi
     done
+    return 1
+}
+
+# Function to check if a file belongs to the project source allowlist.
+is_project_source() {
+    local file="$1"
+
+    for pattern in "${PROJECT_SOURCE_PATTERNS[@]}"; do
+        if [[ "$file" == $pattern ]]; then
+            return 0
+        fi
+    done
+
+    log_verbose "Skipping non-source file: $file"
     return 1
 }
 
@@ -189,6 +197,11 @@ while IFS= read -r file; do
     fi
     
     log_verbose "Found project file: $file"
+
+    # Only implementation and runtime/build sources belong in this export.
+    if ! is_project_source "$file"; then
+        continue
+    fi
     
     # Check additional exclude patterns
     if should_exclude_additional "$file"; then
@@ -249,7 +262,7 @@ FOOTER_EOF
 cat << EOF >> "$OUTPUT_FILE_ABS"
 Total files processed: $file_count
 Generated on: $(date)
-Source: Git-tracked and untracked non-ignored files
+Source: Project implementation and runtime/build source files
 EOF
 
 echo "----------------------------------------"
@@ -259,9 +272,9 @@ echo "Output file: $OUTPUT_FILE_ABS"
 echo "File size: $(du -h "$OUTPUT_FILE_ABS" | cut -f1)"
 echo ""
 echo "Inclusion rules:"
-echo "- Git-tracked and untracked non-ignored files"
-echo "- Excludes local temp/input data: .venv, caches, __pycache__, sources"
-echo "- Excludes nested third-party content; direct files under third_party/<name>/ may be included"
+echo "- Project implementation under src/"
+echo "- Runtime/build inputs under compose/ and docker/ plus selected root configuration/scripts"
+echo "- Excludes tests, evaluation/benchmark material, run results, reports, third-party content, and generated output"
 echo "- Filtered by extension: ${EXTENSIONS[*]}"
 echo "- Binary files are marked but content not included"
 echo ""
