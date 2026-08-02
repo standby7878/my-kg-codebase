@@ -8,20 +8,26 @@ Identify the method responsible for taking a high-level Request together with se
 
 Mandatory MCP protocol:
 1. Batch preflight has already verified that repository `requests` is indexed and available. The measured task begins with `search_symbols`; do not repeat preflight.
-2. The canonical measured CodeKG profile exposes exactly these four tools: `search_symbols`, `get_definition`, `find_callers`, and `find_callees`. Use only those tools, in this sequence: `search_symbols`, `get_definition`, then both `find_callers` and `find_callees`.
+2. The canonical measured CodeKG profile exposes exactly these four tools: `search_symbols`, `get_definition`, `find_callers`, and `find_callees`. Use only those tools.
 3. Do not call `list_repositories`; it is a preflight-only tool and is unavailable in the measured profile.
 4. Use CodeKG MCP tools as the only repository-investigation mechanism.
 5. Do not use shell commands, grep, ripgrep, find, cat, direct filesystem reads, web search, or prior model knowledge as evidence.
 6. Search only repository "requests" with `scope: "source"`.
-7. Start with exactly one `search_symbols` call with `limit` no greater than 5.
-8. Treat search as candidate discovery only. If it returns a plausible top candidate or a `recommended_symbol_id`, do not issue another search. Immediately call `get_definition` with that exact `symbol_id`.
-9. Treat `get_definition` as structural verification of indexed symbol metadata and line bounds. Then call both `find_callers` and `find_callees` with that same exact `symbol_id`.
-10. A second, reformulated search is allowed only when the first search has no plausible candidate. No more than two search calls are allowed.
+7. Start with one `search_symbols` call with `limit` no greater than 5. A returned `recommended_symbol_id` is advisory, not binding.
+8. If the first search has no plausible candidate, one reformulated second
+   search may occur before any definition inspection. Otherwise inspect the
+   strongest candidate with `get_definition`. If its metadata is inconsistent
+   with the requested responsibility, inspect one other candidate that appeared
+   in a prior search result, optionally after one additional search. Maximum:
+   two searches and two definition inspections.
+9. The last definition inspected is the final selection. Call `find_callers` and `find_callees` exactly once each, in either order, using only that final exact `symbol_id`. Do not expand relationships for a rejected candidate.
+10. Do not make a third search or inspect a third definition.
 11. This is a structural-grounding task. Do not make body-level behavioral claims that are not established by definition metadata and caller/callee relationships.
 12. Do not report any symbol, file, line range, caller, or helper unless it appeared in a successful MCP result.
 13. Exact repository-relative POSIX paths and positive, non-null, complete definition line ranges are required.
 14. If `get_definition`, `find_callers`, and `find_callees` have not all succeeded for the selected symbol ID, the run is incomplete and must not return a normal technical answer.
-15. At least one relationship result must be nonempty and directly relevant.
+15. Return one related claim when either relationship result is directly
+    relevant; if neither result is relevant, `related` may be empty.
 16. If any required MCP call fails, is cancelled, or times out, stop and set the answer field to:
     INFRA_ERROR: mcp_call_failed
 
@@ -31,8 +37,7 @@ What to distinguish:
 - The lower-level PreparedRequest method that performs detailed preparation, if delegation occurs.
 
 Return:
-- The primary implementation symbol.
-- Its repository-relative source file and exact line range.
-- One directly relevant caller or delegated helper, with file and line range.
+- `primary`: the primary implementation symbol, repository-relative source file, and exact line range.
+- `related`: zero or one directly relevant symbol with `relationship` set to `caller` or `callee`, plus its repository-relative file and exact line range. Return one when a relevant relationship result is available.
 - A concise explanation of why the primary symbol is the correct responsibility boundary.
 - The final answer must conform to the supplied JSON schema.

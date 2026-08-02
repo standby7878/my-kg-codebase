@@ -112,6 +112,20 @@ repository commands. Both arms hold the model (`gpt-5.4-mini`), reasoning
 effort (`low`), output schema, rules, and sandbox constant. Multi-agent behavior
 is disabled and every trial uses a new ephemeral Codex process.
 
+Both arms return one explicit `primary` claim and zero or one directed
+`related` claim. Each claim contains a qualified symbol, repository-relative
+POSIX path, and complete definition range; a related claim also declares
+`relationship` as `caller` or `callee`. This removes the former duplicate
+symbol/file/evidence lists and makes the selected responsibility boundary
+unambiguous.
+
+The normal CodeKG path uses one search, one definition inspection, and the two
+relationship calls. Bounded recovery may inspect one additional definition,
+either from an earlier search result or after one additional search. The last
+definition inspected is final, and caller/callee expansion is allowed only for
+that final symbol. `recommended_symbol_id` is advisory. The limits are two
+searches, two definition inspections, and one call to each relationship tool.
+
 ### Run the whole suite
 
 Set the corpus root that contains `requests`, `click`, and `sqlalchemy`, and
@@ -203,6 +217,17 @@ provenance. Aggregation accepts only the exact frozen 20-entry schedule with
 one unique thread per trial. The report includes intention-to-treat and
 valid-only results, per-task outcomes, paired CodeKG-minus-native deltas,
 latency summaries, retrieval measures, evidence compliance, and token usage.
+
+Evaluator diagnostics separate schema validity, infrastructure success,
+protocol compliance, provenance compliance, primary and related semantic
+correctness, and exact-location correctness. A reported location is classified
+as exact, containing the canonical definition, or invalid; strict pass still
+requires exact locations. Unsupported claims, location errors, and protocol
+errors are counted independently. MCP-only retrieval measures are not
+applicable to native trials and are represented as JSON `null`, so aggregate
+rates omit them rather than treating them as failed retrievals. Legacy
+`valid`, `correct`, `evidence_compliant`, and `success` summaries remain
+available for compatibility.
 
 Normal tests never launch paid trials:
 

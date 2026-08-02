@@ -20,7 +20,7 @@ Mandatory native-search protocol:
 8. Exact repository-relative paths and non-null complete definition line ranges
    are required. A caller or helper range must cover its complete definition,
    not merely excerpt lines inspected during investigation.
-9. Every symbol included in `symbols`, `evidence`, or the answer must have its
+9. Every symbol included in `primary`, `related`, or the answer must have its
    whole definition inspected through its last syntax line. `end_line` must be
    that last syntax line, with no trailing blank separator. Do not report an
    extra caller or helper when its complete definition boundary was not
@@ -40,8 +40,7 @@ What to distinguish:
 - The lower-level PreparedRequest method that performs detailed preparation, if delegation occurs.
 
 Return:
-- The primary implementation symbol.
-- Its repository-relative source file and exact line range.
-- One directly relevant caller or delegated helper, with file and line range.
+- `primary`: the primary implementation symbol, repository-relative source file, and exact line range.
+- `related`: zero or one directly relevant symbol with `relationship` set to `caller` or `callee`, plus its repository-relative file and exact line range. Return one when verified evidence is available.
 - A concise explanation of why the primary symbol is the correct responsibility boundary.
 - The final answer must conform to the supplied JSON schema.

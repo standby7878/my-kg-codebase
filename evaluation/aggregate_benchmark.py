@@ -32,6 +32,9 @@ SCALAR_METRICS = (
     "searches_before_target",
     "reciprocal_rank",
     "unsupported_claim_count",
+    "location_error_count",
+    "protocol_error_count",
+    "relationship_rows",
     "relationship_location_completeness",
 )
 TOKEN_METRICS = (
@@ -44,6 +47,14 @@ TOKEN_METRICS = (
 )
 RATE_METRICS = (
     "infrastructure_success",
+    "schema_valid",
+    "protocol_compliant",
+    "provenance_compliant",
+    "primary_correct",
+    "related_correct",
+    "semantic_correct",
+    "location_exact",
+    "strict_pass",
     "valid",
     "evidence_compliant",
     "correct",
@@ -60,24 +71,37 @@ def _number(value: object) -> float | None:
 
 
 def _summary(trials: Sequence[dict[str, Any]], seed: int) -> dict[str, Any]:
-    summary: dict[str, Any] = {"count": len(trials), "rates": {}, "metrics": {}, "tokens": {}}
+    summary: dict[str, Any] = {
+        "count": len(trials),
+        "rates": {},
+        "rate_applicable_counts": {},
+        "metrics": {},
+        "tokens": {},
+    }
     for name in RATE_METRICS:
-        values = [bool(trial["metrics"].get(name)) for trial in trials]
+        values = [
+            value for trial in trials if isinstance((value := trial["metrics"].get(name)), bool)
+        ]
         summary["rates"][name] = sum(values) / len(values) if values else None
+        summary["rate_applicable_counts"][name] = len(values)
     for offset, name in enumerate(SCALAR_METRICS):
         values = [
             number
             for trial in trials
             if (number := _number(trial["metrics"].get(name))) is not None
         ]
-        summary["metrics"][name] = summarize_values(values, seed=seed + offset)
+        metric_summary = summarize_values(values, seed=seed + offset)
+        metric_summary["applicable_count"] = len(values)
+        summary["metrics"][name] = metric_summary
     for offset, name in enumerate(TOKEN_METRICS, start=len(SCALAR_METRICS)):
         values = [
             number
             for trial in trials
             if (number := _number(trial["metrics"].get("tokens", {}).get(name))) is not None
         ]
-        summary["tokens"][name] = summarize_values(values, seed=seed + offset)
+        token_summary = summarize_values(values, seed=seed + offset)
+        token_summary["applicable_count"] = len(values)
+        summary["tokens"][name] = token_summary
     return summary
 
 
@@ -100,7 +124,9 @@ def _paired_deltas(trials: Sequence[dict[str, Any]], seed: int) -> dict[str, Any
             native = _number(pair["native"]["metrics"].get(name))
             if codekg is not None and native is not None:
                 values.append(codekg - native)
-        result["metrics"][name] = summarize_values(values, seed=seed + offset)
+        metric_summary = summarize_values(values, seed=seed + offset)
+        metric_summary["applicable_count"] = len(values)
+        result["metrics"][name] = metric_summary
     for offset, name in enumerate(TOKEN_METRICS, start=len(SCALAR_METRICS)):
         values = []
         for pair in by_task.values():
@@ -110,7 +136,9 @@ def _paired_deltas(trials: Sequence[dict[str, Any]], seed: int) -> dict[str, Any
             native = _number(pair["native"]["metrics"].get("tokens", {}).get(name))
             if codekg is not None and native is not None:
                 values.append(codekg - native)
-        result["tokens"][name] = summarize_values(values, seed=seed + offset)
+        token_summary = summarize_values(values, seed=seed + offset)
+        token_summary["applicable_count"] = len(values)
+        result["tokens"][name] = token_summary
     return result
 
 
@@ -219,6 +247,14 @@ def aggregate(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
                 "correct": trial["metrics"].get("correct"),
                 "success": trial["metrics"].get("success"),
                 "evidence_compliant": trial["metrics"].get("evidence_compliant"),
+                "schema_valid": trial["metrics"].get("schema_valid"),
+                "protocol_compliant": trial["metrics"].get("protocol_compliant"),
+                "provenance_compliant": trial["metrics"].get("provenance_compliant"),
+                "primary_correct": trial["metrics"].get("primary_correct"),
+                "related_correct": trial["metrics"].get("related_correct"),
+                "semantic_correct": trial["metrics"].get("semantic_correct"),
+                "location_exact": trial["metrics"].get("location_exact"),
+                "strict_pass": trial["metrics"].get("strict_pass"),
             }
             for trial in trials
         ],

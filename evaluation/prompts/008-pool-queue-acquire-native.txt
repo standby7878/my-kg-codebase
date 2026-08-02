@@ -20,5 +20,7 @@ Mandatory native protocol:
 6. Do not modify files. On required command failure, return
    `INFRA_ERROR: native_search_failed`.
 
-Return the primary acquisition symbol plus one overflow-related caller or
-helper, explain the boundary concisely, and use the supplied JSON schema.
+Return `primary` with its symbol, relative file, and exact range. Return
+`related` as zero or one verified overflow-related symbol with `relationship`
+set to `caller` or `callee`, plus its relative file and exact range; use one
+when available. Explain the boundary concisely using the supplied JSON schema.

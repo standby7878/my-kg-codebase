@@ -10,18 +10,24 @@ before returning the initialized context.
 Mandatory CodeKG protocol:
 1. Preflight already verified the repository. Do not call `list_repositories`.
 2. Use only `search_symbols`, `get_definition`, `find_callers`, and
-   `find_callees`, in that sequence.
+   `find_callees`.
 3. Use CodeKG only; do not use shell, filesystem, web, or prior knowledge.
 4. Search only repository `click` with `scope: "source"`. Start with exactly
    one hybrid search and `limit` no greater than 5.
-5. If the first search yields a plausible candidate or recommended ID, call
-   `get_definition` immediately with that exact ID. A second search is allowed
-   only if no candidate is plausible.
-6. Call both relationship tools with the same exact ID; at least one result
-   must be nonempty and relevant.
+5. Treat `recommended_symbol_id` as advisory. If the first search has no
+   plausible candidate, one reformulated second search may occur before any
+   definition inspection. Otherwise inspect the strongest candidate; if its
+   metadata conflicts with the requested responsibility, inspect one other
+   prior-result candidate, optionally after one additional search. Use at most
+   two searches and two definition inspections.
+6. The last definition inspected is final. Call both relationship tools
+   exactly once with that final ID, in either order, and do not expand a
+   rejected candidate.
 7. Report only MCP-returned symbols, relative paths, and complete positive
    definition ranges. Keep claims structural.
 8. On a required MCP failure, return `INFRA_ERROR: mcp_call_failed`.
 
-Return the primary symbol and one caller or delegated helper, with a concise
-boundary explanation, using the supplied JSON schema.
+Return `primary` with its symbol, relative file, and exact range. Return
+`related` as zero or one verified symbol with `relationship` set to `caller`
+or `callee`, plus its relative file and exact range; use one when available.
+Give a concise boundary explanation using the supplied JSON schema.

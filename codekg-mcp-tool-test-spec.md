@@ -133,6 +133,19 @@ The canonical benchmark now contains ten indexed tasks across the `requests`,
 through CodeKG and once through native search. The seeded order balances which
 arm runs first. From the `my-kg-codebase` root, run the complete suite with:
 
+Both arms use the same explicit answer contract: one `primary` claim and zero
+or one `related` claim. Claims contain a qualified symbol, repository-relative
+POSIX path, and complete definition range. A related claim additionally uses
+`relationship: "caller"` or `relationship: "callee"` so direction can be
+checked against the corresponding evidence.
+
+The normal CodeKG path is one search, one definition inspection, and one call
+to each relationship tool. For bounded recovery, `recommended_symbol_id` is
+advisory: the agent may inspect one additional candidate from a prior result or
+after one additional search. The last definition inspected is final, and only
+that symbol may receive caller/callee expansion. The hard limits are two
+searches, two definition inspections, and one call to each relationship tool.
+
 ```bash
 CORPUS_ROOT=/media/alex/MYSSD/BACKUP/workspace/codekg-corpus
 RUN_DIR="$PWD/runs/codekg-native-intent-suite-$(date +%Y%m%d-%H%M%S)"
@@ -164,6 +177,14 @@ one Codex graph preflight, for 21 Codex processes in a complete run. Output
 directories are immutable and must not be reused. The full contract, task
 list, validation command, and artifact contents are documented in
 `evaluation/README.md`.
+
+Validation reports schema, infrastructure, protocol, provenance, semantic,
+and exact-location outcomes independently before deriving the strict pass.
+Locations are classified as exact, containing the canonical definition, or
+invalid. Unsupported claims, location errors, and protocol errors have
+separate counts. Retrieval-only CodeKG metrics are JSON `null` for native
+trials and are omitted from aggregate denominators; compatibility summaries
+such as `valid`, `correct`, `evidence_compliant`, and `success` remain present.
 
 ### Manual single-pair commands
 
@@ -247,6 +268,11 @@ time codex --ask-for-approval never exec \
 ```
 
 ## Validated paired observation
+
+This historical observation used the earlier duplicated
+`symbols`/`files`/`evidence` answer shape and conflated exact-location failures
+with evidence validity. It remains here as provenance for the motivating run,
+not as a sample of the current evaluator contract.
 
 The following single-pair observation was captured on 2026-07-27 against
 Requests commit `f361ead047be5cb873174218582f7d8b9fcd9f49` with Codex CLI

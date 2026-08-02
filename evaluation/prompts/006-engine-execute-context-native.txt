@@ -20,5 +20,7 @@ Mandatory native protocol:
 6. Do not modify files. On required command failure, return
    `INFRA_ERROR: native_search_failed`.
 
-Return the primary execution-stage symbol plus one caller or delegated helper,
-with a concise boundary explanation and the supplied JSON schema.
+Return `primary` with its symbol, relative file, and exact range. Return
+`related` as zero or one verified symbol with `relationship` set to `caller`
+or `callee`, plus its relative file and exact range; use one when available.
+Give a concise boundary explanation using the supplied JSON schema.

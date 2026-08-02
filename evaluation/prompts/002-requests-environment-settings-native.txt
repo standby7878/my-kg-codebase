@@ -22,6 +22,8 @@ Mandatory native protocol:
 8. If repository access or a required command fails, return
    `INFRA_ERROR: native_search_failed` in the answer field.
 
-Return the primary symbol plus one directly relevant caller or delegated
-helper, explain the responsibility boundary concisely, and conform to the
-supplied JSON schema.
+Return `primary` with its symbol, relative file, and exact range. Return
+`related` as zero or one verified symbol with `relationship` set to `caller`
+or `callee`, plus its relative file and exact range; use one when available.
+Explain the responsibility boundary concisely and conform to the supplied
+JSON schema.

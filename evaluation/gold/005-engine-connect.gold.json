@@ -19,14 +19,6 @@
       "start_line": 3200,
       "end_line": 3226,
       "relationship": "caller"
-    },
-    {
-      "symbol": "base.Engine.raw_connection",
-      "accepted_suffixes": ["Engine.raw_connection", "base.Engine.raw_connection"],
-      "file": "base.py",
-      "start_line": 3262,
-      "end_line": 3284,
-      "relationship": "caller"
     }
   ]
 }
