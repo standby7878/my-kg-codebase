@@ -333,6 +333,18 @@ def graph_preflight_command(
     return command
 
 
+def graph_preflight_prompt(gold: dict[str, Any]) -> str:
+    target = gold["primary"]
+    return (
+        "Preflight the indexed graph using exactly these calls in order: "
+        f"search_symbols(repository='{gold['repository']}', scope='source', "
+        f"limit=1) for {target['symbol']}; get_definition for its "
+        "returned exact symbol ID; then find_callers with limit=5 and find_callees "
+        "with limit=5 for that same ID. Do not use shell, web, or other tools. "
+        "Return a terse structural status only."
+    )
+
+
 def _launch(
     *,
     command: list[str],
@@ -415,8 +427,7 @@ def _direct_repository_preflight(
             "arguments": {},
             "result": {
                 "content": [
-                    value.model_dump(mode="json", exclude_none=True)
-                    for value in result.content
+                    value.model_dump(mode="json", exclude_none=True) for value in result.content
                 ],
                 "structured_content": result.structured_content,
             },
@@ -493,35 +504,34 @@ def validate_graph_preflight(events_path: Path, gold: dict[str, Any], exit_code:
     protocol_errors, _ = validate_codekg_protocol(events, gold["repository"])
     errors.extend(protocol_errors)
     by_tool = {str(item.get("tool")): item for item in successful_mcp_items(events)}
-    expected = [
-        gold["primary"],
-        *gold["relevant"],
-    ]
-    observed = {
+    for tool in ALLOWED_CODEKG_TOOLS:
+        if tool not in by_tool:
+            errors.append(f"graph preflight did not successfully complete {tool}")
+
+    target = gold["primary"]
+    definition_rows = result_rows(by_tool.get("get_definition", {}))
+    observed_definitions = {
         (
             row.get("file"),
             row.get("start_line"),
             row.get("end_line"),
         )
-        for item in by_tool.values()
-        for row in result_rows(item)
+        for row in definition_rows
     }
-    for symbol in expected:
-        record = (symbol["file"], symbol["start_line"], symbol["end_line"])
-        if record not in observed:
-            errors.append(f"graph preflight did not return expected definition range: {record}")
-    caller_rows = result_rows(by_tool.get("find_callers", {}))
-    callee_rows = result_rows(by_tool.get("find_callees", {}))
-    caller = next(item for item in gold["relevant"] if item["relationship"] == "caller")
-    callee = next(item for item in gold["relevant"] if item["relationship"] == "callee")
-    if (caller["file"], caller["start_line"], caller["end_line"]) not in {
-        (row.get("file"), row.get("start_line"), row.get("end_line")) for row in caller_rows
-    }:
-        errors.append(f"graph preflight is missing caller edge for {caller['symbol']}")
-    if (callee["file"], callee["start_line"], callee["end_line"]) not in {
-        (row.get("file"), row.get("start_line"), row.get("end_line")) for row in callee_rows
-    }:
-        errors.append(f"graph preflight is missing callee edge for {callee['symbol']}")
+    record = (target["file"], target["start_line"], target["end_line"])
+    if record not in observed_definitions:
+        errors.append(f"graph preflight did not return expected target definition range: {record}")
+    for relationship, tool in (("caller", "find_callers"), ("callee", "find_callees")):
+        expected = next(item for item in gold["relevant"] if item["relationship"] == relationship)
+        expected_record = (expected["file"], expected["start_line"], expected["end_line"])
+        observed_edges = {
+            (row.get("file"), row.get("start_line"), row.get("end_line"))
+            for row in result_rows(by_tool.get(tool, {}))
+        }
+        if expected_record not in observed_edges:
+            errors.append(
+                f"graph preflight is missing {relationship} edge for {expected['symbol']}"
+            )
     return errors
 
 
@@ -641,14 +651,7 @@ def execute(args: argparse.Namespace) -> int:
             contract=local["profile_contract"],
             repository=first_repository,
         ),
-        prompt=(
-            "Preflight the indexed graph using exactly these calls in order: "
-            f"search_symbols(repository='{graph_gold['repository']}', scope='source', "
-            f"limit=1) for {graph_gold['primary']['symbol']}; get_definition for its "
-            "returned exact symbol ID; then both find_callers and find_callees for that "
-            "same ID. Do not use shell, web, or other tools. Return a terse structural "
-            "status only."
-        ),
+        prompt=graph_preflight_prompt(graph_gold),
         events_path=graph_events,
         stderr_path=graph_preflight_dir / "stderr.log",
         timeout=args.timeout,

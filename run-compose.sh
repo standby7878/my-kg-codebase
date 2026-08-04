@@ -3,10 +3,7 @@
 set -euo pipefail
 
 show_usage() {
-    echo "Usage: $0 <PROFILE> [COMMAND ...]"
-    echo ""
-    echo "Profiles:"
-    echo "  dev-local"
+    echo "Usage: $0 [COMMAND ...]"
     echo ""
     echo "Commands:"
     echo "  build          Build images"
@@ -19,31 +16,26 @@ show_usage() {
     echo "  bootstrap      Run schema bootstrap"
     echo "  index-sources  Bulk-index every repository under CODEKG_REPOS_ROOT"
     echo "  help           Show this help"
+    echo ""
+    echo "Options:"
+    echo "  --mode MODE    Use auto, bulk, or transactional ingestion for index-sources"
 }
 
-if [ "${1:-}" = "" ]; then
-    show_usage
-    exit 1
+PROFILE="dev-local"
+if [ "${1:-}" = "$PROFILE" ]; then
+    shift
 fi
 
-PROFILE="$1"
 PROFILE_DIR="compose/${PROFILE}"
 COMPOSE_FILE="${PROFILE_DIR}/docker-compose.yml"
 ENV_FILE="${PROFILE_DIR}/env"
 RUNTIME_ENV_FILE="${CODEKG_RUNTIME_ENV_FILE:-${PROFILE_DIR}/runtime.env}"
-
-if [ "$PROFILE" != "dev-local" ]; then
-    echo "Unknown profile: ${PROFILE}"
-    show_usage
-    exit 1
-fi
 
 if [ ! -f "$COMPOSE_FILE" ] || [ ! -f "$ENV_FILE" ]; then
     echo "Missing compose profile files under ${PROFILE_DIR}"
     exit 1
 fi
 
-shift || true
 if [ "$#" -eq 0 ]; then
     set -- start
 fi
