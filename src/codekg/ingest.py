@@ -384,7 +384,7 @@ class _PythonExtractor(ast.NodeVisitor):
         receiver = chain[0]
         if self._is_locally_shadowed_or_rebound(receiver):
             return node.attr, None, "dynamic"
-        if receiver in {"self", "cls"}:
+        if receiver in {"self", "cls"} and len(chain) == 2:
             owner_qname = self._nearest_class_qname()
             qname = f"{owner_qname}.{node.attr}" if owner_qname else None
             return node.attr, qname, receiver

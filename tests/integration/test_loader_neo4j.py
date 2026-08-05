@@ -330,6 +330,9 @@ def test_source_scan_to_neo4j_resolves_only_snapshot_local_call_sites(tmp_path) 
         "    def own(self):\n"
         "        return None\n"
         "\n"
+        "    def connect(self):\n"
+        "        return None\n"
+        "\n"
         "    @classmethod\n"
         "    def class_target(cls):\n"
         "        return None\n"
@@ -340,6 +343,7 @@ def test_source_scan_to_neo4j_resolves_only_snapshot_local_call_sites(tmp_path) 
         "\n"
         "    def runner(self, client):\n"
         "        self.own()\n"
+        "        self.pool.connect()\n"
         "        self.inherited()\n"
         "        super().inherited()\n"
         "        client.send()\n"
@@ -451,6 +455,7 @@ def test_source_scan_to_neo4j_resolves_only_snapshot_local_call_sites(tmp_path) 
         "factory().run": ("dynamic", None),
         "duplicate": ("ambiguous", None),
         "self.own": ("self_direct", "cases.Child.own"),
+        "self.pool.connect": ("dynamic", None),
         "cls.class_target": ("cls_direct", "cases.Child.class_target"),
         "self.inherited": ("inherited_method", "cases.Base.inherited"),
         "super().inherited": ("super_method", "cases.Base.inherited"),

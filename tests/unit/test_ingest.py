@@ -297,6 +297,41 @@ def test_scan_repository_retains_all_call_sites_and_syntax_diagnostics(tmp_path:
     assert broken_file.diagnostics[0].line == 1
 
 
+def test_scan_repository_only_marks_genuine_self_and_cls_calls_as_direct(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "receivers.py").write_text(
+        "class Worker:\n"
+        "    def run(self):\n"
+        "        self.connect()\n"
+        "        self.pool.connect()\n"
+        "        self.connection.execute()\n"
+        "        self.layer.connection.execute()\n"
+        "\n"
+        "    @classmethod\n"
+        "    def build(cls):\n"
+        "        cls.create()\n"
+        "        cls.factory.create()\n",
+        encoding="utf-8",
+    )
+
+    repository = scan_repository(repo_root)
+    source_file = next(file for file in repository.files if file.path == "receivers.py")
+
+    assert [
+        (call.raw_callee, call.receiver_kind, call.callee_qname_hint) for call in source_file.calls
+    ] == [
+        ("self.connect", "self", "receivers.Worker.connect"),
+        ("self.pool.connect", "attribute", "self.pool.connect"),
+        ("self.connection.execute", "attribute", "self.connection.execute"),
+        ("self.layer.connection.execute", "attribute", "self.layer.connection.execute"),
+        ("cls.create", "cls", "receivers.Worker.create"),
+        ("cls.factory.create", "attribute", "cls.factory.create"),
+    ]
+
+
 def test_replace_index_removes_previous_zvec_keys_before_graph_load(
     tmp_path: Path, monkeypatch
 ) -> None:

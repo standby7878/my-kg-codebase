@@ -9,6 +9,7 @@ the loader turns successful resolutions into graph relationships.
 
 from __future__ import annotations
 
+import ast
 import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
@@ -134,6 +135,8 @@ class _Resolver:
 
         owner = owners[0]
         if call.receiver_kind in {"self", "cls"}:
+            if not _is_direct_receiver_call(call, call.receiver_kind):
+                return CallResolution(call, file.path, owner.key, "dynamic", ())
             return self._resolve_receiver_method(file, call, owner, is_super=False)
         if call.receiver_kind == "super":
             return self._resolve_receiver_method(file, call, owner, is_super=True)
@@ -548,6 +551,21 @@ class _Resolver:
         mro = (type_qname, *merged)
         self._mro_cache[type_qname] = mro
         return mro
+
+
+def _is_direct_receiver_call(call: CallIR, receiver: str) -> bool:
+    """Reject malformed IR that labels a receiver chain as a direct method call."""
+
+    try:
+        expression = ast.parse(call.raw_callee, mode="eval").body
+    except SyntaxError:
+        return False
+    return (
+        isinstance(expression, ast.Attribute)
+        and isinstance(expression.value, ast.Name)
+        and expression.value.id == receiver
+        and expression.attr == call.callee_name
+    )
 
 
 def _group_by_qname(values: Iterable[SymbolRef]) -> dict[str, tuple[SymbolRef, ...]]:
