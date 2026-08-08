@@ -8,4 +8,4 @@ NEO4J_BOLT_PORT=7687
 MCP_TRANSPORT=http
 MCP_HOST=0.0.0.0
 MCP_PORT=8765
-CODEKG_REPOS_ROOT=/media/alex/MYSSD/BACKUP/workspace/codekg-corpus/click;/media/alex/MYSSD/BACKUP/workspace/codekg-corpus/requests;/media/alex/MYSSD/BACKUP/workspace/codekg-corpus/sqlalchemy/lib/sqlalchemy/engine;/media/alex/MYSSD/BACKUP/workspace/codekg-corpus/sqlalchemy/lib/sqlalchemy/pool;/media/alex/MYSSD/BACKUP/workspace/codekg-corpus/sqlalchemy/lib/sqlalchemy/sql
+CODEKG_REPOS_ROOT=/home/alexanderakimov/workspace/codekg-corpus/click;/home/alexanderakimov/workspace/codekg-corpus/requests;/home/alexanderakimov/workspace/codekg-corpus/sqlalchemy/lib/sqlalchemy/engine;/home/alexanderakimov/workspace/codekg-corpus/sqlalchemy/lib/sqlalchemy/pool;/home/alexanderakimov/workspace/codekg-corpus/sqlalchemy/lib/sqlalchemy/sql

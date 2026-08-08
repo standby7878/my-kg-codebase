@@ -49,11 +49,12 @@ def test_frozen_corpora_run_through_one_neo4j_and_isolated_zvec_indexes(tmp_path
     }
     assert synthetic["structural_metrics"]["call_sites"]["statuses"] == {
         "cls_direct": 1,
+        "constructor_exact_local": 1,
         "dynamic": 3,
         "exact_local": 13,
         "self_direct": 1,
         "super_method": 1,
-        "unresolved": 4,
+        "unresolved": 3,
     }
     assert synthetic["truth"]["structural"]["ok"] is True
     assert synthetic["truth"]["call_sites"] == {
@@ -72,7 +73,7 @@ def test_frozen_corpora_run_through_one_neo4j_and_isolated_zvec_indexes(tmp_path
         "status": "skipped",
         "reason": "optional path env CODEKG_EVAL_EXTERNAL_PATH is unset",
     }
-    assert report["summary"] == {"passed": 2, "failed": 0, "skipped": 1}
+    assert report["summary"] == {"passed": 2, "failed": 0, "skipped": 6}
     assert (tmp_path / "zvec" / "synthetic-phase1").is_dir()
     assert (tmp_path / "zvec" / "codekg-dogfood").is_dir()
     assert '"format_version": 1' in (tmp_path / "report.json").read_text(encoding="utf-8")

@@ -207,7 +207,7 @@
       "start_column": 15,
       "ordinal": 9,
       "raw_callee": "Inner",
-      "status": "unresolved",
+      "status": "constructor_exact_local",
       "target_qname": null,
       "projection": "none"
     },
@@ -268,11 +268,12 @@
     "total": 23,
     "statuses": {
       "cls_direct": 1,
+      "constructor_exact_local": 1,
       "dynamic": 3,
       "exact_local": 13,
       "self_direct": 1,
       "super_method": 1,
-      "unresolved": 4
+      "unresolved": 3
     },
     "resolves_to": 16,
     "calls": 16,

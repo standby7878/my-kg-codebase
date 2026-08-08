@@ -2,8 +2,12 @@
 """Run the paired multi-repository CodeKG/native benchmark.
 
 The default ``plan`` command is free and side-effect-light. ``run`` refuses to
-launch Codex unless ``--execute`` is supplied; a complete run performs one
+launch Claude Code unless ``--execute`` is supplied; a complete run performs one
 batch preflight and one CodeKG/native pair for each of ten indexed tasks.
+
+The runner is Claude Code CLI (``claude -p --output-format stream-json``). Its raw
+event stream is normalized into the same event schema the evaluator already
+understands by ``claude_events.py``, so ``benchmark_lib.py`` needed no changes.
 """
 
 from __future__ import annotations
@@ -15,7 +19,6 @@ import os
 import subprocess
 import sys
 import time
-import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +40,34 @@ from benchmark_lib import (
     validate_trial,
     write_json_new,
 )
+from claude_events import finalize_claude_trial
+
+MODEL_ENV_VAR = "CODEKG_BENCHMARK_MODEL"
+DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+ALLOWED_MODELS = frozenset({"claude-haiku-4-5-20251001", "claude-sonnet-5"})
+EFFORT_ENV_VAR = "CODEKG_BENCHMARK_EFFORT"
+DEFAULT_EFFORT = "high"
+CODEKG_MCP_URL = "http://127.0.0.1:8765/mcp"
+MCP_CONFIG_PATH = Path(__file__).resolve().parent / "claude-codekg-mcp.json"
+JSON_ONLY_SYSTEM_PROMPT = (
+    "Your final assistant message of this session must be the JSON answer object "
+    "only: no markdown code fences, no prose before or after it, no explanation "
+    "outside the JSON object's own fields."
+)
+
+
+def resolve_model() -> str:
+    model = os.environ.get(MODEL_ENV_VAR, DEFAULT_MODEL)
+    if model not in ALLOWED_MODELS:
+        raise RuntimeError(
+            f"{MODEL_ENV_VAR}={model!r} is not one of the allowed benchmark models: "
+            f"{sorted(ALLOWED_MODELS)}"
+        )
+    return model
+
+
+def resolve_effort() -> str:
+    return os.environ.get(EFFORT_ENV_VAR, DEFAULT_EFFORT)
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -51,74 +82,45 @@ def _git(repository: Path, *arguments: str) -> str:
     return process.stdout.strip()
 
 
-def profile_contract(profile_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
-    with profile_path.open("rb") as handle:
-        profile = tomllib.load(handle)
-    codekg = profile.get("mcp_servers", {}).get("codekg", {})
-    if profile.get("model") != manifest["model"]:
-        raise RuntimeError("benchmark profile model does not match the manifest")
-    if profile.get("model_reasoning_effort") != manifest["model_reasoning_effort"]:
-        raise RuntimeError("benchmark profile reasoning effort does not match the manifest")
-    if set(codekg.get("enabled_tools", [])) != ALLOWED_CODEKG_TOOLS:
-        raise RuntimeError("benchmark profile must expose exactly the four CodeKG tools")
-    if codekg.get("enabled") is not True or codekg.get("required") is not True:
-        raise RuntimeError("benchmark profile must enable and require CodeKG")
-    if codekg.get("url") != "http://127.0.0.1:8765/mcp":
-        raise RuntimeError("benchmark profile must use the frozen loopback CodeKG URL")
-    if codekg.get("startup_timeout_sec") != 15:
-        raise RuntimeError("benchmark profile must use the frozen CodeKG startup timeout")
-    if codekg.get("tool_timeout_sec") != 30:
-        raise RuntimeError("benchmark profile must use the frozen CodeKG tool timeout")
-    if profile.get("web_search") != "disabled":
-        raise RuntimeError("benchmark profile must disable web search")
-    if profile.get("features", {}).get("multi_agent") is not False:
-        raise RuntimeError("benchmark profile must disable multi-agent execution")
-    return {
-        "model": profile["model"],
-        "model_reasoning_effort": profile["model_reasoning_effort"],
-        "web_search": profile["web_search"],
-        "multi_agent": profile["features"]["multi_agent"],
-        "codekg_enabled": codekg["enabled"],
-        "codekg_required": codekg["required"],
-        "codekg_url": codekg["url"],
-        "codekg_startup_timeout_sec": codekg["startup_timeout_sec"],
-        "codekg_tool_timeout_sec": codekg["tool_timeout_sec"],
-        "codekg_enabled_tools": codekg["enabled_tools"],
-    }
-
-
-def codex_version(codex: str) -> str:
+def claude_version(claude: str) -> str:
     process = subprocess.run(
-        [codex, "--version"],
+        [claude, "--version"],
         check=False,
         capture_output=True,
         text=True,
     )
     if process.returncode or not process.stdout.strip():
-        raise RuntimeError(process.stderr.strip() or "cannot determine Codex version")
+        raise RuntimeError(process.stderr.strip() or "cannot determine Claude Code version")
     return process.stdout.strip()
 
 
-def expected_profile_path() -> Path:
-    configured_root = os.environ.get("CODEX_HOME")
-    codex_root = Path(configured_root) if configured_root else Path.home() / ".codex"
-    return (codex_root / "benchmark.config.toml").resolve()
+def claude_auth_status(claude: str) -> dict[str, Any]:
+    process = subprocess.run(
+        [claude, "auth", "status"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode or not process.stdout.strip():
+        raise RuntimeError(process.stderr.strip() or "cannot determine Claude Code auth status")
+    try:
+        status = json.loads(process.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("cannot parse 'claude auth status' output") from exc
+    if not status.get("loggedIn"):
+        raise RuntimeError("Claude Code is not logged in; run 'claude auth login' first")
+    return status
 
 
-def enforce_profile_path(profile_path: Path) -> Path:
-    resolved = profile_path.resolve()
-    expected = expected_profile_path()
-    if resolved != expected:
-        raise RuntimeError(
-            "--profile-path must identify the file loaded by '--profile benchmark': "
-            f"expected {expected}, got {resolved}"
-        )
-    return resolved
-
-
-def enforce_manifest_profile(manifest: dict[str, Any]) -> None:
-    if manifest.get("profile") != "benchmark":
-        raise RuntimeError("the frozen suite runner requires manifest profile='benchmark'")
+def runner_contract(*, model: str, effort: str) -> dict[str, Any]:
+    return {
+        "runner": "claude-code",
+        "model": model,
+        "effort": effort,
+        "codekg_url": CODEKG_MCP_URL,
+        "codekg_enabled_tools": sorted(ALLOWED_CODEKG_TOOLS),
+        "mcp_config_path": str(MCP_CONFIG_PATH.resolve()),
+    }
 
 
 def repository_states(corpus_root: Path, manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -165,15 +167,13 @@ def repository_states(corpus_root: Path, manifest: dict[str, Any]) -> dict[str, 
 
 
 def local_preflight(
-    *, corpus_root: Path, manifest_path: Path, profile_path: Path, codex: str
+    *, corpus_root: Path, manifest_path: Path, claude: str, model: str, effort: str
 ) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
-    enforce_manifest_profile(manifest)
-    profile_path = enforce_profile_path(profile_path)
     repositories = repository_states(corpus_root, manifest)
-    if not profile_path.is_file():
-        raise RuntimeError(f"benchmark profile does not exist: {profile_path}")
-    contract = profile_contract(profile_path, manifest)
+    if not MCP_CONFIG_PATH.is_file():
+        raise RuntimeError(f"CodeKG MCP config does not exist: {MCP_CONFIG_PATH}")
+    contract = runner_contract(model=model, effort=effort)
     expected_files = [resolve_manifest_file(manifest_path, manifest["schema_file"])]
     for task in manifest["tasks"]:
         expected_files.append(resolve_manifest_file(manifest_path, task["gold_file"]))
@@ -187,10 +187,10 @@ def local_preflight(
     return {
         "corpus_root": str(corpus_root.resolve()),
         "repositories": repositories,
-        "profile_path": str(profile_path.resolve()),
-        "profile_contract": contract,
-        "codex_version": codex_version(codex),
-        "hashes": snapshot_hashes(manifest_path, profile_path),
+        "runner_contract": contract,
+        "claude_version": claude_version(claude),
+        "claude_auth": claude_auth_status(claude),
+        "hashes": snapshot_hashes(manifest_path, MCP_CONFIG_PATH),
     }
 
 
@@ -198,12 +198,11 @@ def assert_frozen_state(
     *,
     corpus_root: Path,
     manifest_path: Path,
-    profile_path: Path,
     expected_hashes: dict[str, str],
 ) -> None:
     manifest = load_manifest(manifest_path)
     repository_states(corpus_root, manifest)
-    observed_hashes = snapshot_hashes(manifest_path, profile_path)
+    observed_hashes = snapshot_hashes(manifest_path, MCP_CONFIG_PATH)
     if observed_hashes != expected_hashes:
         changed = sorted(
             path
@@ -213,124 +212,59 @@ def assert_frozen_state(
         raise RuntimeError(f"frozen benchmark inputs drifted: {changed}")
 
 
-def base_codex_command(
+def base_claude_command(
     *,
-    codex: str,
-    profile: str,
+    claude: str,
     contract: dict[str, Any],
-    repository: Path,
-    schema_path: Path | None,
-    answer_path: Path | None,
+    arm: str,
+    json_schema: str | None = None,
 ) -> list[str]:
     command = [
-        codex,
-        "--ask-for-approval",
-        "never",
-        "exec",
-        "--profile",
-        profile,
-        "--ignore-user-config",
-        "--strict-config",
-        "--ephemeral",
-        "--json",
-        "--sandbox",
-        "danger-full-access",
-        "--ignore-rules",
-        "--cd",
-        str(repository.resolve()),
-        "-c",
-        f"model={json.dumps(contract['model'])}",
-        "-c",
-        f"model_reasoning_effort={json.dumps(contract['model_reasoning_effort'])}",
-        "-c",
-        "features.multi_agent=false",
-        "-c",
-        "features.apps=false",
-        "-c",
-        "features.plugins=false",
-        "-c",
-        'web_search="disabled"',
-        "-c",
-        f"mcp_servers.codekg.url={json.dumps(contract['codekg_url'])}",
-        "-c",
-        (f"mcp_servers.codekg.startup_timeout_sec={contract['codekg_startup_timeout_sec']}"),
-        "-c",
-        f"mcp_servers.codekg.tool_timeout_sec={contract['codekg_tool_timeout_sec']}",
+        claude,
+        "-p",
+        "--model",
+        contract["model"],
+        "--effort",
+        contract["effort"],
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--no-session-persistence",
+        "--strict-mcp-config",
+        "--permission-mode",
+        "dontAsk",
+        "--append-system-prompt",
+        JSON_ONLY_SYSTEM_PROMPT,
     ]
-    if schema_path is not None:
-        command.extend(["--output-schema", str(schema_path.resolve())])
-    if answer_path is not None:
-        command.extend(["-o", str(answer_path.resolve())])
-    return command
-
-
-def trial_command(
-    *,
-    arm: str,
-    codex: str,
-    profile: str,
-    contract: dict[str, Any],
-    repository: Path,
-    schema_path: Path,
-    answer_path: Path,
-) -> list[str]:
-    command = base_codex_command(
-        codex=codex,
-        profile=profile,
-        contract=contract,
-        repository=repository,
-        schema_path=schema_path,
-        answer_path=answer_path,
-    )
+    if json_schema is not None:
+        command.extend(["--json-schema", json_schema])
     if arm == "codekg":
         command.extend(
             [
-                "-c",
-                "mcp_servers.codekg.enabled=true",
-                "-c",
-                "mcp_servers.codekg.required=true",
-                "-c",
-                'mcp_servers.codekg.enabled_tools=["search_symbols","get_definition",'
-                '"find_callers","find_callees"]',
+                "--mcp-config",
+                str(MCP_CONFIG_PATH.resolve()),
+                "--tools",
+                "",
+                "--allowedTools",
+                "mcp__codekg__search_symbols",
+                "mcp__codekg__get_definition",
+                "mcp__codekg__find_callers",
+                "mcp__codekg__find_callees",
             ]
         )
     elif arm == "native":
-        command.extend(
-            [
-                "-c",
-                "mcp_servers.codekg.enabled=false",
-                "-c",
-                "mcp_servers.codekg.required=false",
-            ]
-        )
+        command.extend(["--tools", "Bash", "--allowedTools", "Bash"])
     else:
         raise ValueError(f"unknown arm: {arm}")
     return command
 
 
-def graph_preflight_command(
-    *, codex: str, profile: str, contract: dict[str, Any], repository: Path
-) -> list[str]:
-    command = base_codex_command(
-        codex=codex,
-        profile=profile,
-        contract=contract,
-        repository=repository,
-        schema_path=None,
-        answer_path=None,
-    )
-    command.extend(
-        [
-            "-c",
-            "mcp_servers.codekg.enabled=true",
-            "-c",
-            "mcp_servers.codekg.required=true",
-            "-c",
-            'mcp_servers.codekg.enabled_tools=["search_symbols","get_definition",'
-            '"find_callers","find_callees"]',
-        ]
-    )
-    return command
+def trial_command(*, arm: str, claude: str, contract: dict[str, Any], json_schema: str) -> list[str]:
+    return base_claude_command(claude=claude, contract=contract, arm=arm, json_schema=json_schema)
+
+
+def graph_preflight_command(*, claude: str, contract: dict[str, Any]) -> list[str]:
+    return base_claude_command(claude=claude, contract=contract, arm="codekg")
 
 
 def graph_preflight_prompt(gold: dict[str, Any]) -> str:
@@ -349,9 +283,11 @@ def _launch(
     *,
     command: list[str],
     prompt: str,
+    cwd: Path,
     events_path: Path,
     stderr_path: Path,
     timeout: float,
+    answer_path: Path | None = None,
 ) -> tuple[int, float]:
     events_path.parent.mkdir(parents=True, exist_ok=False)
     started = time.perf_counter()
@@ -363,6 +299,7 @@ def _launch(
             process = subprocess.run(
                 command,
                 input=prompt,
+                cwd=str(cwd.resolve()),
                 stdout=stdout,
                 stderr=stderr,
                 text=True,
@@ -372,6 +309,7 @@ def _launch(
             exit_code = process.returncode
         except subprocess.TimeoutExpired:
             exit_code = 124
+    finalize_claude_trial(events_path, answer_path)
     return exit_code, time.perf_counter() - started
 
 
@@ -379,19 +317,23 @@ def _launch_with_frozen_state(
     *,
     command: list[str],
     prompt: str,
+    cwd: Path,
     events_path: Path,
     stderr_path: Path,
     timeout: float,
     frozen_state_arguments: dict[str, Any],
+    answer_path: Path | None = None,
 ) -> tuple[int, float]:
     assert_frozen_state(**frozen_state_arguments)
     try:
         return _launch(
             command=command,
             prompt=prompt,
+            cwd=cwd,
             events_path=events_path,
             stderr_path=stderr_path,
             timeout=timeout,
+            answer_path=answer_path,
         )
     finally:
         assert_frozen_state(**frozen_state_arguments)
@@ -558,11 +500,14 @@ def execute(args: argparse.Namespace) -> int:
     manifest_path = args.manifest.resolve()
     manifest = load_manifest(manifest_path)
     corpus_root = args.corpus_root.resolve()
+    model = resolve_model()
+    effort = resolve_effort()
     local = local_preflight(
         corpus_root=corpus_root,
         manifest_path=manifest_path,
-        profile_path=args.profile_path.resolve(),
-        codex=args.codex,
+        claude=args.claude,
+        model=model,
+        effort=effort,
     )
     repository_paths = {
         name: Path(state["repository_root"]) for name, state in local["repositories"].items()
@@ -581,7 +526,7 @@ def execute(args: argparse.Namespace) -> int:
                     "local_preflight": local,
                     "schedule": schedule,
                     "codekg_tools": sorted(ALLOWED_CODEKG_TOOLS),
-                    "note": "No Codex process was launched.",
+                    "note": "No Claude Code process was launched.",
                 },
                 indent=2,
                 sort_keys=True,
@@ -603,7 +548,6 @@ def execute(args: argparse.Namespace) -> int:
     frozen_state_arguments = {
         "corpus_root": corpus_root,
         "manifest_path": manifest_path,
-        "profile_path": Path(local["profile_path"]),
         "expected_hashes": local["hashes"],
     }
 
@@ -613,7 +557,7 @@ def execute(args: argparse.Namespace) -> int:
     repository_preflight_dir = preflight_dir / "repository"
     preflight_events = repository_preflight_dir / "events.jsonl"
     preflight_exit, preflight_wall = _direct_repository_preflight(
-        url=local["profile_contract"]["codekg_url"],
+        url=local["runner_contract"]["codekg_url"],
         events_path=preflight_events,
         stderr_path=repository_preflight_dir / "stderr.log",
         frozen_state_arguments=frozen_state_arguments,
@@ -639,19 +583,14 @@ def execute(args: argparse.Namespace) -> int:
         print("batch preflight failed; measured trials were not started", file=sys.stderr)
         return 2
 
-    schema_path = resolve_manifest_file(manifest_path, manifest["schema_file"])
     graph_gold_path = resolve_manifest_file(manifest_path, first_task["gold_file"])
     graph_gold = read_json(graph_gold_path)
     graph_preflight_dir = preflight_dir / "graph"
     graph_events = graph_preflight_dir / "events.jsonl"
     graph_exit, graph_wall = _launch_with_frozen_state(
-        command=graph_preflight_command(
-            codex=args.codex,
-            profile=manifest["profile"],
-            contract=local["profile_contract"],
-            repository=first_repository,
-        ),
+        command=graph_preflight_command(claude=args.claude, contract=local["runner_contract"]),
         prompt=graph_preflight_prompt(graph_gold),
+        cwd=first_repository,
         events_path=graph_events,
         stderr_path=graph_preflight_dir / "stderr.log",
         timeout=args.timeout,
@@ -679,6 +618,8 @@ def execute(args: argparse.Namespace) -> int:
         print("graph preflight failed; measured trials were not started", file=sys.stderr)
         return 2
 
+    schema_path = resolve_manifest_file(manifest_path, manifest["schema_file"])
+    json_schema = json.dumps(read_json(schema_path), separators=(",", ":"))
     for entry in schedule_entries:
         task = tasks[entry.task_index]
         repository = repository_paths[entry.repository]
@@ -687,21 +628,17 @@ def execute(args: argparse.Namespace) -> int:
         prompt_path = resolve_manifest_file(manifest_path, task["prompt_files"][entry.arm])
         gold_path = resolve_manifest_file(manifest_path, task["gold_file"])
         command = trial_command(
-            arm=entry.arm,
-            codex=args.codex,
-            profile=manifest["profile"],
-            contract=local["profile_contract"],
-            repository=repository,
-            schema_path=schema_path,
-            answer_path=answer_path,
+            arm=entry.arm, claude=args.claude, contract=local["runner_contract"], json_schema=json_schema
         )
         exit_code, wall_seconds = _launch_with_frozen_state(
             command=command,
             prompt=prompt_path.read_text(encoding="utf-8"),
+            cwd=repository,
             events_path=trial_dir / "events.jsonl",
             stderr_path=trial_dir / "stderr.log",
             timeout=args.timeout,
             frozen_state_arguments=frozen_state_arguments,
+            answer_path=answer_path,
         )
         metadata = {
             "ordinal": entry.ordinal,
@@ -713,6 +650,10 @@ def execute(args: argparse.Namespace) -> int:
             "exit_code": exit_code,
             "wall_seconds": wall_seconds,
             "command": command,
+            "runner": "claude-code",
+            "runner_version": local["claude_version"],
+            "model": model,
+            "effort": effort,
             "prompt_sha256": local["hashes"][str(prompt_path.resolve())],
         }
         write_json_new(trial_dir / "metadata.json", metadata)
@@ -738,12 +679,7 @@ def parser() -> argparse.ArgumentParser:
         command = subparsers.add_parser(name)
         command.add_argument("--corpus-root", type=Path, required=True)
         command.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
-        command.add_argument(
-            "--profile-path",
-            type=Path,
-            default=expected_profile_path(),
-        )
-        command.add_argument("--codex", default="codex")
+        command.add_argument("--claude", default="claude")
         command.add_argument("--timeout", type=float, default=300.0)
         command.add_argument(
             "--output",
@@ -753,7 +689,7 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--execute",
             action="store_true",
-            help="required for run; acknowledges that Codex calls may incur charges",
+            help="required for run; acknowledges that Claude Code calls may incur charges",
         )
     return value
 

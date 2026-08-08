@@ -1,9 +1,11 @@
 {
   "version": 2,
   "suite_id": "codekg-native-intent-suite-001",
-  "profile": "benchmark",
-  "model": "gpt-5.4-mini",
-  "model_reasoning_effort": "low",
+  "profile": "claude-code",
+  "runner": "claude-code",
+  "model": "claude-haiku-4-5-20251001",
+  "model_reasoning_effort": "high",
+  "model_note": "The actual runtime model/effort come from CODEKG_BENCHMARK_MODEL/CODEKG_BENCHMARK_EFFORT env vars (see run_benchmark.py); this field documents the default.",
   "seed": 20260727,
   "arms": [
     "codekg",
