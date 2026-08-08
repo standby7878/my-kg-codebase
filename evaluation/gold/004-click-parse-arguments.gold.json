@@ -6,27 +6,46 @@
   "category": "intent_symbol_discovery",
   "primary": {
     "symbol": "src.click.core.Command.parse_args",
-    "accepted_suffixes": ["Command.parse_args", "core.Command.parse_args"],
+    "accepted_suffixes": [
+      "Command.parse_args",
+      "core.Command.parse_args"
+    ],
     "file": "src/click/core.py",
     "start_line": 1358,
-    "end_line": 1392
+    "end_line": 1392,
+    "accepted_paths": [
+      "src/click/core.py"
+    ]
   },
   "relevant": [
     {
       "symbol": "src.click.core.Command.make_context",
-      "accepted_suffixes": ["Command.make_context", "core.Command.make_context"],
+      "accepted_suffixes": [
+        "Command.make_context",
+        "core.Command.make_context"
+      ],
       "file": "src/click/core.py",
       "start_line": 1321,
       "end_line": 1356,
-      "relationship": "caller"
+      "relationship": "caller",
+      "accepted_paths": [
+        "src/click/core.py"
+      ]
     },
     {
       "symbol": "src.click.core.Command.make_parser",
-      "accepted_suffixes": ["Command.make_parser", "core.Command.make_parser"],
+      "accepted_suffixes": [
+        "Command.make_parser",
+        "core.Command.make_parser"
+      ],
       "file": "src/click/core.py",
       "start_line": 1219,
       "end_line": 1224,
-      "relationship": "callee"
+      "relationship": "callee",
+      "accepted_paths": [
+        "src/click/core.py"
+      ]
     }
-  ]
+  ],
+  "related_audit": "A6 related-gold audit (2026-08-09): Sonnet CodeKG trial (runs/claude-sonnet-1/tasks/04.../codekg) reported callee iter_params_for_processing instead of either gold-accepted edge. Verified via events.jsonl that find_callers/find_callees returned BOTH gold-accepted edges (Command.make_context caller, Command.make_parser callee) in that same trial -- the edge was present in the graph and in accepted_suffixes; the model chose to report a third, real, non-gold callee instead. Not a graph coverage or accepted_suffixes defect. The underlying scoring gap is structural: `related` accepts only one volunteered edge (grade_answer requires len(related) == 1, matching the prompt's 'zero or one' instruction -- confirmed intended, not a silent bug), while the real call graph has more than two valid caller/callee edges for this symbol."
 }

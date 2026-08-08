@@ -193,12 +193,19 @@ def normalize(raw_text: str) -> tuple[list[dict[str, Any]], str | None]:
             mapped_usage = {
                 "input_tokens": 0,
                 "cached_input_tokens": 0,
+                "cache_creation_tokens": 0,
                 "output_tokens": 0,
                 "reasoning_output_tokens": 0,
             }
             if isinstance(usage, dict):
                 mapped_usage["input_tokens"] = int(usage.get("input_tokens", 0) or 0)
                 mapped_usage["cached_input_tokens"] = int(usage.get("cache_read_input_tokens", 0) or 0)
+                # A7.2: cache writes bill above base input and were previously
+                # dropped entirely, understating cost most in high-cache-churn
+                # cells (e.g. Haiku native).
+                mapped_usage["cache_creation_tokens"] = int(
+                    usage.get("cache_creation_input_tokens", 0) or 0
+                )
                 mapped_usage["output_tokens"] = int(usage.get("output_tokens", 0) or 0)
             events.append({"type": "turn.completed", "usage": mapped_usage})
             # With --json-schema, the schema-constrained answer lives on this

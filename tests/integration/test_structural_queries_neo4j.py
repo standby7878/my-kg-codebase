@@ -312,6 +312,65 @@ def test_structural_queries_are_key_first_snapshot_safe_and_callsite_authoritati
     assert beta_target != alpha_target
 
 
+def test_deep_call_traversal_does_not_leak_module_level_functions_across_snapshots() -> None:
+    """`find_callers`/`find_callees` at depth > 1 filter path nodes with
+    `WHERE (caller:Function OR caller:Method) AND ALL(... snapshot_prefix)`.
+    Without the parens, `AND` binds tighter than `OR`, so the clause parses
+    as `caller:Function OR (caller:Method AND ALL(...))` -- any
+    Function-labelled node (module-level, not a class Method) bypasses
+    snapshot isolation entirely. A Method-only fixture can't catch this,
+    since for Method rows the buggy and fixed clauses agree.
+    """
+    alpha = _repository("alpha", "aaa")
+    beta = _repository("beta", "bbb")
+    alpha_source = _key(alpha, "shared.caller", 2)
+    alpha_bridge = _key(alpha, "shared.orphan", 10)
+    beta_target = _key(beta, "shared.target", 7)
+
+    with Neo4jContainer("neo4j:5.26-community", password="password") as container:
+        client = Neo4jClient(
+            uri=container.get_connection_url(),
+            username=container.username,
+            password=container.password,
+        )
+        try:
+            bootstrap_schema(client=client)
+            load_repository(alpha, replace=False, client=client, batch_size=2)
+            load_repository(beta, replace=False, client=client, batch_size=2)
+            # Fabricate a cross-snapshot EXACT_CALLS chain: alpha.caller ->
+            # alpha.orphan -> beta.target. Both alpha nodes are plain
+            # module-level Functions (not Methods), which is exactly the
+            # case the unparenthesised WHERE mishandles.
+            client.execute_write(
+                """
+                MATCH (source:Function {key: $source_key})
+                MATCH (bridge:Function {key: $bridge_key})
+                MATCH (target:Function {key: $target_key})
+                CREATE (source)-[:EXACT_CALLS {key: 'leak-hop-1'}]->(bridge)
+                CREATE (bridge)-[:EXACT_CALLS {key: 'leak-hop-2'}]->(target)
+                """,
+                {
+                    "source_key": alpha_source,
+                    "bridge_key": alpha_bridge,
+                    "target_key": beta_target,
+                },
+            )
+
+            deep_callers = find_callers(beta_target, depth=2, client=client)
+            deep_callees = find_callees(alpha_source, depth=2, client=client)
+        finally:
+            client.close()
+
+    leaked_caller_keys = {row["key"] for row in deep_callers}
+    assert alpha_bridge not in leaked_caller_keys
+    assert alpha_source not in leaked_caller_keys
+
+    # alpha_bridge is a legitimate same-snapshot 1-hop callee of alpha_source;
+    # only the cross-snapshot 2-hop hop into beta must be excluded.
+    leaked_callee_keys = {row["key"] for row in deep_callees}
+    assert beta_target not in leaked_callee_keys
+
+
 def test_selector_reports_real_graph_ambiguity_and_snapshot_mismatch() -> None:
     alpha = _repository("alpha", "aaa")
     alpha_target = _key(alpha, "shared.target", 7)

@@ -210,6 +210,17 @@ def _safe_search_diagnostics(diagnostics: object, scope: SearchScope) -> dict[st
     return safe
 
 
+# B4 (codekg-ranking-presentation-spec.md): recommended_symbol_id was removed
+# rather than margin-gated. Calibration (evaluation/replay_b4.py, replayed
+# offline against all recorded CodeKG search_symbols calls across three runs)
+# found no ratio/absolute-difference threshold that separates correct from
+# wrong rank-1 recommendations: a correct case (ratio=1.20, diff=220) and a
+# wrong one (ratio=1.20, diff=262) share the same margin, and one wrong case
+# -- a tier-boosted qualified-name-suffix false match -- carries ratio=9.69,
+# diff=8080, an outlier margin higher than every correct case's, that would
+# still be wrong. B4.5's ship gate (zero wrong recommendations emitted) is
+# unreachable by any threshold on this signal, so per B4.4's escape hatch an
+# absent field is shipped instead of a confidently wrong one.
 def _add_discovery_guidance(response: dict[str, object], scope: SearchScope) -> None:
     """Keep scope and the discovery-to-evidence workflow visible to MCP clients."""
     response.setdefault("scope", scope.value)
@@ -219,10 +230,9 @@ def _add_discovery_guidance(response: dict[str, object], scope: SearchScope) -> 
     first = results[0]
     if not isinstance(first, dict):
         return
-    symbol_id = first.get("symbol_id")
-    if isinstance(symbol_id, str) and symbol_id:
-        response.setdefault("recommended_next_tool", "get_definition")
-        response.setdefault("recommended_symbol_id", symbol_id)
+    # recommended_next_tool is unconditional: advising the client to fetch a
+    # definition next is sound regardless of which candidate it picks.
+    response.setdefault("recommended_next_tool", "get_definition")
 
 
 def _search_summary(response: dict[str, Any]) -> str:

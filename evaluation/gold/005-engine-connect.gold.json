@@ -6,19 +6,33 @@
   "category": "intent_symbol_discovery",
   "primary": {
     "symbol": "base.Engine.connect",
-    "accepted_suffixes": ["Engine.connect", "base.Engine.connect"],
+    "accepted_suffixes": [
+      "Engine.connect",
+      "base.Engine.connect"
+    ],
     "file": "base.py",
     "start_line": 3237,
-    "end_line": 3260
+    "end_line": 3260,
+    "accepted_paths": [
+      "base.py",
+      "lib/sqlalchemy/engine/base.py"
+    ]
   },
   "relevant": [
     {
       "symbol": "base.Engine.begin",
-      "accepted_suffixes": ["Engine.begin", "base.Engine.begin"],
+      "accepted_suffixes": [
+        "Engine.begin",
+        "base.Engine.begin"
+      ],
       "file": "base.py",
       "start_line": 3200,
       "end_line": 3226,
-      "relationship": "caller"
+      "relationship": "caller",
+      "accepted_paths": [
+        "base.py",
+        "lib/sqlalchemy/engine/base.py"
+      ]
     }
   ]
 }

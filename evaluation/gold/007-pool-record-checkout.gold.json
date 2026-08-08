@@ -12,7 +12,11 @@
     ],
     "file": "base.py",
     "start_line": 706,
-    "end_line": 739
+    "end_line": 739,
+    "accepted_paths": [
+      "base.py",
+      "lib/sqlalchemy/pool/base.py"
+    ]
   },
   "relevant": [
     {
@@ -24,15 +28,27 @@
       "file": "base.py",
       "start_line": 1232,
       "end_line": 1243,
-      "relationship": "callee"
+      "relationship": "callee",
+      "accepted_paths": [
+        "base.py",
+        "lib/sqlalchemy/pool/base.py"
+      ]
     },
     {
       "symbol": "base._finalize_fairy",
-      "accepted_suffixes": ["_finalize_fairy", "base._finalize_fairy"],
+      "accepted_suffixes": [
+        "_finalize_fairy",
+        "base._finalize_fairy"
+      ],
       "file": "base.py",
       "start_line": 915,
       "end_line": 1044,
-      "relationship": "callee"
+      "relationship": "callee",
+      "accepted_paths": [
+        "base.py",
+        "lib/sqlalchemy/pool/base.py"
+      ]
     }
-  ]
+  ],
+  "related_audit": "A6 related-gold audit (2026-08-09): both native trials (claude-baseline-1 and claude-sonnet-1) reported a different real relationship than either gold-accepted callee (_ConnectionFairy._checkout as caller, and _ConnectionRecord.get_connection as callee, respectively) -- both are genuine edges in the source, not hallucinations. Same structural gap as task 04: gold's `relevant` array is narrower than the true call graph, and the single-related-slot protocol cannot credit a correct-but-undesignated edge."
 }

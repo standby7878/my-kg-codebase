@@ -13,7 +13,7 @@ Mandatory MCP protocol:
 4. Use CodeKG MCP tools as the only repository-investigation mechanism.
 5. Do not use shell commands, grep, ripgrep, find, cat, direct filesystem reads, web search, or prior model knowledge as evidence.
 6. Search only repository "requests" with `scope: "source"`.
-7. Start with one `search_symbols` call with `limit` no greater than 5. A returned `recommended_symbol_id` is advisory, not binding.
+7. Start with one `search_symbols` call with `limit` no greater than 5. Use judgment to select the strongest candidate from the search results.
 8. If the first search has no plausible candidate, one reformulated second
    search may occur before any definition inspection. Otherwise inspect the
    strongest candidate with `get_definition`. If its metadata is inconsistent
@@ -41,3 +41,5 @@ Return:
 - `related`: zero or one directly relevant symbol with `relationship` set to `caller` or `callee`, plus its repository-relative file and exact line range. Return one when a relevant relationship result is available.
 - A concise explanation of why the primary symbol is the correct responsibility boundary.
 - The final answer must conform to the supplied JSON schema.
+
+Report every `file` value as the path relative to the root of the repository you were given. Do not prefix it with the upstream project's directory layout.

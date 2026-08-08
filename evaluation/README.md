@@ -123,8 +123,11 @@ The normal CodeKG path uses one search, one definition inspection, and the two
 relationship calls. Bounded recovery may inspect one additional definition,
 either from an earlier search result or after one additional search. The last
 definition inspected is final, and caller/callee expansion is allowed only for
-that final symbol. `recommended_symbol_id` is advisory. The limits are two
-searches, two definition inspections, and one call to each relationship tool.
+that final symbol. `search_symbols` no longer returns `recommended_symbol_id`
+(removed per `codekg-ranking-presentation-spec.md` B4 -- no score-margin
+threshold separated correct from wrong rank-1 recommendations), so the agent
+must judge the strongest candidate itself. The limits are two searches, two
+definition inspections, and one call to each relationship tool.
 
 ### Run the whole suite
 

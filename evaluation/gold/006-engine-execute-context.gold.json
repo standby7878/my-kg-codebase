@@ -6,10 +6,17 @@
   "category": "intent_symbol_discovery",
   "primary": {
     "symbol": "base.Connection._execute_context",
-    "accepted_suffixes": ["Connection._execute_context", "base.Connection._execute_context"],
+    "accepted_suffixes": [
+      "Connection._execute_context",
+      "base.Connection._execute_context"
+    ],
     "file": "base.py",
     "start_line": 1767,
-    "end_line": 1824
+    "end_line": 1824,
+    "accepted_paths": [
+      "base.py",
+      "lib/sqlalchemy/engine/base.py"
+    ]
   },
   "relevant": [
     {
@@ -21,7 +28,11 @@
       "file": "base.py",
       "start_line": 1618,
       "end_line": 1690,
-      "relationship": "caller"
+      "relationship": "caller",
+      "accepted_paths": [
+        "base.py",
+        "lib/sqlalchemy/engine/base.py"
+      ]
     },
     {
       "symbol": "base.Connection._exec_single_context",
@@ -32,7 +43,11 @@
       "file": "base.py",
       "start_line": 1826,
       "end_line": 1966,
-      "relationship": "callee"
+      "relationship": "callee",
+      "accepted_paths": [
+        "base.py",
+        "lib/sqlalchemy/engine/base.py"
+      ]
     }
   ]
 }

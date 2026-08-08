@@ -24,3 +24,5 @@ Return `primary` with its symbol, relative file, and exact range. Return
 `related` as zero or one verified symbol with `relationship` set to `caller`
 or `callee`, plus its relative file and exact range; use one when available.
 Give a concise boundary explanation using the supplied JSON schema.
+
+Report every `file` value as the path relative to the root of the repository you were given. Do not prefix it with the upstream project's directory layout.

@@ -284,6 +284,33 @@ def _valid_relative_path(value: object) -> bool:
     return all(part not in {"", ".", ".."} for part in path.parts)
 
 
+def _path_key(value: str) -> tuple[str, ...]:
+    """Posix-normalized path components, lowercased for case-insensitive hosts."""
+    return tuple(part.lower() for part in PurePosixPath(value).parts)
+
+
+def paths_equivalent(claimed: object, expected: object) -> bool:
+    """True when one path's components are a suffix of the other's.
+
+    Accepts ``lib/sqlalchemy/engine/base.py`` against gold ``base.py``, and
+    ``base.py`` against gold ``lib/sqlalchemy/engine/base.py``. Rejects
+    ``other/base.py`` against ``engine/base.py`` -- a shared basename in an
+    unrelated directory is not a match.
+    """
+    if not isinstance(claimed, str) or not isinstance(expected, str):
+        return False
+    if not claimed or not expected:
+        return False
+    claimed_key = _path_key(claimed)
+    expected_key = _path_key(expected)
+    shorter, longer = sorted((claimed_key, expected_key), key=len)
+    return longer[len(longer) - len(shorter) :] == shorter
+
+
+def _matches_any_path(claimed: object, accepted_paths: Sequence[str]) -> bool:
+    return any(paths_equivalent(claimed, expected) for expected in accepted_paths)
+
+
 def validate_answer_schema(answer: object) -> list[str]:
     if not isinstance(answer, dict):
         return ["answer is not a JSON object"]
@@ -358,32 +385,69 @@ def _answer_claims(answer: Mapping[str, Any]) -> list[tuple[str, Mapping[str, An
     return claims
 
 
+def _gold_accepted_paths_for_claim(label: str, claim: Mapping[str, Any], gold: Mapping[str, Any]) -> Sequence[str]:
+    """Find the gold record's accepted_paths that this claim is trying to name.
+
+    Matched by symbol suffix rather than by claim label, since a native
+    answer's ``related`` entry may name either the caller or the callee gold
+    slot. Falls back to every accepted path in the gold record when no
+    symbol match is found, so an unrecognized path is still flagged.
+    """
+    symbol = claim.get("symbol")
+    candidates: list[Mapping[str, Any]] = [gold["primary"], *gold.get("relevant", [])]
+    if isinstance(symbol, str):
+        for candidate in candidates:
+            if _matches_symbol(symbol, candidate.get("accepted_suffixes", [])):
+                return candidate.get("accepted_paths", [candidate["file"]])
+    combined: list[str] = []
+    for candidate in candidates:
+        combined.extend(candidate.get("accepted_paths", [candidate["file"]]))
+    return combined
+
+
 def validate_repository_identity_and_paths(
     answer: Mapping[str, Any],
     repository: Path,
-    expected_commit: str,
-    identity: str,
-) -> list[str]:
-    errors: list[str] = []
-    observed_commit = repository_snapshot_commit(repository, identity)
+    gold: Mapping[str, Any],
+) -> tuple[list[str], list[str]]:
+    """Return ``(provenance_errors, path_convention_errors)``.
+
+    A claimed path that fails to resolve against the repository but matches
+    one of the gold record's ``accepted_paths`` (via ``paths_equivalent``) is
+    a formatting deviation, not evidence the symbol was never inspected --
+    it is reported under ``path_convention`` and must not gate
+    ``provenance_compliant``. An unresolvable path that matches nothing in
+    ``accepted_paths`` remains a provenance violation.
+    """
+    provenance_errors: list[str] = []
+    path_convention_errors: list[str] = []
+    observed_commit = repository_snapshot_commit(repository, gold["identity"])
+    expected_commit = gold["commit"]
     if not observed_commit or not observed_commit.startswith(expected_commit):
-        errors.append(
+        provenance_errors.append(
             f"repository commit mismatch: expected {expected_commit}, "
             f"got {observed_commit or '<unavailable>'}"
         )
-    paths = [claim.get("file") for _, claim in _answer_claims(answer)]
-    for value in paths:
+    for label, claim in _answer_claims(answer):
+        value = claim.get("file")
         if not _valid_relative_path(value):
             continue
         resolved = (repository / str(value)).resolve()
         try:
             resolved.relative_to(repository.resolve())
         except ValueError:
-            errors.append(f"reported path escapes repository through a symlink: {value}")
+            provenance_errors.append(f"reported path escapes repository through a symlink: {value}")
             continue
-        if not resolved.is_file():
-            errors.append(f"reported path does not exist in repository: {value}")
-    return errors
+        if resolved.is_file():
+            continue
+        accepted_paths = _gold_accepted_paths_for_claim(label, claim, gold)
+        if _matches_any_path(value, accepted_paths):
+            path_convention_errors.append(
+                f"{label} reported path uses a different convention than the repository layout: {value}"
+            )
+        else:
+            provenance_errors.append(f"reported path does not exist in repository: {value}")
+    return provenance_errors, path_convention_errors
 
 
 def _answer_from_final_message(events: Sequence[dict[str, Any]]) -> Any:
@@ -848,10 +912,18 @@ def grade_answer(
     primary_correct: bool | None = None
     if isinstance(primary_claim, Mapping):
         primary_correct = (
-            primary_claim.get("file") == primary["file"]
+            _matches_any_path(primary_claim.get("file"), primary["accepted_paths"])
             and isinstance(primary_claim.get("symbol"), str)
             and _matches_symbol(primary_claim["symbol"], primary["accepted_suffixes"])
         )
+    # Intentional, not an oversight (A6 audit, 2026-08-09): every prompt tells
+    # the model to return "zero or one" related symbol, so an answer with two
+    # or more is out of protocol and is scored as no related claim at all
+    # rather than picked from. Confirmed via runs/claude-sonnet-1 task 04/07
+    # that this does occasionally under-credit a real edge the model chose to
+    # volunteer instead of one of gold's designated ones -- see
+    # `related_audit` in those gold files. That is a gold-coverage gap, not a
+    # reason to accept multi-element `related`.
     related_value = answer.get("related")
     related_claim = (
         related_value[0]
@@ -865,7 +937,7 @@ def grade_answer(
     for expected in gold["relevant"]:
         matched = bool(
             related_claim
-            and related_claim.get("file") == expected["file"]
+            and _matches_any_path(related_claim.get("file"), expected["accepted_paths"])
             and related_claim.get("relationship") == expected.get("relationship")
             and isinstance(related_claim.get("symbol"), str)
             and _matches_symbol(related_claim["symbol"], expected["accepted_suffixes"])
@@ -940,7 +1012,7 @@ def collect_metrics(
     gold: Mapping[str, Any],
     wall_seconds: float | None,
     exit_code: int | None,
-    valid: bool,
+    structural_valid: bool,
     evidence_compliant: bool,
     correctness: Mapping[str, Any],
     unsupported_claim_count: int,
@@ -950,10 +1022,12 @@ def collect_metrics(
     infrastructure_success: bool | None = None,
     protocol_compliant: bool | None = None,
     provenance_compliant: bool | None = None,
+    path_convention_compliant: bool | None = None,
 ) -> dict[str, Any]:
     usage = {
         "input_tokens": 0,
         "cached_input_tokens": 0,
+        "cache_creation_tokens": 0,
         "output_tokens": 0,
         "reasoning_output_tokens": 0,
     }
@@ -1009,20 +1083,23 @@ def collect_metrics(
     primary_correct = correctness.get("primary_correct")
     related_correct = correctness.get("related_correct")
     semantic_correct = correctness.get("semantic_correct", correctness.get("correct"))
+    answer_correct = bool(semantic_correct)
     location_exact = correctness.get("location_exact")
-    strict_pass = bool(valid and semantic_correct)
+    strict_pass = bool(structural_valid and answer_correct and evidence_compliant)
     result = {
         "arm": arm,
         "schema_valid": schema_valid,
         "infrastructure_success": infrastructure_success,
         "protocol_compliant": protocol_compliant,
         "provenance_compliant": provenance_compliant,
+        "path_convention_compliant": path_convention_compliant,
+        "structural_valid": structural_valid,
         "primary_correct": primary_correct,
         "related_correct": related_correct,
         "semantic_correct": semantic_correct,
+        "answer_correct": answer_correct,
         "location_exact": location_exact,
         "strict_pass": strict_pass,
-        "valid": valid,
         "evidence_compliant": evidence_compliant,
         "unsupported_claim_count": unsupported_claim_count,
         "location_error_count": location_error_count,
@@ -1031,6 +1108,12 @@ def collect_metrics(
         "success": strict_pass,
         "wall_seconds": wall_seconds,
         "turns": sum(event.get("type") == "turn.started" for event in events),
+        # A2: the codekg prompt caps tool use ("at most two searches and two
+        # definition inspections"); the native prompt has no cap. A
+        # native-vs-codekg tool_calls delta therefore measures a prompt
+        # difference, not a capability difference. Kept for protocol-audit
+        # purposes only -- never as an efficiency endpoint (wall_seconds and
+        # token counts are the efficiency endpoints; see PREREGISTRATION.md).
         "tool_calls": len(
             [
                 item
@@ -1038,6 +1121,7 @@ def collect_metrics(
                 if item.get("type") in {"mcp_tool_call", "command_execution"}
             ]
         ),
+        "tool_calls_prompt_bounded": arm == "codekg",
         "response_bytes": response_bytes if arm == "codekg" else None,
         "search_calls": len(search_items) if arm == "codekg" else None,
         "candidate_count": (
@@ -1057,6 +1141,7 @@ def collect_metrics(
         "tokens": {
             "input": input_tokens,
             "cached_input": usage["cached_input_tokens"],
+            "cache_creation": usage["cache_creation_tokens"],
             "uncached_input": uncached,
             "cache_hit_ratio": usage["cached_input_tokens"] / input_tokens
             if input_tokens
@@ -1128,15 +1213,14 @@ def validate_trial(
             location_statuses = _native_location_statuses(answer, repository)
         else:
             protocol_errors.append(f"unknown arm: {arm}")
+    path_convention_errors: list[str] = []
     if isinstance(answer, Mapping):
-        provenance_errors.extend(
-            validate_repository_identity_and_paths(
-                answer,
-                repository,
-                gold["commit"],
-                gold["identity"],
-            )
+        identity_provenance_errors, path_convention_errors = validate_repository_identity_and_paths(
+            answer,
+            repository,
+            gold,
         )
+        provenance_errors.extend(identity_provenance_errors)
     correctness = (
         grade_answer(answer, gold, location_statuses=location_statuses)
         if isinstance(answer, Mapping)
@@ -1167,17 +1251,20 @@ def validate_trial(
     infrastructure_success = not infrastructure_errors
     protocol_compliant = not protocol_errors
     provenance_compliant = not provenance_errors
+    path_convention_compliant = not path_convention_errors
     location_exact = bool(correctness.get("location_exact")) and not evidence_location_errors
     evidence_compliant = provenance_compliant and location_exact
-    valid = schema_valid and infrastructure_success and protocol_compliant and evidence_compliant
+    structural_valid = schema_valid and infrastructure_success and protocol_compliant
     semantic_correct = correctness.get("semantic_correct")
-    strict_pass = bool(valid and semantic_correct)
+    answer_correct = bool(semantic_correct)
+    strict_pass = bool(structural_valid and answer_correct and evidence_compliant)
     errors = [
         *schema_errors,
         *infrastructure_errors,
         *protocol_errors,
         *provenance_errors,
         *location_errors,
+        *path_convention_errors,
     ]
     unsupported_claim_count = sum(
         error.startswith("primary claim") or error.startswith("related[")
@@ -1194,12 +1281,14 @@ def validate_trial(
         "infrastructure_success": infrastructure_success,
         "protocol_compliant": protocol_compliant,
         "provenance_compliant": provenance_compliant,
+        "path_convention_compliant": path_convention_compliant,
+        "structural_valid": structural_valid,
         "primary_correct": correctness.get("primary_correct"),
         "related_correct": correctness.get("related_correct"),
         "semantic_correct": semantic_correct,
+        "answer_correct": answer_correct,
         "location_exact": location_exact,
         "strict_pass": strict_pass,
-        "valid": valid,
         "errors": errors,
         "error_categories": {
             "schema": schema_errors,
@@ -1207,6 +1296,7 @@ def validate_trial(
             "protocol": protocol_errors,
             "provenance": provenance_errors,
             "location": location_errors,
+            "path_convention": path_convention_errors,
         },
         "protocol": protocol,
         "correctness": correctness,
@@ -1222,7 +1312,7 @@ def validate_trial(
         gold=gold,
         wall_seconds=wall_seconds,
         exit_code=exit_code,
-        valid=valid,
+        structural_valid=structural_valid,
         evidence_compliant=evidence_compliant,
         correctness=correctness,
         unsupported_claim_count=unsupported_claim_count,
@@ -1232,6 +1322,7 @@ def validate_trial(
         infrastructure_success=infrastructure_success,
         protocol_compliant=protocol_compliant,
         provenance_compliant=provenance_compliant,
+        path_convention_compliant=path_convention_compliant,
     )
     return validation, metrics
 

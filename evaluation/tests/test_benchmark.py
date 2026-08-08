@@ -157,7 +157,10 @@ def test_codekg_prompt_matches_measured_tool_contract() -> None:
         normalized = " ".join(prompt.split())
         assert "preflight" in prompt.lower()
         assert expected_tools in normalized
-        assert "recommended_symbol_id" in normalized and "advisory" in normalized
+        # B4 (codekg-ranking-presentation-spec.md): recommended_symbol_id was
+        # removed from the MCP response via the B4.4 escape hatch, so the
+        # prompt no longer references it.
+        assert "recommended_symbol_id" not in normalized
         assert "final" in normalized and "find_callers" in normalized
         assert "search_symbols" in prompt
         assert "Do not call `list_repositories`" in prompt
@@ -264,7 +267,7 @@ def test_valid_codekg_trial_and_metrics(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         benchmark_lib,
         "validate_repository_identity_and_paths",
-        lambda answer, repository, expected_commit, identity: [],
+        lambda answer, repository, gold: ([], []),
     )
     validation, metrics = benchmark_lib.validate_trial(
         arm="codekg",
@@ -275,16 +278,17 @@ def test_valid_codekg_trial_and_metrics(tmp_path: Path, monkeypatch) -> None:
         wall_seconds=1.25,
         exit_code=0,
     )
-    assert validation["valid"], validation["errors"]
+    assert validation["structural_valid"], validation["errors"]
     assert validation["schema_valid"]
     assert validation["infrastructure_success"]
     assert validation["protocol_compliant"]
     assert validation["provenance_compliant"]
     assert validation["semantic_correct"]
+    assert validation["answer_correct"]
     assert validation["location_exact"]
     assert validation["strict_pass"]
     assert validation["correctness"]["correct"]
-    assert metrics["valid"]
+    assert metrics["structural_valid"]
     assert metrics["correct"] == metrics["semantic_correct"]
     assert metrics["success"] == metrics["strict_pass"]
     assert metrics["target_rank"] == 1
@@ -332,7 +336,7 @@ def test_wrong_symbol_with_own_exact_range_remains_location_exact(
     monkeypatch.setattr(
         benchmark_lib,
         "validate_repository_identity_and_paths",
-        lambda answer, repository, expected_commit, identity: [],
+        lambda answer, repository, gold: ([], []),
     )
     validation, metrics = benchmark_lib.validate_trial(
         arm="codekg",
@@ -693,7 +697,7 @@ def test_native_fabricated_symbol_is_unsupported_provenance(tmp_path: Path, monk
     monkeypatch.setattr(
         benchmark_lib,
         "validate_repository_identity_and_paths",
-        lambda answer, repository, expected_commit, identity: [],
+        lambda answer, repository, gold: ([], []),
     )
     validation, metrics = benchmark_lib.validate_trial(
         arm="native",
@@ -725,7 +729,7 @@ def test_completed_mcp_call_without_result_is_infrastructure_failure(
     monkeypatch.setattr(
         benchmark_lib,
         "validate_repository_identity_and_paths",
-        lambda answer, repository, expected_commit, identity: [],
+        lambda answer, repository, gold: ([], []),
     )
     validation, metrics = benchmark_lib.validate_trial(
         arm="codekg",
@@ -736,7 +740,7 @@ def test_completed_mcp_call_without_result_is_infrastructure_failure(
         exit_code=0,
     )
     assert validation["infrastructure_success"] is False
-    assert validation["valid"] is False
+    assert validation["structural_valid"] is False
     assert validation["strict_pass"] is False
     assert metrics["infrastructure_success"] is False
 
@@ -749,7 +753,7 @@ def test_native_mcp_only_metrics_are_null() -> None:
         gold=json.loads(GOLD_PATH.read_text()),
         wall_seconds=1.0,
         exit_code=0,
-        valid=True,
+        structural_valid=True,
         evidence_compliant=True,
         correctness={
             "primary_correct": True,
@@ -1071,7 +1075,7 @@ def test_trial_requires_one_nonempty_thread_id(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setattr(
         benchmark_lib,
         "validate_repository_identity_and_paths",
-        lambda answer, repository, expected_commit, identity: [],
+        lambda answer, repository, gold: ([], []),
     )
     validation, _ = benchmark_lib.validate_trial(
         arm="codekg",

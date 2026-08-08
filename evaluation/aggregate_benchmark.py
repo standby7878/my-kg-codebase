@@ -40,6 +40,7 @@ SCALAR_METRICS = (
 TOKEN_METRICS = (
     "input",
     "cached_input",
+    "cache_creation",
     "uncached_input",
     "cache_hit_ratio",
     "output",
@@ -50,12 +51,14 @@ RATE_METRICS = (
     "schema_valid",
     "protocol_compliant",
     "provenance_compliant",
+    "path_convention_compliant",
+    "structural_valid",
     "primary_correct",
     "related_correct",
     "semantic_correct",
+    "answer_correct",
     "location_exact",
     "strict_pass",
-    "valid",
     "evidence_compliant",
     "correct",
     "success",
@@ -144,9 +147,23 @@ def _paired_deltas(trials: Sequence[dict[str, Any]], seed: int) -> dict[str, Any
 
 def aggregate(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
     manifest = load_manifest(manifest_path)
+    batch_path = run_dir / "batch.json"
+    resolved_model = None
+    if batch_path.is_file():
+        resolved_model = read_json(batch_path).get("resolved", {}).get("model")
     all_trials = []
     for metadata_path in sorted((run_dir / "tasks").glob("*/*/metadata.json")):
         metadata = read_json(metadata_path)
+        if resolved_model is not None and metadata.get("model") != resolved_model:
+            # A7.1: batch.json.resolved.model is the ground truth for what
+            # actually ran; a mismatch here means the run mixed models
+            # mid-batch or resolved_provenance was computed from a stale
+            # value, and the aggregate must not silently label it.
+            raise ValueError(
+                f"trial model mismatch: {metadata_path.parent} has "
+                f"metadata.model={metadata.get('model')!r}, "
+                f"batch.json.resolved.model={resolved_model!r}"
+            )
         metrics_path = metadata_path.parent / "metrics.json"
         validation_path = metadata_path.parent / "validation.json"
         if not metrics_path.is_file() or not validation_path.is_file():
@@ -218,23 +235,21 @@ def aggregate(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
         arm: [trial for trial in trials if trial["metadata"]["arm"] == arm]
         for arm in manifest["arms"]
     }
-    valid_by_arm = {
-        arm: [trial for trial in arm_trials if trial["metrics"].get("valid")]
-        for arm, arm_trials in by_arm.items()
-    }
     seed = int(manifest["seed"])
     return {
         "suite_id": manifest["suite_id"],
         "repositories": manifest["repositories"],
         "expected_measured_trials": expected,
         "observed_measured_trials": len(trials),
+        # Intention-to-treat over all attempted trials is the only reported
+        # aggregate. A "valid_only" subgroup (conditioning on an arm-asymmetric
+        # filter) previously existed here and was deleted per
+        # benchmark-measurement-correctness-spec.md A1: any such filter
+        # reintroduces the A0 class of bug. structural_valid is reported as
+        # its own rate below instead.
         "intention_to_treat": {
             arm: _summary(arm_trials, seed + index * 100)
             for index, (arm, arm_trials) in enumerate(by_arm.items())
-        },
-        "valid_only": {
-            arm: _summary(arm_trials, seed + 1_000 + index * 100)
-            for index, (arm, arm_trials) in enumerate(valid_by_arm.items())
         },
         "paired_deltas": _paired_deltas(trials, seed + 2_000),
         "trial_outcomes": [
@@ -243,13 +258,15 @@ def aggregate(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
                 "task_index": trial["metadata"]["task_index"],
                 "task_id": trial["metadata"]["task_id"],
                 "repository": trial["metadata"]["repository"],
-                "valid": trial["metrics"].get("valid"),
+                "structural_valid": trial["metrics"].get("structural_valid"),
+                "answer_correct": trial["metrics"].get("answer_correct"),
                 "correct": trial["metrics"].get("correct"),
                 "success": trial["metrics"].get("success"),
                 "evidence_compliant": trial["metrics"].get("evidence_compliant"),
                 "schema_valid": trial["metrics"].get("schema_valid"),
                 "protocol_compliant": trial["metrics"].get("protocol_compliant"),
                 "provenance_compliant": trial["metrics"].get("provenance_compliant"),
+                "path_convention_compliant": trial["metrics"].get("path_convention_compliant"),
                 "primary_correct": trial["metrics"].get("primary_correct"),
                 "related_correct": trial["metrics"].get("related_correct"),
                 "semantic_correct": trial["metrics"].get("semantic_correct"),

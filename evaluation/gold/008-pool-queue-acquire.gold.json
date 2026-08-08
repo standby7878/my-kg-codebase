@@ -6,27 +6,48 @@
   "category": "intent_symbol_discovery",
   "primary": {
     "symbol": "impl.QueuePool._do_get",
-    "accepted_suffixes": ["QueuePool._do_get", "impl.QueuePool._do_get"],
+    "accepted_suffixes": [
+      "QueuePool._do_get",
+      "impl.QueuePool._do_get"
+    ],
     "file": "impl.py",
     "start_line": 150,
-    "end_line": 180
+    "end_line": 180,
+    "accepted_paths": [
+      "impl.py",
+      "lib/sqlalchemy/pool/impl.py"
+    ]
   },
   "relevant": [
     {
       "symbol": "impl.QueuePool._inc_overflow",
-      "accepted_suffixes": ["QueuePool._inc_overflow", "impl.QueuePool._inc_overflow"],
+      "accepted_suffixes": [
+        "QueuePool._inc_overflow",
+        "impl.QueuePool._inc_overflow"
+      ],
       "file": "impl.py",
       "start_line": 182,
       "end_line": 191,
-      "relationship": "callee"
+      "relationship": "callee",
+      "accepted_paths": [
+        "impl.py",
+        "lib/sqlalchemy/pool/impl.py"
+      ]
     },
     {
       "symbol": "impl.QueuePool._dec_overflow",
-      "accepted_suffixes": ["QueuePool._dec_overflow", "impl.QueuePool._dec_overflow"],
+      "accepted_suffixes": [
+        "QueuePool._dec_overflow",
+        "impl.QueuePool._dec_overflow"
+      ],
       "file": "impl.py",
       "start_line": 193,
       "end_line": 199,
-      "relationship": "callee"
+      "relationship": "callee",
+      "accepted_paths": [
+        "impl.py",
+        "lib/sqlalchemy/pool/impl.py"
+      ]
     }
   ]
 }

@@ -14,7 +14,7 @@ Mandatory CodeKG protocol:
 3. Use CodeKG only; shell, filesystem, web, and prior knowledge are forbidden.
 4. Search only repository `sql`, `scope: "source"`, hybrid mode, starting with
    exactly one call and `limit` no greater than 5.
-5. Treat `recommended_symbol_id` as advisory. If the first search has no
+5. Use judgment to select the strongest candidate from the search results. If the first search has no
    plausible candidate, one reformulated second search may occur before any
    definition inspection. Otherwise inspect the strongest candidate; if its
    metadata conflicts with the requested responsibility, inspect one other
@@ -32,3 +32,5 @@ Return `primary` with its symbol, relative file, and exact range. Return
 `relationship` set to `caller` or `callee`, plus its relative file and exact
 range; use one when available. Explain the boundary concisely using the
 supplied JSON schema.
+
+Report every `file` value as the path relative to the root of the repository you were given. Do not prefix it with the upstream project's directory layout.

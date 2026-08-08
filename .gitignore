@@ -11,3 +11,5 @@ AGENTS.md
 project_export*.txt
 compose/dev-local/runtime.env
 codekg-csv-export/
+/runs/
+/third_party/

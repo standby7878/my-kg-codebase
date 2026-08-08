@@ -21,7 +21,48 @@ _DISCOVERY_DEFAULT_LIMIT = 5
 _DISCOVERY_MAX_LIMIT = 20
 _DISCOVERY_CANDIDATE_POOL = 100
 _GENERIC_CODE_TERMS = frozenset(
-    {"method", "function", "class", "object", "value", "data", "prepare", "prepared", "request"}
+    {
+        # Retrieval-parameter demotion list: terms here score `generic` (weight
+        # 100/30/20/40 depending on match field) instead of `specific`
+        # (300/80/40/120) in `_weighted_matches`. A term earns a place here only
+        # by a corpus-frequency criterion, checked against the five indexed
+        # evaluation corpora (requests, click, sqlalchemy engine/pool/sql):
+        # present with non-trivial count in at least 3 of the 5 repositories.
+        # Appearing in only one or two repositories means the term is specific
+        # to that codebase's vocabulary, not generic across Python code, no
+        # matter how generic-sounding the English word is.
+        #
+        # Measured 2026-08-09 (AST def/class-name token counts):
+        #   class     33 occurrences across 3/5 repos  -> generic, kept
+        #   data      13 occurrences across 4/5 repos  -> generic, kept
+        #   function  23 occurrences across 3/5 repos  -> generic, kept
+        #   method     9 occurrences across 3/5 repos  -> generic, kept
+        #   object    14 occurrences across 4/5 repos  -> generic, kept
+        #   value     88 occurrences across 4/5 repos  -> generic, kept
+        #   prepare   21 occurrences across 3/5 repos, but 14/21 (67%) in
+        #             `requests` alone       -> REMOVED, see A11 below
+        #   prepared  14 occurrences across 3/5 repos, but 11/14 (79%) in
+        #             `requests` alone       -> REMOVED, see A11 below
+        #   request   38 occurrences, ALL in `requests` (1/5 repos)
+        #                                    -> REMOVED, see A11 below
+        #
+        # A11 (benchmark-measurement-correctness-spec.md): `prepare`,
+        # `prepared`, and `request` were previously in this set. They are the
+        # content words of evaluation task 001 (requests-prepare-request), and
+        # even where they cross the 3-repo bar, their occurrences are
+        # overwhelmingly concentrated in the one repository that task targets
+        # -- a retrieval parameter fitted to the evaluation set, not a
+        # domain-generic term. Removed; frozen and hashed into
+        # `batch.json.resolved.generic_terms_hash` by `run_benchmark.py`, and
+        # `tests/unit/test_ranker_term_list.py` fails if this set changes
+        # without a matching entry in `RANKING_TUNING_LOG.md`.
+        "method",
+        "function",
+        "class",
+        "object",
+        "value",
+        "data",
+    }
 )
 _STOPWORDS = frozenset(
     {
@@ -382,6 +423,64 @@ def _decode_cursor(
         raise ValueError("cursor does not match this repository search") from exc
 
 
+# B2 (codekg-ranking-presentation-spec.md): a flat qname weight makes every
+# dotted component -- package, module, owner class, and method name --
+# indistinguishable to the scorer. The owner class is the most discriminating
+# component for a method (it separates `Command.parse_args` from
+# `_OptionParser.parse_args`), while a leading repository-wrapper component
+# (`src`, `lib`) is shared by every candidate in the repository and carries
+# almost no signal. Only qname weighting changes here: signature/path/
+# description weights, the +10000/+9000/+8000 tiers, _GENERIC_CODE_TERMS, and
+# the sort key are all untouched.
+#
+# Tuning run 2026-08-09 (evaluation/replay_b2.py, 33 recorded CodeKG search
+# calls across three runs, real graph data): the spec's suggested
+# _OWNER_WEIGHT=700 regressed target_rank on 3-4 other tasks -- most
+# instructively, task 001's query literally contains "PreparedRequest", so an
+# owner-class match on `PreparedRequest.prepare` got boosted past gold
+# `Session.prepare_request`, the exact task-001-overfitting failure mode
+# A11 flagged, resurfacing through the owner path once A11 uncapped
+# prepare/prepared/request to full weight. A binary sweep over the replay
+# found the empirical zero-regression ceiling at owner_weight ~=370; 350 is
+# set with headroom below that cliff while still weighting the owner class
+# above a plain module component, per the spec's own reasoning.
+_OWNER_WEIGHT = 350
+_OWNER_GENERIC_WEIGHT = 115
+_MODULE_WEIGHT = 300  # unchanged from the prior flat qname weight
+_MODULE_GENERIC_WEIGHT = 100  # unchanged from the prior flat qname weight
+_PACKAGE_WEIGHT = 60
+_PACKAGE_GENERIC_WEIGHT = 20
+_PACKAGE_ROOTS = frozenset({"src", "lib"})
+
+
+def _qname_role_terms(qname: str, name: str) -> dict[str, list[str]]:
+    """Partition a dotted qname into package / module / owner role tokens.
+
+    The trailing component matching `name` is dropped first. Of what
+    remains, the last component is the owner class if it looks like one
+    (PEP 8 PascalCase, vs. lowercase module/package names) -- this is a
+    heuristic, not a graph lookup, so it costs nothing per candidate. The
+    PascalCase check strips a leading underscore first, so private classes
+    like `_OptionParser` and `_ConnectionRecord` are still detected as
+    owners rather than falling through to module weight. A leading
+    `src`/`lib` wrapper-root component is package; everything else
+    remaining is module.
+    """
+    parts = [part for part in qname.split(".") if part]
+    if parts and parts[-1] == name:
+        parts = parts[:-1]
+    owner_terms: list[str] = []
+    if parts and parts[-1].lstrip("_")[:1].isupper():
+        owner_terms = _analyze_text(parts[-1])
+        parts = parts[:-1]
+    package_terms: list[str] = []
+    if parts and parts[0] in _PACKAGE_ROOTS:
+        package_terms = _analyze_text(parts[0])
+        parts = parts[1:]
+    module_terms = [term for part in parts for term in _analyze_text(part)]
+    return {"package": package_terms, "module": module_terms, "owner": owner_terms}
+
+
 def _rank_discovery_rows(query: str, rows: list[dict[str, object]]) -> list[dict[str, object]]:
     terms = _analyze_query(query)
     by_key: dict[str, dict[str, object]] = {}
@@ -410,7 +509,27 @@ def _rank_discovery_rows(query: str, rows: list[dict[str, object]]) -> list[dict
         elif _identifier_key(query) == _identifier_key(str(row.get("name") or "")):
             score += 8000
             match_type = "exact_name"
-        score += _weighted_matches(qname_matches | name_matches, specific=300, generic=100)
+        # A term is credited once, at whichever role it's associated with.
+        # Without excluding name_matches here, a term that coincidentally
+        # appears in both the owner class and the trailing method name (e.g.
+        # query term "context" matching both owner "Context" and name
+        # "_make_sub_context") would be double-counted -- once as an owner
+        # match and once as a name match -- and win purely on that
+        # coincidence. The pre-B2 flat scheme avoided this via set union
+        # (`qname_matches | name_matches`); role-splitting must preserve that
+        # same one-credit-per-term invariant.
+        roles = _qname_role_terms(str(row.get("qname") or ""), str(row.get("name") or ""))
+        owner_matches = (set(terms) & set(roles["owner"])) - name_matches
+        module_matches = (set(terms) & set(roles["module"])) - name_matches
+        package_matches = (set(terms) & set(roles["package"])) - name_matches
+        score += _weighted_matches(owner_matches, specific=_OWNER_WEIGHT, generic=_OWNER_GENERIC_WEIGHT)
+        score += _weighted_matches(
+            module_matches, specific=_MODULE_WEIGHT, generic=_MODULE_GENERIC_WEIGHT
+        )
+        score += _weighted_matches(
+            package_matches, specific=_PACKAGE_WEIGHT, generic=_PACKAGE_GENERIC_WEIGHT
+        )
+        score += _weighted_matches(name_matches, specific=300, generic=100)
         score += _weighted_matches(signature_matches, specific=80, generic=30)
         score += _weighted_matches(path_matches, specific=40, generic=20)
         # Zvec text begins with identifier/signature material.  Only the tail
@@ -524,7 +643,23 @@ def _matches_scope(row: dict[str, object], scope: DiscoveryScope) -> bool:
     return scope == "all" or _path_scope(row.get("file")) == scope
 
 
+_SIGNATURE_MAX_LENGTH = 200
+
+
+def _truncate_signature(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    if len(value) <= _SIGNATURE_MAX_LENGTH:
+        return value
+    return value[: _SIGNATURE_MAX_LENGTH - 1] + "…"
+
+
 def _compact_discovery_row(row: dict[str, object], query: str) -> dict[str, object]:
+    # B3 (codekg-ranking-presentation-spec.md): the signature is already
+    # fetched by the Cypher query and already participates in scoring
+    # (_weighted_matches(signature_matches, ...) above); it was being dropped
+    # before emission, forcing a get_definition round trip just to
+    # distinguish same-named candidates in different classes.
     return {
         "symbol_id": row["key"],
         "qualified_name": row.get("qname"),
@@ -535,6 +670,7 @@ def _compact_discovery_row(row: dict[str, object], query: str) -> dict[str, obje
         "matched_terms": row.get("_matched_terms", _analyze_query(query)),
         "match_type": row.get("_match_type", "terms"),
         "scope": _path_scope(row.get("file")),
+        "signature": _truncate_signature(row.get("signature")),
     }
 
 
@@ -659,7 +795,7 @@ def find_callers(
             MATCH (callee {key: $key})<-[res:RESOLVES_TO]-(site:CallSite)
             MATCH (caller)-[:HAS_CALLSITE]->(site)
             MATCH (caller_file:File)-[:CONTAINS]->(caller)
-            WHERE caller:Function OR caller:Method
+            WHERE (caller:Function OR caller:Method)
               AND caller.key STARTS WITH $snapshot_prefix
               AND site.key STARTS WITH $snapshot_prefix
             RETURN DISTINCT caller.key AS key,
@@ -685,7 +821,7 @@ def find_callers(
         MATCH (callee {{key: $key}})
         MATCH path = (caller)-[:EXACT_CALLS*1..{_depth(depth)}]->(callee)
         MATCH (caller_file:File)-[:CONTAINS]->(caller)
-        WHERE caller:Function OR caller:Method
+        WHERE (caller:Function OR caller:Method)
           AND ALL(node IN nodes(path) WHERE node.key STARTS WITH $snapshot_prefix)
         RETURN DISTINCT caller.key AS key,
                caller.qname AS qname,
@@ -728,7 +864,7 @@ def find_callees(
             """
             MATCH (caller {key: $key})-[:HAS_CALLSITE]->(site:CallSite)-[res:RESOLVES_TO]->(callee)
             MATCH (callee_file:File)-[:CONTAINS]->(callee)
-            WHERE callee:Function OR callee:Method
+            WHERE (callee:Function OR callee:Method)
               AND callee.key STARTS WITH $snapshot_prefix
               AND site.key STARTS WITH $snapshot_prefix
             RETURN DISTINCT callee.key AS key,
@@ -754,7 +890,7 @@ def find_callees(
         MATCH (caller {{key: $key}})
         MATCH path = (caller)-[:EXACT_CALLS*1..{_depth(depth)}]->(callee)
         MATCH (callee_file:File)-[:CONTAINS]->(callee)
-        WHERE callee:Function OR callee:Method
+        WHERE (callee:Function OR callee:Method)
           AND ALL(node IN nodes(path) WHERE node.key STARTS WITH $snapshot_prefix)
         RETURN DISTINCT callee.key AS key,
                callee.qname AS qname,

@@ -27,3 +27,5 @@ Return `primary` with its symbol, relative file, and exact range. Return
 or `callee`, plus its relative file and exact range; use one when available.
 Explain the responsibility boundary concisely and conform to the supplied
 JSON schema.
+
+Report every `file` value as the path relative to the root of the repository you were given. Do not prefix it with the upstream project's directory layout.

@@ -140,9 +140,14 @@ POSIX path, and complete definition range. A related claim additionally uses
 checked against the corresponding evidence.
 
 The normal CodeKG path is one search, one definition inspection, and one call
-to each relationship tool. For bounded recovery, `recommended_symbol_id` is
-advisory: the agent may inspect one additional candidate from a prior result or
-after one additional search. The last definition inspected is final, and only
+to each relationship tool. For bounded recovery, the agent uses judgment to
+select the strongest candidate and may inspect one additional candidate from a
+prior result or after one additional search. (`recommended_symbol_id` was
+removed from `search_symbols` responses per
+`codekg-ranking-presentation-spec.md` B4: calibration found no score-margin
+threshold that separates correct from wrong rank-1 recommendations, so an
+absent field ships instead of a confidently wrong one.) The last definition
+inspected is final, and only
 that symbol may receive caller/callee expansion. The hard limits are two
 searches, two definition inspections, and one call to each relationship tool.
 

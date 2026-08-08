@@ -15,7 +15,7 @@ Mandatory CodeKG protocol:
    filesystem, web, or prior model knowledge as evidence.
 4. Search only repository `requests` with `scope: "source"`. Start with exactly
    one hybrid search and `limit` no greater than 5.
-5. Search is candidate discovery only; `recommended_symbol_id` is advisory.
+5. Search is candidate discovery only; use judgment to select the strongest candidate.
    If the first search has no plausible candidate, one reformulated second
    search may occur before any definition inspection. Otherwise inspect the
    strongest candidate. If its definition metadata conflicts with the
@@ -35,3 +35,5 @@ Return `primary` with its symbol, relative file, and exact range. Return
 or `callee`, plus its relative file and exact range; use one when available.
 Explain the responsibility boundary concisely and conform to the supplied
 JSON schema.
+
+Report every `file` value as the path relative to the root of the repository you were given. Do not prefix it with the upstream project's directory layout.

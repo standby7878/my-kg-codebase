@@ -234,7 +234,7 @@ def test_discover_symbols_compacts_results_and_paginates() -> None:
             "file": "requests/sessions.py",
             "start_line": line,
             "end_line": line + 1,
-            "signature": "long data that must not leak",
+            "signature": "def prepare_request(self, request)",
             "score": 1.0,
         }
         for line, name in ((1, "prepare_request"), (2, "request"), (3, "send"))
@@ -259,8 +259,13 @@ def test_discover_symbols_compacts_results_and_paginates() -> None:
         "matched_terms",
         "match_type",
         "scope",
+        "signature",
     }
     assert first["qualified_name"] == "requests.Session.prepare_request"
+    # B3 (codekg-ranking-presentation-spec.md): signature is emitted so the
+    # model can distinguish same-named candidates without a get_definition
+    # round trip.
+    assert first["signature"] == "def prepare_request(self, request)"
     assert response["next_cursor"]
     payload = json.loads(
         base64.urlsafe_b64decode(
@@ -283,6 +288,50 @@ def test_discover_symbols_compacts_results_and_paginates() -> None:
     )  # type: ignore[arg-type]
     assert [row["qualified_name"] for row in next_page["results"]] == ["requests.Session.send"]
     assert client.calls[3][1]["limit"] == 100
+
+
+def test_discover_symbols_truncates_long_signature() -> None:
+    long_signature = "def f(" + ", ".join(f"arg{i}: int" for i in range(40)) + ") -> None"
+    assert len(long_signature) > 200
+    rows = [
+        {
+            "key": "pkg@abc:mod.py:pkg.f:1",
+            "name": "f",
+            "qname": "pkg.f",
+            "file": "pkg/mod.py",
+            "start_line": 1,
+            "end_line": 2,
+            "signature": long_signature,
+            "score": 1.0,
+        }
+    ]
+    client = DiscoveryClient([_repository()], rows)
+
+    response = discover_symbols("f", repository="requests", mode="graph", client=client)  # type: ignore[arg-type]
+
+    signature = response["results"][0]["signature"]
+    assert len(signature) == 200
+    assert signature.endswith("…")
+    assert signature[:-1] == long_signature[:199]
+
+
+def test_discover_symbols_signature_null_when_absent() -> None:
+    rows = [
+        {
+            "key": "pkg@abc:mod.py:pkg.T:1",
+            "name": "T",
+            "qname": "pkg.T",
+            "file": "pkg/mod.py",
+            "start_line": 1,
+            "end_line": 2,
+            "score": 1.0,
+        }
+    ]
+    client = DiscoveryClient([_repository()], rows)
+
+    response = discover_symbols("T", repository="requests", mode="graph", client=client)  # type: ignore[arg-type]
+
+    assert response["results"][0]["signature"] is None
 
 
 def test_discover_backend_query_excludes_stopwords() -> None:
@@ -686,18 +735,101 @@ def test_prepared_request_behavioral_description_beats_generic_identifier_terms(
     assert ranked[0]["key"] == "session-prepare-request"
 
 
+def test_qname_role_terms_splits_owner_module_package() -> None:
+    from codekg.queries.code import _qname_role_terms
+
+    roles = _qname_role_terms("src.click.core.Command.parse_args", "parse_args")
+    assert roles["owner"] == ["command"]
+    assert roles["module"] == ["click", "core"]
+    assert roles["package"] == ["src"]
+
+
+def test_qname_role_terms_plain_function_has_no_owner() -> None:
+    from codekg.queries.code import _qname_role_terms
+
+    roles = _qname_role_terms("base._finalize_fairy", "_finalize_fairy")
+    assert roles["owner"] == []
+    assert roles["module"] == ["base"]
+    assert roles["package"] == []
+
+
+def test_owner_class_match_outranks_same_named_method_in_another_class() -> None:
+    """B2 (codekg-ranking-presentation-spec.md): the motivating task-04
+    failure. Gold `Command.parse_args` must outrank `_OptionParser.parse_args`
+    once the query names the owner class, even though both match "parse" and
+    "args" identically."""
+    from codekg.queries.code import _rank_discovery_rows
+
+    ranked = _rank_discovery_rows(
+        "parse_args command context leftover arguments",
+        [
+            {
+                "key": "optionparser-parse-args",
+                "name": "parse_args",
+                "qname": "src.click.parser._OptionParser.parse_args",
+                "signature": "def parse_args(self, args)",
+                "file": "src/click/parser.py",
+                "score": 10,
+            },
+            {
+                "key": "command-parse-args",
+                "name": "parse_args",
+                "qname": "src.click.core.Command.parse_args",
+                "signature": "def parse_args(self, ctx, args)",
+                "file": "src/click/core.py",
+                "score": 10,
+            },
+        ],
+    )
+
+    assert ranked[0]["key"] == "command-parse-args"
+
+
+def test_owner_and_name_overlap_is_not_double_counted() -> None:
+    """Regression test: a query term matching BOTH the owner class and the
+    trailing method name (e.g. "context" matching owner `Context` and name
+    `_make_sub_context`) must be credited once, not once per role. Without
+    the fix, this candidate outranks a plainer, more relevant match purely on
+    the coincidental vocabulary overlap."""
+    from codekg.queries.code import _rank_discovery_rows
+
+    ranked = _rank_discovery_rows(
+        "make context command invoke",
+        [
+            {
+                "key": "make-context",
+                "name": "make_context",
+                "qname": "src.click.core.Command.make_context",
+                "signature": "def make_context(self, info_name, args, parent, **extra)",
+                "file": "src/click/core.py",
+                "score": 10,
+            },
+            {
+                "key": "make-sub-context",
+                "name": "_make_sub_context",
+                "qname": "src.click.core.Context._make_sub_context",
+                "signature": "def _make_sub_context(self, command, **kwargs)",
+                "file": "src/click/core.py",
+                "score": 10,
+            },
+        ],
+    )
+
+    assert ranked[0]["key"] == "make-context"
+
+
 def test_specific_description_term_outweighs_generic_description_term() -> None:
     from codekg.queries.code import _rank_discovery_rows
 
     ranked = _rank_discovery_rows(
-        "session request",
+        "session class",
         [
             {
                 "key": "generic",
                 "name": "first",
                 "qname": "pkg.first",
                 "file": "pkg/first.py",
-                "_description": "request",
+                "_description": "class",
                 "score": 0,
             },
             {

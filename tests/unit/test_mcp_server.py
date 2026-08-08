@@ -138,7 +138,6 @@ async def test_search_symbols_returns_concise_text_and_canonical_structured_resu
         "next_cursor": "opaque-next-page",
         "scope": "source",
         "recommended_next_tool": "get_definition",
-        "recommended_symbol_id": "requests@f361ead047be:sessions.py:Session.prepare_request:450",
     }
     text = result.content[0].text
     assert (
@@ -171,7 +170,27 @@ def test_discovery_guidance_preserves_query_diagnostics_and_recommendation() -> 
     assert response["scope"] == "source"
     assert response["diagnostics"] == {"match_types": ["exact_qualified_name"]}
     assert response["recommended_next_tool"] == "find_callees"
-    assert response["recommended_symbol_id"] == "requests@abc:sessions.py:Session.request:1"
+
+
+def test_discovery_guidance_never_emits_recommended_symbol_id() -> None:
+    """B4 (codekg-ranking-presentation-spec.md): removed via the B4.4 escape
+    hatch after calibration found no margin threshold separates correct from
+    wrong rank-1 recommendations. An absent field, not a confidently wrong
+    one."""
+    response: dict[str, object] = {
+        "status": "ok",
+        "results": [
+            {"symbol_id": "requests@abc:sessions.py:Session.request:1", "score": 9010},
+            {"symbol_id": "requests@abc:sessions.py:Session.other:2", "score": 10},
+        ],
+    }
+
+    server._add_discovery_guidance(response, SearchScope.SOURCE)
+
+    assert response["recommended_next_tool"] == "get_definition"
+    assert "recommended_symbol_id" not in response
+    assert "rank_margin" not in response
+    assert "ambiguous" not in response
 
 
 def test_search_symbols_error_summary_does_not_duplicate_available_repositories() -> None:

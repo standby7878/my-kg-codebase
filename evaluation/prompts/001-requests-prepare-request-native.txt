@@ -44,3 +44,5 @@ Return:
 - `related`: zero or one directly relevant symbol with `relationship` set to `caller` or `callee`, plus its repository-relative file and exact line range. Return one when verified evidence is available.
 - A concise explanation of why the primary symbol is the correct responsibility boundary.
 - The final answer must conform to the supplied JSON schema.
+
+Report every `file` value as the path relative to the root of the repository you were given. Do not prefix it with the upstream project's directory layout.

@@ -49,6 +49,8 @@ EFFORT_ENV_VAR = "CODEKG_BENCHMARK_EFFORT"
 DEFAULT_EFFORT = "high"
 CODEKG_MCP_URL = "http://127.0.0.1:8765/mcp"
 MCP_CONFIG_PATH = Path(__file__).resolve().parent / "claude-codekg-mcp.json"
+PRICE_TABLE_ID = "2026-08"
+REPO_ROOT = Path(__file__).resolve().parents[1]
 JSON_ONLY_SYSTEM_PROMPT = (
     "Your final assistant message of this session must be the JSON answer object "
     "only: no markdown code fences, no prose before or after it, no explanation "
@@ -68,6 +70,48 @@ def resolve_model() -> str:
 
 def resolve_effort() -> str:
     return os.environ.get(EFFORT_ENV_VAR, DEFAULT_EFFORT)
+
+
+def _codekg_commit() -> str:
+    try:
+        return _git(REPO_ROOT, "rev-parse", "HEAD")
+    except RuntimeError:
+        return "<unavailable>"
+
+
+def _generic_terms_hash() -> str:
+    """A11: hash of the frozen ranker term-list, so a run's batch.json pins
+    exactly which retrieval-parameter version produced its CodeKG results."""
+    import hashlib
+
+    from codekg.queries.code import _GENERIC_CODE_TERMS
+
+    return hashlib.sha256(repr(sorted(_GENERIC_CODE_TERMS)).encode()).hexdigest()
+
+
+def resolved_provenance(
+    *, model: str, effort: str, cli_version: str, manifest: dict[str, Any]
+) -> dict[str, Any]:
+    """The actually-resolved run configuration, written once to batch.json.
+
+    A7.1: batch.json previously recorded manifest.model (the configured
+    default) rather than the value CODEKG_BENCHMARK_MODEL/_EFFORT resolved to,
+    so a Sonnet run's batch.json could claim "claude-haiku-4-5-20251001" while
+    every per-trial metadata.json correctly said "claude-sonnet-5". This is
+    the corrected, resolved record; aggregate_benchmark.py asserts every
+    trial's metadata.model matches resolved.model.
+    """
+    return {
+        "model": model,
+        "effort": effort,
+        "cli_version": cli_version,
+        "codekg_commit": _codekg_commit(),
+        "corpus_commits": {
+            repo["name"]: repo["indexed_commit"] for repo in manifest["repositories"]
+        },
+        "price_table_id": PRICE_TABLE_ID,
+        "generic_terms_hash": _generic_terms_hash(),
+    }
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -543,6 +587,12 @@ def execute(args: argparse.Namespace) -> int:
             "manifest": manifest,
             "local_preflight": local,
             "schedule": schedule,
+            "resolved": resolved_provenance(
+                model=model,
+                effort=effort,
+                cli_version=local["claude_version"],
+                manifest=manifest,
+            ),
         },
     )
     frozen_state_arguments = {

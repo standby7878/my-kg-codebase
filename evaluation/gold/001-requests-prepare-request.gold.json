@@ -12,7 +12,10 @@
     ],
     "file": "src/requests/sessions.py",
     "start_line": 511,
-    "end_line": 555
+    "end_line": 555,
+    "accepted_paths": [
+      "src/requests/sessions.py"
+    ]
   },
   "relevant": [
     {
@@ -24,7 +27,10 @@
       "file": "src/requests/sessions.py",
       "start_line": 557,
       "end_line": 653,
-      "relationship": "caller"
+      "relationship": "caller",
+      "accepted_paths": [
+        "src/requests/sessions.py"
+      ]
     },
     {
       "symbol": "src.requests.models.PreparedRequest.prepare",
@@ -35,7 +41,10 @@
       "file": "src/requests/models.py",
       "start_line": 424,
       "end_line": 451,
-      "relationship": "callee"
+      "relationship": "callee",
+      "accepted_paths": [
+        "src/requests/models.py"
+      ]
     }
   ]
 }

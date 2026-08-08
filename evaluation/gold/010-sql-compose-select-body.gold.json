@@ -12,16 +12,27 @@
     ],
     "file": "compiler.py",
     "start_line": 5260,
-    "end_line": 5358
+    "end_line": 5358,
+    "accepted_paths": [
+      "compiler.py",
+      "lib/sqlalchemy/sql/compiler.py"
+    ]
   },
   "relevant": [
     {
       "symbol": "compiler.SQLCompiler.visit_select",
-      "accepted_suffixes": ["SQLCompiler.visit_select", "compiler.SQLCompiler.visit_select"],
+      "accepted_suffixes": [
+        "SQLCompiler.visit_select",
+        "compiler.SQLCompiler.visit_select"
+      ],
       "file": "compiler.py",
       "start_line": 4973,
       "end_line": 5194,
-      "relationship": "caller"
+      "relationship": "caller",
+      "accepted_paths": [
+        "compiler.py",
+        "lib/sqlalchemy/sql/compiler.py"
+      ]
     },
     {
       "symbol": "compiler.SQLCompiler.order_by_clause",
@@ -32,7 +43,11 @@
       "file": "compiler.py",
       "start_line": 5456,
       "end_line": 5466,
-      "relationship": "callee"
+      "relationship": "callee",
+      "accepted_paths": [
+        "compiler.py",
+        "lib/sqlalchemy/sql/compiler.py"
+      ]
     }
   ]
 }
