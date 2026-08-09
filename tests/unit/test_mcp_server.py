@@ -341,7 +341,7 @@ async def test_dead_code_normalizes_absolute_paths_using_tool_scope_hints(
     )
 
     result = await (await mcp.get_tools())["find_dead_code"].run(
-        {"repo": "requests", "commit": "abc"}
+        {"repository": "requests", "commit": "abc"}
     )
 
     assert result.structured_content["result"][0]["file"] == "dead.py"
@@ -366,7 +366,7 @@ async def test_complexity_normalizes_absolute_paths_using_commit_hint(
     )
 
     result = await (await mcp.get_tools())["get_complexity"].run(
-        {"repo": "requests", "commit": "new", "top_n": 1}
+        {"repository": "requests", "commit": "new", "top_n": 1}
     )
 
     assert result.structured_content["result"][0]["file"] == "complex.py"

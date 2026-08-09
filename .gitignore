@@ -15,3 +15,4 @@ codekg-csv-export/
 /.stress-results/
 /runs/
 /third_party/
+/evaluation-aiven-core/

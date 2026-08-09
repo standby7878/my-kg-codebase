@@ -73,7 +73,7 @@ mcp = FastMCP(
     instructions=(
         "Read-only tools for querying the offline CodeKG Neo4j graph. "
         "Use list_repositories first when the repository name is unknown. "
-        "Use exact keys returned by earlier tools. Qualified-name selectors require repo, "
+        "Use exact keys returned by earlier tools. Qualified-name selectors require repository, "
         "and ambiguous qualified names return their candidate exact keys."
     ),
 )
@@ -390,18 +390,20 @@ def _symbol_identity_hints(
     description=(
         "Verify exact indexed definition metadata and line bounds for one selected symbol. "
         "Pass the symbol_id returned by search_symbols; a qualified-name fallback requires "
-        "repo and fails on ambiguity."
+        "repository and fails on ambiguity."
     ),
     output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def get_definition(
     identifier: Annotated[str, Field(description="Symbol key or qualified name.")],
-    repo: Annotated[str | None, Field(description="Required for qualified-name lookup.")] = None,
+    repository: Annotated[
+        str | None, Field(description="Required for qualified-name lookup.")
+    ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
 ) -> ToolResult:
     return _wrapped_list_result(
         "get_definition",
-        _normalize_public_rows(query_get_definition(identifier, repo=repo, commit=commit)),
+        _normalize_public_rows(query_get_definition(identifier, repo=repository, commit=commit)),
     )
 
 
@@ -415,16 +417,18 @@ def get_definition(
 )
 def find_callers(
     identifier: Annotated[str, Field(description="Function or method key, or qualified name.")],
-    repo: Annotated[str | None, Field(description="Required for qualified-name lookup.")] = None,
+    repository: Annotated[
+        str | None, Field(description="Required for qualified-name lookup.")
+    ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS traversal depth.")] = 1,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
 ) -> ToolResult:
-    repository_hint, commit_hint = _symbol_identity_hints(identifier, repo, commit)
+    repository_hint, commit_hint = _symbol_identity_hints(identifier, repository, commit)
     return _wrapped_list_result(
         "find_callers",
         _normalize_public_rows(
-            query_find_callers(identifier, repo=repo, commit=commit, depth=depth, limit=limit),
+            query_find_callers(identifier, repo=repository, commit=commit, depth=depth, limit=limit),
             repository_hint=repository_hint,
             commit_hint=commit_hint,
         ),
@@ -441,16 +445,18 @@ def find_callers(
 )
 def find_callees(
     identifier: Annotated[str, Field(description="Function or method key, or qualified name.")],
-    repo: Annotated[str | None, Field(description="Required for qualified-name lookup.")] = None,
+    repository: Annotated[
+        str | None, Field(description="Required for qualified-name lookup.")
+    ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS traversal depth.")] = 1,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
 ) -> ToolResult:
-    repository_hint, commit_hint = _symbol_identity_hints(identifier, repo, commit)
+    repository_hint, commit_hint = _symbol_identity_hints(identifier, repository, commit)
     return _wrapped_list_result(
         "find_callees",
         _normalize_public_rows(
-            query_find_callees(identifier, repo=repo, commit=commit, depth=depth, limit=limit),
+            query_find_callees(identifier, repo=repository, commit=commit, depth=depth, limit=limit),
             repository_hint=repository_hint,
             commit_hint=commit_hint,
         ),
@@ -460,7 +466,7 @@ def find_callees(
 @mcp.tool(
     description=(
         "Find a bounded call path between two functions or methods. Prefer exact keys; "
-        "qualified-name endpoints require repo. The returned path contains exact key/qname "
+        "qualified-name endpoints require repository. The returned path contains exact key/qname "
         "pairs and uses only EXACT_CALLS projections."
     ),
     output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
@@ -468,7 +474,9 @@ def find_callees(
 def trace_call_path(
     from_identifier: Annotated[str, Field(description="Source function or method key/qname.")],
     to_identifier: Annotated[str, Field(description="Target function or method key/qname.")],
-    repo: Annotated[str | None, Field(description="Required for qualified-name endpoints.")] = None,
+    repository: Annotated[
+        str | None, Field(description="Required for qualified-name endpoints.")
+    ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     max_depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS path depth.")] = 8,
     limit: Annotated[int, Field(ge=1, le=10, description="Maximum paths to return.")] = 5,
@@ -479,7 +487,7 @@ def trace_call_path(
             query_trace_call_path(
                 from_identifier,
                 to_identifier,
-                repo=repo,
+                repo=repository,
                 commit=commit,
                 max_depth=max_depth,
                 limit=limit,
@@ -497,14 +505,16 @@ def trace_call_path(
 )
 def find_importers(
     module_identifier: Annotated[str, Field(description="Imported module key or qualified name.")],
-    repo: Annotated[str | None, Field(description="Required for qualified-name lookup.")] = None,
+    repository: Annotated[
+        str | None, Field(description="Required for qualified-name lookup.")
+    ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 100,
 ) -> ToolResult:
     return _wrapped_list_result(
         "find_importers",
         _normalize_public_rows(
-            query_find_importers(module_identifier, repo=repo, commit=commit, limit=limit)
+            query_find_importers(module_identifier, repo=repository, commit=commit, limit=limit)
         ),
     )
 
@@ -512,14 +522,16 @@ def find_importers(
 @mcp.tool(
     description=(
         "Return ancestors or descendants of a selected type through inheritance and interface "
-        "relationships. Exact keys are preferred; qualified names require repo. Direction "
+        "relationships. Exact keys are preferred; qualified names require repository. Direction "
         "must be explicit and results are bounded."
     ),
     output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def get_class_hierarchy(
     identifier: Annotated[str, Field(description="Type key or qualified name.")],
-    repo: Annotated[str | None, Field(description="Required for qualified-name lookup.")] = None,
+    repository: Annotated[
+        str | None, Field(description="Required for qualified-name lookup.")
+    ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     direction: Annotated[
         HierarchyDirection,
@@ -533,7 +545,7 @@ def get_class_hierarchy(
         _normalize_public_rows(
             query_get_class_hierarchy(
                 identifier,
-                repo=repo,
+                repo=repository,
                 commit=commit,
                 direction=direction,
                 depth=depth,
@@ -552,15 +564,15 @@ def get_class_hierarchy(
     output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def find_dead_code(
-    repo: Annotated[str, Field(description="Repository name.")],
+    repository: Annotated[str, Field(description="Repository name.")],
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 100,
 ) -> ToolResult:
     return _wrapped_list_result(
         "find_dead_code",
         _normalize_public_rows(
-            query_find_dead_code(repo, commit=commit, limit=limit),
-            repository_hint=repo,
+            query_find_dead_code(repository, commit=commit, limit=limit),
+            repository_hint=repository,
             commit_hint=commit,
         ),
     )
@@ -570,7 +582,7 @@ def find_dead_code(
     description=(
         "Return cyclomatic complexity for one symbol, or the most complex symbols in a "
         "repository when a top-N request is provided. An identifier is exact-key-first; "
-        "qualified-name lookup requires repo."
+        "qualified-name lookup requires repository."
     ),
     output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
@@ -579,7 +591,9 @@ def get_complexity(
         str | None,
         Field(description="Optional symbol key or qualified name for a single symbol."),
     ] = None,
-    repo: Annotated[str | None, Field(description="Optional repository name filter.")] = None,
+    repository: Annotated[
+        str | None, Field(description="Optional repository name filter.")
+    ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     top_n: Annotated[
         int | None,
@@ -589,8 +603,8 @@ def get_complexity(
     return _wrapped_list_result(
         "get_complexity",
         _normalize_public_rows(
-            query_get_complexity(identifier, repo=repo, commit=commit, top_n=top_n),
-            repository_hint=repo,
+            query_get_complexity(identifier, repo=repository, commit=commit, top_n=top_n),
+            repository_hint=repository,
             commit_hint=commit,
         ),
     )

@@ -65,7 +65,7 @@ def main() -> None:
         write_json_new(trial / "validation.json", validation)
         write_json_new(trial / "metrics.json", metrics)
     print(json.dumps(result, indent=2, sort_keys=True))
-    raise SystemExit(0 if validation["valid"] else 1)
+    raise SystemExit(0 if validation["strict_pass"] else 1)
 
 
 if __name__ == "__main__":
