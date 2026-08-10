@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import csv
+import logging
 from pathlib import Path
 
 import pytest
 
 from codekg.bulk_export import export_repositories, load_bulk_export
-from codekg.ir import CallIR, FileIR, ImportIR, LocalBindingIR, RepositoryIR, SymbolIR
+from codekg.ir import (
+    CallIR,
+    FileIR,
+    ImportIR,
+    LocalBindingIR,
+    ParseDiagnosticIR,
+    RepositoryIR,
+    SymbolIR,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -59,6 +68,15 @@ def _repo(
             ),
         ),
     )
+
+
+def test_bulk_export_logs_graph_phase_boundaries(caplog, tmp_path: Path) -> None:
+    with caplog.at_level(logging.DEBUG, logger="codekg.bulk_export"):
+        export_repositories([_repo()], tmp_path)
+
+    assert "codekg_bulk_export_started" in caplog.text
+    assert "codekg_bulk_export_graph_built" in caplog.text
+    assert '"duration_ms":' in caplog.text
 
 
 def _local_receiver_repo() -> RepositoryIR:
@@ -206,6 +224,62 @@ def test_repeated_identical_imports_are_exported_once(tmp_path: Path) -> None:
 
     assert len(rows) == 2
     assert exported.counts["relationships_IMPORTS"] == 1
+
+
+def test_diagnostics_are_generated_once_per_repository_and_attached_to_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import codekg.bulk_export as bulk_export
+
+    repo = RepositoryIR(
+        repo_name="broken",
+        commit="abc",
+        root_path="/repos/broken",
+        files=(
+            FileIR(
+                path="first.py",
+                language="python",
+                loc=1,
+                module_qname="first",
+                parse_status="error",
+                diagnostics=(ParseDiagnosticIR("syntax_error", "error", 1, 1, "first"),),
+            ),
+            FileIR(
+                path="second.py",
+                language="python",
+                loc=1,
+                module_qname="second",
+                parse_status="error",
+                diagnostics=(ParseDiagnosticIR("syntax_error", "error", 1, 1, "second"),),
+            ),
+        ),
+    )
+    original = bulk_export._diagnostic_rows
+    calls = 0
+
+    def diagnostic_rows_once(value: RepositoryIR) -> list[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        return original(value)
+
+    monkeypatch.setattr(bulk_export, "_diagnostic_rows", diagnostic_rows_once)
+    exported = export_repositories([repo], tmp_path / "export")
+
+    assert calls == 1
+    with exported.node_files["ParseDiagnostic"].open(newline="", encoding="utf-8") as handle:
+        diagnostic_rows = list(csv.DictReader(handle))
+    with exported.relationship_files["HAS_DIAGNOSTIC"].open(newline="", encoding="utf-8") as handle:
+        relationships = list(csv.DictReader(handle))
+    assert [row["message"] for row in diagnostic_rows] == ["first", "second"]
+    assert {(row[":START_ID(CodeKG)"], row[":END_ID(CodeKG)"]) for row in relationships} == {
+        ("broken@abc:first.py", row["key:ID(CodeKG)"])
+        for row in diagnostic_rows
+        if row["message"] == "first"
+    } | {
+        ("broken@abc:second.py", row["key:ID(CodeKG)"])
+        for row in diagnostic_rows
+        if row["message"] == "second"
+    }
 
 
 def test_duplicate_import_keys_with_different_aliases_are_rejected(tmp_path: Path) -> None:

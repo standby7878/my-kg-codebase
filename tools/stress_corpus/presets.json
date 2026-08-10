@@ -1,0 +1,46 @@
+{
+  "small": {
+    "packages": 2,
+    "modules_per_package": 3,
+    "classes_per_module": 2,
+    "functions_per_module": 3,
+    "methods_per_class": 2,
+    "syntax_error_modules": 1,
+    "large_modules": 0,
+    "large_module_bytes": 0,
+    "seed": 1729
+  },
+  "medium": {
+    "packages": 12,
+    "modules_per_package": 16,
+    "classes_per_module": 4,
+    "functions_per_module": 8,
+    "methods_per_class": 4,
+    "syntax_error_modules": 2,
+    "large_modules": 1,
+    "large_module_bytes": 1048576,
+    "seed": 1729
+  },
+  "large": {
+    "packages": 40,
+    "modules_per_package": 50,
+    "classes_per_module": 5,
+    "functions_per_module": 10,
+    "methods_per_class": 5,
+    "syntax_error_modules": 8,
+    "large_modules": 4,
+    "large_module_bytes": 8388608,
+    "seed": 1729
+  },
+  "huge": {
+    "packages": 100,
+    "modules_per_package": 100,
+    "classes_per_module": 6,
+    "functions_per_module": 12,
+    "methods_per_class": 6,
+    "syntax_error_modules": 20,
+    "large_modules": 10,
+    "large_module_bytes": 33554432,
+    "seed": 1729
+  }
+}

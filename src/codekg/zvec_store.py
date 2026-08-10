@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from itertools import islice
 from pathlib import Path
 from typing import Any
+
+from codekg.logging_config import debug_event
 
 DEFAULT_ZVEC_PATH = "/data/zvec/codekg"
 COLLECTION_NAME = "codekg"
 ZVEC_MAX_WRITE_BATCH_SIZE = 1024
+logger = logging.getLogger(__name__)
 
 
 class ZvecUnavailableError(RuntimeError):
@@ -65,9 +71,11 @@ def ensure_collection(path: str | None = None):
     collection_path = Path(path or default_path())
     option = zvec.CollectionOption(read_only=False, enable_mmap=True)
     if collection_path.exists():
+        debug_event(logger, "zvec_collection_opening", exists=True)
         return zvec.open(str(collection_path), option=option)
 
     collection_path.parent.mkdir(parents=True, exist_ok=True)
+    debug_event(logger, "zvec_collection_creating")
     return zvec.create_and_open(path=str(collection_path), schema=_schema(zvec), option=option)
 
 
@@ -77,6 +85,7 @@ def open_write(path: str | None = None):
 
 def open_read(path: str | None = None):
     zvec = _zvec()
+    debug_event(logger, "zvec_collection_opening", read_only=True)
     return zvec.open(
         path or default_path(),
         option=zvec.CollectionOption(read_only=True, enable_mmap=True),
@@ -84,7 +93,9 @@ def open_read(path: str | None = None):
 
 
 def delete_repo(collection, repo: str) -> None:
+    debug_event(logger, "zvec_repository_delete_started")
     collection.delete_by_filter(f"repo = '{_filter_string(repo)}'")
+    debug_event(logger, "zvec_repository_delete_completed")
 
 
 def delete_repo_records(repo: str, *, zvec_path: str | None = None) -> None:
@@ -98,8 +109,10 @@ def delete_repo_records(repo: str, *, zvec_path: str | None = None) -> None:
 def optimize_and_flush(collection) -> None:
     """Publish scalar and FTS mutations for a separate read-only process."""
 
+    debug_event(logger, "zvec_flush_started")
     collection.optimize()
     collection.flush()
+    debug_event(logger, "zvec_flush_completed")
 
 
 def delete_keys(collection, keys: set[str]) -> None:
@@ -108,37 +121,39 @@ def delete_keys(collection, keys: set[str]) -> None:
         collection.delete_by_filter(f"key in ({quoted})")
 
 
-def upsert_symbol_docs(collection, docs: list[SymbolDoc]) -> int:
+def upsert_symbol_docs(collection, docs: Iterable[SymbolDoc]) -> int:
     zvec = _zvec()
-    rows = [
-        zvec.Doc(
-            id=doc_id_for_key(doc.key),
-            fields={
-                "key": doc.key,
-                "repo": doc.repo,
-                "commit": doc.commit,
-                "path": doc.path,
-                "qname": doc.qname,
-                "kind": doc.kind,
-                "signature": doc.signature,
-                "start_line": int(doc.start_line),
-                "end_line": int(doc.end_line),
-                "text": doc.text,
-            },
-        )
-        for doc in docs
-    ]
-    if not rows:
-        return 0
     total = 0
-    for batch in _batches(rows, ZVEC_MAX_WRITE_BATCH_SIZE):
-        statuses = collection.upsert(batch)
+    for docs_batch in _iter_batches(docs, ZVEC_MAX_WRITE_BATCH_SIZE):
+        debug_event(logger, "zvec_upsert_batch_started", documents=len(docs_batch))
+        rows = [
+            zvec.Doc(
+                id=doc_id_for_key(doc.key),
+                fields={
+                    "key": doc.key,
+                    "repo": doc.repo,
+                    "commit": doc.commit,
+                    "path": doc.path,
+                    "qname": doc.qname,
+                    "kind": doc.kind,
+                    "signature": doc.signature,
+                    "start_line": int(doc.start_line),
+                    "end_line": int(doc.end_line),
+                    "text": doc.text,
+                },
+            )
+            for doc in docs_batch
+        ]
+        statuses = collection.upsert(rows)
         if not isinstance(statuses, list):
             statuses = [statuses]
         failed = [status for status in statuses if not status.ok()]
         if failed:
+            debug_event(logger, "zvec_upsert_batch_failed", documents=len(rows), failed=len(failed))
             raise RuntimeError(f"zvec upsert failed for {len(failed)} description record(s)")
-        total += len(batch)
+        total += len(rows)
+        debug_event(logger, "zvec_upsert_batch_completed", documents=len(rows), total=total)
+    debug_event(logger, "zvec_upsert_completed", documents=total)
     return total
 
 
@@ -260,6 +275,12 @@ def _filter_string(value: str) -> str:
 
 def _batches(values: list[str], size: int) -> list[list[str]]:
     return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def _iter_batches(values: Iterable[SymbolDoc], size: int) -> Iterator[list[SymbolDoc]]:
+    iterator = iter(values)
+    while batch := list(islice(iterator, size)):
+        yield batch
 
 
 def _doc_fields(doc) -> dict[str, Any]:

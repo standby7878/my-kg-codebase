@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import tempfile
+import time
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -25,6 +27,9 @@ from codekg.loader import (
     _resolved_call_rows,
     _symbol_key,
 )
+from codekg.logging_config import debug_event
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -162,7 +167,32 @@ _REL_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
 
 def export_repositories(repositories: Iterable[RepositoryIR], output_dir: Path) -> BulkExport:
     """Export snapshots and publish a JSON manifest after validation."""
-    graph = _build_graph(tuple(repositories))
+    repository_snapshots = tuple(repositories)
+    started = time.perf_counter()
+    debug_event(
+        logger,
+        "bulk_export_started",
+        repositories=len(repository_snapshots),
+    )
+    try:
+        graph = _build_graph(repository_snapshots)
+    except Exception as exc:
+        debug_event(
+            logger,
+            "bulk_export_graph_failed",
+            repositories=len(repository_snapshots),
+            error_type=type(exc).__name__,
+            duration_ms=round((time.perf_counter() - started) * 1000, 2),
+        )
+        raise
+    debug_event(
+        logger,
+        "bulk_export_graph_built",
+        repositories=graph["counts"].get("repositories", 0),
+        nodes=graph["counts"].get("nodes", 0),
+        relationships=graph["counts"].get("relationships", 0),
+        duration_ms=round((time.perf_counter() - started) * 1000, 2),
+    )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     node_files = {label: output_dir / f"nodes_{label}.csv" for label in sorted(graph["nodes"])}
@@ -170,8 +200,10 @@ def export_repositories(repositories: Iterable[RepositoryIR], output_dir: Path) 
         kind: output_dir / f"relationships_{kind}.csv" for kind in sorted(graph["relationships"])
     }
     for label, rows in graph["nodes"].items():
+        debug_event(logger, "bulk_export_node_file", label=label, rows=len(rows))
         _write_csv(node_files[label], _NODE_COLUMNS[label], rows, label)
     for kind, rows in graph["relationships"].items():
+        debug_event(logger, "bulk_export_relationship_file", kind=kind, rows=len(rows))
         _write_csv(relationship_files[kind], _REL_COLUMNS[kind], rows, kind)
     manifest = {
         "version": 1,
@@ -196,12 +228,20 @@ def export_repositories(repositories: Iterable[RepositoryIR], output_dir: Path) 
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
-    return BulkExport(manifest_path, output_dir, node_files, relationship_files, graph["counts"])
+    result = BulkExport(manifest_path, output_dir, node_files, relationship_files, graph["counts"])
+    debug_event(
+        logger,
+        "bulk_export_completed",
+        nodes=graph["counts"].get("nodes", 0),
+        relationships=graph["counts"].get("relationships", 0),
+    )
+    return result
 
 
 def load_bulk_export(manifest_path: Path) -> BulkExport:
     """Load a previously published export manifest."""
     manifest_path = Path(manifest_path)
+    debug_event(logger, "bulk_export_manifest_load_started")
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
     output_dir = Path(data["output_dir"])
     if not output_dir.is_absolute():
@@ -210,7 +250,14 @@ def load_bulk_export(manifest_path: Path) -> BulkExport:
     relationship_files = {
         kind: output_dir / entry["file"] for kind, entry in data["relationships"].items()
     }
-    return BulkExport(manifest_path, output_dir, node_files, relationship_files, data["counts"])
+    result = BulkExport(manifest_path, output_dir, node_files, relationship_files, data["counts"])
+    debug_event(
+        logger,
+        "bulk_export_manifest_load_completed",
+        node_files=len(node_files),
+        relationship_files=len(relationship_files),
+    )
+    return result
 
 
 def _build_graph(repositories: tuple[RepositoryIR, ...]) -> dict[str, Any]:
@@ -269,6 +316,9 @@ def _build_graph(repositories: tuple[RepositoryIR, ...]) -> dict[str, Any]:
         type_rows: list[dict[str, Any]] = []
         callable_rows: list[dict[str, Any]] = []
         owner_rows: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        diagnostics_by_file: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+        for diagnostic in _diagnostic_rows(repo):
+            diagnostics_by_file[str(diagnostic["file_key"])].append(diagnostic)
         for file in repo.files:
             f = _file_row(repo, file)
             node("File", f)
@@ -281,16 +331,15 @@ def _build_graph(repositories: tuple[RepositoryIR, ...]) -> dict[str, Any]:
             }
             node("Module", m)
             rel("DEFINES", f["key"], m["key"], {}, f"{m['key']}:defines")
-            for diagnostic in _diagnostic_rows(repo):
-                if diagnostic["file_key"] == f["key"]:
-                    node("ParseDiagnostic", diagnostic)
-                    rel(
-                        "HAS_DIAGNOSTIC",
-                        f["key"],
-                        diagnostic["key"],
-                        {},
-                        f"{diagnostic['key']}:has",
-                    )
+            for diagnostic in diagnostics_by_file[f["key"]]:
+                node("ParseDiagnostic", diagnostic)
+                rel(
+                    "HAS_DIAGNOSTIC",
+                    f["key"],
+                    diagnostic["key"],
+                    {},
+                    f"{diagnostic['key']}:has",
+                )
             if file.module_init:
                 init = _module_init_row(repo, file)
                 node("ModuleInit", init)

@@ -12,6 +12,7 @@ from fastmcp import FastMCP
 from fastmcp.tools.tool import ToolResult
 from pydantic import Field
 
+from codekg.logging_config import configure_logging, debug_event
 from codekg.queries.code import discover_symbols as query_discover_symbols
 from codekg.queries.code import (
     find_callees as query_find_callees,
@@ -56,8 +57,6 @@ class SearchScope(StrEnum):
 
 
 logger = logging.getLogger(__name__)
-_LOG_LEVEL = os.getenv("CODEKG_LOG_LEVEL", "INFO").upper()
-logger.setLevel(getattr(logging, _LOG_LEVEL, logging.INFO))
 
 _WRAPPED_LIST_OUTPUT_SCHEMA = {
     "description": "Generic wrapper for non-object return types.",
@@ -598,7 +597,9 @@ def get_complexity(
 
 
 def main() -> None:
+    configure_logging()
     transport = os.getenv("MCP_TRANSPORT", "stdio")
+    debug_event(logger, "mcp_started", transport=transport)
     if transport == "http":
         mcp.run(
             transport="http",

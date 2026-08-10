@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import gc
+import logging
 from pathlib import Path
 
 import pytest
 
-from codekg.ingest import index_repository, scan_repository
+from codekg.ingest import (
+    _content_hash,
+    _iter_source_files,
+    _scan_file,
+    index_repository,
+    iter_markdown_files,
+    scan_repository,
+)
 from codekg.ir import FileIR, RepositoryIR, SymbolIR
 from codekg.search_index import callable_docs_from_repository
 from codekg.zvec_store import fetch_symbol_docs, open_write, upsert_symbol_docs
@@ -92,6 +100,27 @@ def test_scan_repository_extracts_python_symbols(tmp_path: Path) -> None:
     ] == [("worker.build", "worker", "call", "Worker", False)]
 
 
+def test_scan_logs_aggregate_file_and_repository_lifecycle(caplog, tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "worker.py").write_text(
+        'import os\n\ndef build():\n    """private documentation"""\n    return os.getcwd()\n',
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="codekg.ingest"):
+        scan_repository(repo_root)
+
+    assert "codekg_scan_started" in caplog.text
+    assert "codekg_scan_file" in caplog.text
+    assert "codekg_scan_completed" in caplog.text
+    assert '"imports": 1' in caplog.text
+    assert '"functions": 1' in caplog.text
+    assert '"calls": 1' in caplog.text
+    assert "private documentation" not in caplog.text
+    assert "os.getcwd()" not in caplog.text
+
+
 def test_scan_repository_extracts_docstrings_and_markdown_descriptions(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -114,6 +143,24 @@ def test_scan_repository_extracts_docstrings_and_markdown_descriptions(tmp_path:
     assert not hasattr(repo, "docs")
 
 
+def test_scan_repository_keeps_markdown_descriptions_in_lexical_path_order(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "worker.py").write_text("def build():\n    return 1\n", encoding="utf-8")
+    (repo_root / "a").mkdir()
+    (repo_root / "a.md").write_text("Top-level worker.build description.", encoding="utf-8")
+    (repo_root / "a" / "note.md").write_text("Nested worker.build description.", encoding="utf-8")
+
+    repo = scan_repository(repo_root)
+
+    assert repo.markdown_descriptions["worker.build"] == (
+        "Top-level worker.build description.",
+        "Nested worker.build description.",
+    )
+
+
 def test_scan_repository_excludes_virtual_environment_directories(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -129,6 +176,48 @@ def test_scan_repository_excludes_virtual_environment_directories(tmp_path: Path
     assert repo.markdown_descriptions == {}
 
 
+def test_repository_file_walkers_prune_skipped_directories_and_are_deterministic(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    (root / "a" / "nested").mkdir(parents=True)
+    (root / "z").mkdir()
+    (root / "node_modules" / "package").mkdir(parents=True)
+    (root / "a" / "nested" / "worker.py").write_text("pass\n", encoding="utf-8")
+    (root / "a" / "README.md").write_text("# A\n", encoding="utf-8")
+    (root / "z" / "last.py").write_text("pass\n", encoding="utf-8")
+    (root / "node_modules" / "package" / "ignored.py").write_text("pass\n", encoding="utf-8")
+    (root / "node_modules" / "package" / "README.md").write_text("# ignored\n", encoding="utf-8")
+    (root / "linked.py").symlink_to(root / "z" / "last.py")
+    (root / "linked-directory").symlink_to(root / "a", target_is_directory=True)
+
+    source_paths = [path.relative_to(root).as_posix() for path in _iter_source_files(root)]
+    markdown_paths = [path.relative_to(root).as_posix() for path in iter_markdown_files(root)]
+
+    assert source_paths == ["a/nested/worker.py", "linked.py", "z/last.py"]
+    assert markdown_paths == ["a/README.md"]
+    assert source_paths == [path.relative_to(root).as_posix() for path in _iter_source_files(root)]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_loc"),
+    [
+        ("", 0),
+        ("pass", 1),
+        ("pass\n", 1),
+        ("pass\n\n", 2),
+        ("pass\nnext", 2),
+    ],
+)
+def test_scan_file_counts_lines_without_allocating_line_list(
+    tmp_path: Path, text: str, expected_loc: int
+) -> None:
+    path = tmp_path / "module.py"
+    path.write_text(text, encoding="utf-8")
+
+    assert _scan_file(tmp_path, path).loc == expected_loc
+
+
 def test_scan_repository_content_hash_includes_markdown(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -141,6 +230,21 @@ def test_scan_repository_content_hash_includes_markdown(tmp_path: Path) -> None:
     second = scan_repository(repo_root).commit
 
     assert first != second
+
+
+def test_content_hash_ignores_skipped_files_and_is_stable_for_walk_order(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    (root / "z").mkdir(parents=True)
+    (root / "a").mkdir()
+    (root / "node_modules").mkdir()
+    (root / "z" / "worker.py").write_text("def worker():\n    pass\n", encoding="utf-8")
+    (root / "a" / "README.md").write_text("# Usage\n", encoding="utf-8")
+    (root / "node_modules" / "ignored.py").write_text("raise RuntimeError\n", encoding="utf-8")
+
+    first = _content_hash(root)
+    (root / "node_modules" / "ignored.py").write_text("raise ValueError\n", encoding="utf-8")
+
+    assert _content_hash(root) == first
 
 
 def test_scan_repository_resolves_relative_imports_and_nested_function_qnames(

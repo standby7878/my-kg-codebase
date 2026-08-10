@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import logging
+import os
 import subprocess
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -20,6 +23,7 @@ from codekg.ir import (
     SymbolIR,
 )
 from codekg.loader import load_repository
+from codekg.logging_config import debug_event
 from codekg.neo4j_client import Neo4jClient, get_client
 from codekg.search_index import (
     callable_docs_from_repository,
@@ -27,6 +31,8 @@ from codekg.search_index import (
     validate_search_index_consistency,
 )
 from codekg.zvec_store import delete_repo, open_write, optimize_and_flush, upsert_symbol_docs
+
+logger = logging.getLogger(__name__)
 
 LANGUAGES_BY_SUFFIX = {
     ".py": "python",
@@ -603,7 +609,16 @@ def index_repository(
 ) -> dict[str, int | str]:
     """Replace a repository graph and its one-per-callable descriptions."""
 
+    started = time.perf_counter()
+    debug_event(logger, "index_started", replace=replace)
     repo = scan_repository(path)
+    debug_event(
+        logger,
+        "index_scanned",
+        files=len(repo.files),
+        markdown_descriptions=len(repo.markdown_descriptions),
+        duration_ms=_duration_ms(started),
+    )
     db = client or get_client()
     collection = open_write(zvec_path)
     replaced_keys = (
@@ -615,11 +630,22 @@ def index_repository(
         # Remove stale search hits before the corresponding graph nodes disappear.
         delete_repo(collection, repo.repo_name)
         optimize_and_flush(collection)
+        debug_event(logger, "index_zvec_snapshot_removed", replaced_keys=len(replaced_keys))
 
     result = load_repository(repo, replace=replace, client=db)
+    debug_event(
+        logger,
+        "index_graph_loaded",
+        files=len(repo.files),
+        batches=result.get("batches", 0),
+        duration_ms=_duration_ms(started),
+    )
     descriptions = callable_docs_from_repository(repo)
     indexed = upsert_symbol_docs(collection, descriptions)
     optimize_and_flush(collection)
+    debug_event(
+        logger, "index_zvec_loaded", descriptions=indexed, duration_ms=_duration_ms(started)
+    )
     live_graph_keys = {
         str(row["key"]) for row in iter_callable_rows(repo=repo.repo_name, client=db)
     }
@@ -630,6 +656,15 @@ def index_repository(
         collection=collection,
     )
     if not consistency["ok"]:
+        debug_event(
+            logger,
+            "index_consistency_failed",
+            **{
+                key: len(value)
+                for key, value in consistency.items()
+                if isinstance(value, (list, set, tuple))
+            },
+        )
         raise RuntimeError(
             "zvec description index is inconsistent after ingest: "
             f"missing_in_graph={consistency['missing_in_graph']}, "
@@ -637,13 +672,22 @@ def index_repository(
             f"missing={consistency['missing_in_zvec']}, "
             f"stale_after_replace={consistency['stale_after_replace']}"
         )
-    return {
+    response = {
         "repo_name": repo.repo_name,
         "commit": repo.commit,
         "files": len(repo.files),
         "descriptions": indexed,
         **result,
     }
+    debug_event(
+        logger,
+        "index_completed",
+        files=len(repo.files),
+        descriptions=indexed,
+        nodes=result["nodes"],
+        duration_ms=_duration_ms(started),
+    )
+    return response
 
 
 def scan_repository(path: Path) -> RepositoryIR:
@@ -651,6 +695,8 @@ def scan_repository(path: Path) -> RepositoryIR:
     if not root.is_dir():
         raise ValueError(f"Repository path does not exist or is not a directory: {path}")
 
+    started = time.perf_counter()
+    debug_event(logger, "scan_started")
     repo_name = root.name
     commit = _git_commit(root) or _content_hash(root)
     files = tuple(_scan_file(root, file_path) for file_path in _iter_source_files(root))
@@ -661,38 +707,69 @@ def scan_repository(path: Path) -> RepositoryIR:
         if symbol.kind in {"function", "method"}
     }
     markdown_descriptions = resolve_markdown_descriptions(
-        iter_markdown_files(root), callable_qnames
+        # Markdown descriptions are ordered enrichment.  The streaming DFS
+        # walker intentionally does not reproduce Path.rglob's global lexical
+        # order, so materialize only this much smaller input set here to retain
+        # the legacy description precedence.
+        sorted(iter_markdown_files(root), key=lambda markdown_path: markdown_path.as_posix()),
+        callable_qnames,
     )
-    return RepositoryIR(
+    repository = RepositoryIR(
         repo_name=repo_name,
         commit=commit,
         root_path=str(root),
         files=files,
         markdown_descriptions=markdown_descriptions,
     )
+    debug_event(
+        logger,
+        "scan_completed",
+        files=len(files),
+        imports=sum(len(file.imports) for file in files),
+        functions=sum(symbol.kind == "function" for file in files for symbol in file.symbols),
+        methods=sum(symbol.kind == "method" for file in files for symbol in file.symbols),
+        types=sum(symbol.kind == "type" for file in files for symbol in file.symbols),
+        calls=sum(len(file.calls) for file in files),
+        diagnostics=sum(len(file.diagnostics) for file in files),
+        markdown_descriptions=len(markdown_descriptions),
+        duration_ms=_duration_ms(started),
+    )
+    return repository
 
 
 def _iter_source_files(root: Path) -> Iterable[Path]:
-    for path in sorted(root.rglob("*")):
-        if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
-            continue
-        if path.is_file() and path.suffix.lower() in LANGUAGES_BY_SUFFIX:
-            yield path
+    yield from _iter_files(root, LANGUAGES_BY_SUFFIX)
 
 
 def iter_markdown_files(root: Path) -> Iterable[Path]:
-    for path in sorted(root.rglob("*")):
-        if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
-            continue
-        if path.is_file() and path.suffix.lower() == ".md":
+    yield from _iter_files(root, {".md"})
+
+
+def _iter_files(root: Path, suffixes: Iterable[str]) -> Iterable[Path]:
+    """Yield matching repository files in deterministic order without a full walk."""
+    allowed_suffixes = frozenset(suffixes)
+    stack: list[tuple[bool, Path]] = [(True, root)]
+    while stack:
+        is_directory, path = stack.pop()
+        if not is_directory:
             yield path
+            continue
+        with os.scandir(path) as entries:
+            for entry in sorted(entries, key=lambda item: item.name, reverse=True):
+                entry_path = Path(entry.path)
+                if entry.is_dir(follow_symlinks=False):
+                    if entry.name not in SKIP_DIRS:
+                        stack.append((True, entry_path))
+                elif entry.is_file() and entry_path.suffix.lower() in allowed_suffixes:
+                    stack.append((False, entry_path))
 
 
 def _scan_file(root: Path, path: Path) -> FileIR:
+    started = time.perf_counter()
     rel_path = path.relative_to(root).as_posix()
     language = LANGUAGES_BY_SUFFIX[path.suffix.lower()]
     text = path.read_text(encoding="utf-8", errors="replace")
-    loc = len(text.splitlines())
+    loc = text.count("\n") + int(bool(text) and not text.endswith("\n"))
     module_qname = _module_qname(rel_path, repository_name=root.name)
     if language != "python":
         return FileIR(path=rel_path, language=language, loc=loc, module_qname=module_qname)
@@ -705,6 +782,16 @@ def _scan_file(root: Path, path: Path) -> FileIR:
     try:
         tree = ast.parse(text, filename=rel_path)
     except SyntaxError as error:
+        debug_event(
+            logger,
+            "scan_file",
+            path=rel_path,
+            language=language,
+            loc=loc,
+            parse_status="error",
+            diagnostics=1,
+            duration_ms=_duration_ms(started),
+        )
         return FileIR(
             path=rel_path,
             language=language,
@@ -725,7 +812,7 @@ def _scan_file(root: Path, path: Path) -> FileIR:
 
     extractor = _PythonExtractor(rel_path, module_qname, text)
     extractor.visit(tree)
-    return FileIR(
+    file = FileIR(
         path=rel_path,
         language=language,
         loc=loc,
@@ -737,6 +824,63 @@ def _scan_file(root: Path, path: Path) -> FileIR:
         calls=extractor.call_sites(),
         local_bindings=extractor.ordered_local_bindings(),
     )
+    for import_ir in file.imports:
+        debug_event(
+            logger,
+            "scan_import",
+            path=rel_path,
+            module=import_ir.module,
+            name=import_ir.name,
+            aliased=import_ir.alias is not None,
+        )
+    for symbol in file.symbols:
+        debug_event(
+            logger,
+            "scan_symbol",
+            path=rel_path,
+            kind=symbol.kind,
+            qname=symbol.qname,
+            start_line=symbol.start_line,
+            end_line=symbol.end_line,
+        )
+    for call in file.calls:
+        debug_event(
+            logger,
+            "scan_call",
+            path=rel_path,
+            owner_qname=call.owner_qname,
+            receiver_kind=call.receiver_kind,
+            start_line=call.start_line,
+        )
+    for diagnostic in file.diagnostics:
+        debug_event(
+            logger,
+            "scan_diagnostic",
+            path=rel_path,
+            category=diagnostic.category,
+            severity=diagnostic.severity,
+            line=diagnostic.line,
+        )
+    debug_event(
+        logger,
+        "scan_file",
+        language=language,
+        loc=loc,
+        parse_status="ok",
+        imports=len(file.imports),
+        functions=sum(symbol.kind == "function" for symbol in file.symbols),
+        methods=sum(symbol.kind == "method" for symbol in file.symbols),
+        types=sum(symbol.kind == "type" for symbol in file.symbols),
+        calls=len(file.calls),
+        diagnostics=len(file.diagnostics),
+        path=rel_path,
+        duration_ms=_duration_ms(started),
+    )
+    return file
+
+
+def _duration_ms(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000, 2)
 
 
 def _module_qname(rel_path: str, *, repository_name: str | None = None) -> str:

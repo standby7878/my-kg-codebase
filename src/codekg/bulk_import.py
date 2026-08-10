@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from codekg.logging_config import debug_event
+
+logger = logging.getLogger(__name__)
 
 
 class BulkImportError(ValueError):
@@ -77,6 +82,7 @@ def run_bulk_import(
 ) -> BulkImportResult:
     """Load, validate, and execute an offline Neo4j database import."""
 
+    debug_event(logger, "bulk_import_started", database=database)
     path = Path(manifest_path)
     if not path.exists() or not path.is_file():
         raise BulkImportError(f"bulk export manifest does not exist: {path}")
@@ -88,6 +94,12 @@ def run_bulk_import(
     except Exception as exc:
         raise BulkImportError(f"invalid bulk export manifest: {path}: {exc}") from exc
 
+    debug_event(
+        logger,
+        "bulk_import_command_built",
+        node_files=len(getattr(export, "node_files", {})),
+        relationship_files=len(getattr(export, "relationship_files", {})),
+    )
     try:
         completed = runner(command, check=False, capture_output=True, text=True)
     except OSError as exc:
@@ -97,9 +109,12 @@ def run_bulk_import(
     stderr = _output_text(getattr(completed, "stderr", ""))
     returncode = int(getattr(completed, "returncode", 0))
     if returncode:
+        debug_event(logger, "bulk_import_failed", returncode=returncode)
         detail = stderr.strip() or "no stderr output"
         raise BulkImportError(f"neo4j-admin import failed with exit code {returncode}: {detail}")
-    return BulkImportResult(command, returncode, stdout, stderr)
+    result = BulkImportResult(command, returncode, stdout, stderr)
+    debug_event(logger, "bulk_import_completed", returncode=returncode)
+    return result
 
 
 def _file_arguments(export: Any, attribute: str, kind: str) -> list[tuple[str, str]]:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 from codekg.ir import RepositoryIR, SymbolIR
@@ -12,32 +12,34 @@ from codekg.zvec_store import SymbolDoc, fetch_symbol_docs
 NAME_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|[_\W]+")
 
 
-def callable_docs_from_repository(repo: RepositoryIR) -> list[SymbolDoc]:
-    """Build the one-per-callable zvec descriptions from the immutable IR."""
+def iter_callable_docs_from_repository(repo: RepositoryIR) -> Iterator[SymbolDoc]:
+    """Yield one zvec description per callable in deterministic IR order."""
 
-    docs: list[SymbolDoc] = []
     for file in repo.files:
         for symbol in file.symbols:
             if not _is_searchable_callable(symbol):
                 continue
-            docs.append(
-                SymbolDoc(
-                    key=symbol_key(repo, file.path, symbol.qname, symbol.start_line),
-                    repo=repo.repo_name,
-                    commit=repo.commit,
-                    path=file.path,
-                    qname=symbol.qname,
-                    kind=symbol.kind,
-                    signature=symbol.signature,
-                    start_line=symbol.start_line,
-                    end_line=symbol.end_line,
-                    text=build_symbol_text(
-                        symbol,
-                        repo.markdown_descriptions.get(symbol.qname, ()),
-                    ),
-                )
+            yield SymbolDoc(
+                key=symbol_key(repo, file.path, symbol.qname, symbol.start_line),
+                repo=repo.repo_name,
+                commit=repo.commit,
+                path=file.path,
+                qname=symbol.qname,
+                kind=symbol.kind,
+                signature=symbol.signature,
+                start_line=symbol.start_line,
+                end_line=symbol.end_line,
+                text=build_symbol_text(
+                    symbol,
+                    repo.markdown_descriptions.get(symbol.qname, ()),
+                ),
             )
-    return docs
+
+
+def callable_docs_from_repository(repo: RepositoryIR) -> list[SymbolDoc]:
+    """Build the one-per-callable zvec descriptions from the immutable IR."""
+
+    return list(iter_callable_docs_from_repository(repo))
 
 
 def validate_search_index_consistency(

@@ -142,6 +142,18 @@ path:
 bash run-compose.sh dev-local index-sources --mode bulk
 ```
 
+#### Measure bulk-ingestion changes
+
+For a like-for-like ingestion benchmark, record the synchronized corpus
+revision, machine, container image, and the CSV manifest before comparing
+runs. Run one warm-up and at least three measured runs of the same bulk
+workflow, then compare median wall-clock time and peak RSS. The `bulk-export`
+and `bulk-zvec` CLI results include additive timing fields and
+`peak_rss_kib`; the latter is the Linux process high-water mark, not a
+container-wide measurement. Verify graph semantics by comparing CSV headers,
+manifest counts, node keys, relationship identities, and callable document
+keys/text. Byte-for-byte CSV equality is optional.
+
 The active graph, zvec, and log volume names are recorded in the ignored
 `compose/dev-local/runtime.env` pointer file. The matching CSV-staging volume
 uses the same generation suffix. This makes the bulk CSVs available for

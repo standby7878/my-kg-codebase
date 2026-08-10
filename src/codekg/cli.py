@@ -1,18 +1,27 @@
 from __future__ import annotations
 
+import logging
+import resource
+import time
+from itertools import chain
 from pathlib import Path
 from typing import Annotated
 
 import typer
 from rich.console import Console
 
+from codekg.logging_config import configure_logging, debug_event
+
 app = typer.Typer(help="Operate the offline code knowledge graph.")
 console = Console()
+logger = logging.getLogger(__name__)
 
 
 @app.callback()
 def main() -> None:
     """CodeKG command line interface."""
+    configure_logging()
+    debug_event(logger, "cli_started")
 
 
 @app.command()
@@ -21,7 +30,9 @@ def bootstrap() -> None:
 
     from codekg.schema.bootstrap import bootstrap_schema
 
+    debug_event(logger, "cli_command_started", command="bootstrap")
     bootstrap_schema()
+    debug_event(logger, "cli_command_completed", command="bootstrap")
     console.print("[green]CodeKG schema bootstrap complete[/green]")
 
 
@@ -31,7 +42,9 @@ def index_repo(path: Path) -> None:
 
     from codekg.ingest import index_repository
 
+    debug_event(logger, "cli_command_started", command="index")
     result = index_repository(path, replace=True)
+    debug_event(logger, "cli_command_completed", command="index", files=result.get("files", 0))
     console.print(result)
 
 
@@ -41,7 +54,9 @@ def reindex_repo(path: Path) -> None:
 
     from codekg.ingest import index_repository
 
+    debug_event(logger, "cli_command_started", command="reindex")
     result = index_repository(path, replace=True)
+    debug_event(logger, "cli_command_completed", command="reindex", files=result.get("files", 0))
     console.print(result)
 
 
@@ -61,8 +76,10 @@ def index_all(root: Annotated[Path, typer.Argument()] = Path("/repos")) -> None:
         (child for child in root.iterdir() if not child.name.startswith(".") and child.is_dir()),
         key=lambda child: child.name,
     )
+    debug_event(logger, "cli_command_started", command="index-all", repositories=len(children))
     for child in children:
         console.print(index_repository(child, replace=True))
+    debug_event(logger, "cli_command_completed", command="index-all", repositories=len(children))
 
 
 @app.command("list")
@@ -71,8 +88,11 @@ def list_repositories() -> None:
 
     from codekg.queries.repositories import list_repositories as query_repositories
 
-    for row in query_repositories():
+    debug_event(logger, "cli_command_started", command="list")
+    rows = query_repositories()
+    for row in rows:
         console.print(row)
+    debug_event(logger, "cli_command_completed", command="list", repositories=len(rows))
 
 
 @app.command("delete")
@@ -82,9 +102,11 @@ def delete_repository(repo_name: str) -> None:
     from codekg.loader import delete_repository_by_name
     from codekg.zvec_store import delete_repo_records
 
+    debug_event(logger, "cli_command_started", command="delete")
     delete_repo_records(repo_name)
     deleted = delete_repository_by_name(repo_name)
     console.print({"repo_name": repo_name, "deleted": deleted})
+    debug_event(logger, "cli_command_completed", command="delete", deleted=deleted)
 
 
 @app.command("evaluate")
@@ -103,6 +125,7 @@ def evaluate(
 
     from codekg.evaluation import run_evaluation, write_report
 
+    debug_event(logger, "cli_command_started", command="evaluate")
     report = run_evaluation(
         manifest.resolve(),
         project_root=project_root.resolve(),
@@ -111,6 +134,7 @@ def evaluate(
     )
     write_report(report, output.resolve())
     console.print(report["summary"])
+    debug_event(logger, "cli_command_completed", command="evaluate")
 
 
 @app.command("bulk-export")
@@ -123,9 +147,25 @@ def bulk_export(
     from codekg.bulk_export import export_repositories
     from codekg.ingest import scan_repository
 
+    debug_event(logger, "cli_command_started", command="bulk-export", repositories=len(paths))
+    started = time.perf_counter()
     repositories = [scan_repository(path) for path in paths]
+    scanned_at = time.perf_counter()
     result = export_repositories(repositories, output)
-    console.print({"manifest": str(result.manifest_path), "counts": dict(result.counts)})
+    finished = time.perf_counter()
+    console.print(
+        {
+            "manifest": str(result.manifest_path),
+            "counts": dict(result.counts),
+            "metrics": {
+                "scan_seconds": round(scanned_at - started, 3),
+                "export_seconds": round(finished - scanned_at, 3),
+                "elapsed_seconds": round(finished - started, 3),
+                "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            },
+        }
+    )
+    debug_event(logger, "cli_command_completed", command="bulk-export", repositories=len(paths))
 
 
 @app.command("bulk-import")
@@ -138,8 +178,12 @@ def bulk_import(
 
     from codekg.bulk_import import run_bulk_import
 
+    debug_event(logger, "cli_command_started", command="bulk-import")
     result = run_bulk_import(manifest, database=database, neo4j_admin=neo4j_admin)
     console.print(result)
+    debug_event(
+        logger, "cli_command_completed", command="bulk-import", returncode=result.returncode
+    )
 
 
 @app.command("bulk-zvec")
@@ -147,17 +191,35 @@ def bulk_zvec(paths: Annotated[list[Path], typer.Argument(min=1)]) -> None:
     """Build the derived zvec index from repository snapshots."""
 
     from codekg.ingest import scan_repository
-    from codekg.search_index import callable_docs_from_repository
+    from codekg.search_index import iter_callable_docs_from_repository
     from codekg.zvec_store import open_write, optimize_and_flush, upsert_symbol_docs
 
+    debug_event(logger, "cli_command_started", command="bulk-zvec", repositories=len(paths))
+    started = time.perf_counter()
     repositories = [scan_repository(path) for path in paths]
-    descriptions = [
-        doc for repository in repositories for doc in callable_docs_from_repository(repository)
-    ]
+    scanned_at = time.perf_counter()
     collection = open_write()
-    document_count = upsert_symbol_docs(collection, descriptions)
+    document_count = upsert_symbol_docs(
+        collection,
+        chain.from_iterable(
+            iter_callable_docs_from_repository(repository) for repository in repositories
+        ),
+    )
     optimize_and_flush(collection)
-    console.print({"repositories": len(paths), "documents": document_count})
+    finished = time.perf_counter()
+    console.print(
+        {
+            "repositories": len(paths),
+            "documents": document_count,
+            "metrics": {
+                "scan_seconds": round(scanned_at - started, 3),
+                "zvec_seconds": round(finished - scanned_at, 3),
+                "elapsed_seconds": round(finished - started, 3),
+                "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            },
+        }
+    )
+    debug_event(logger, "cli_command_completed", command="bulk-zvec", documents=document_count)
 
 
 @app.command("validate-bulk-index")
@@ -172,6 +234,9 @@ def validate_bulk_index(paths: Annotated[list[Path], typer.Argument(min=1)]) -> 
     )
     from codekg.zvec_store import open_write
 
+    debug_event(
+        logger, "cli_command_started", command="validate-bulk-index", repositories=len(paths)
+    )
     repositories = [scan_repository(path) for path in paths]
     descriptions = [
         doc for repository in repositories for doc in callable_docs_from_repository(repository)
@@ -187,5 +252,11 @@ def validate_bulk_index(paths: Annotated[list[Path], typer.Argument(min=1)]) -> 
         collection=open_write(),
     )
     console.print(result)
+    debug_event(
+        logger,
+        "cli_command_completed",
+        command="validate-bulk-index",
+        ok=bool(result["ok"]),
+    )
     if not result["ok"]:
         raise typer.Exit(1)

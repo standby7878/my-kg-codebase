@@ -114,6 +114,10 @@ def test_bulk_export_scans_paths_and_prints_manifest_and_counts(
     assert str(manifest) in result.stdout
     assert "repositories" in result.stdout
     assert "files" in result.stdout
+    assert "scan_seconds" in result.stdout
+    assert "export_seconds" in result.stdout
+    assert "elapsed_seconds" in result.stdout
+    assert "peak_rss_kib" in result.stdout
 
 
 def test_bulk_import_passes_options_and_prints_result(monkeypatch, tmp_path: Path) -> None:
@@ -155,24 +159,25 @@ def test_bulk_zvec_scans_and_indexes_descriptions_without_graph_calls(monkeypatc
         scanned.append(path)
         return f"repository:{path.name}"
 
-    def fake_callable_docs(repository: object) -> list[object]:
+    def fake_iter_callable_docs(repository: object):
         docs_for.append(repository)
-        return [f"doc:{repository}"]
+        yield f"doc:{repository}"
 
     def fake_open_write() -> object:
         return collection
 
-    def fake_upsert_symbol_docs(target: object, docs: list[object]) -> int:
-        upserts.append((target, docs))
-        return len(docs)
+    def fake_upsert_symbol_docs(target: object, docs) -> int:
+        doc_list = list(docs)
+        upserts.append((target, doc_list))
+        return len(doc_list)
 
     def fake_optimize_and_flush(target: object) -> None:
         optimized.append(target)
 
     monkeypatch.setattr("codekg.ingest.scan_repository", fake_scan_repository)
     monkeypatch.setattr(
-        "codekg.search_index.callable_docs_from_repository",
-        fake_callable_docs,
+        "codekg.search_index.iter_callable_docs_from_repository",
+        fake_iter_callable_docs,
     )
     monkeypatch.setattr("codekg.zvec_store.open_write", fake_open_write)
     monkeypatch.setattr("codekg.zvec_store.upsert_symbol_docs", fake_upsert_symbol_docs)

@@ -8,15 +8,19 @@ only from an exact ``CallSite`` resolution in the current snapshot.
 
 from __future__ import annotations
 
+import logging
+import time
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 from typing import Any
 
 from codekg.ir import CallIR, FileIR, RepositoryIR
+from codekg.logging_config import debug_event
 from codekg.neo4j_client import Neo4jClient, get_client
 from codekg.resolver import CallResolution, SymbolRef, resolve_call_sites
 
 DEFAULT_BATCH_SIZE = 1_000
+logger = logging.getLogger(__name__)
 
 
 def load_repository(
@@ -31,10 +35,15 @@ def load_repository(
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
 
+    started = time.perf_counter()
+    debug_event(
+        logger, "loader_started", files=len(repo.files), replace=replace, batch_size=batch_size
+    )
     db = client or get_client()
     batch_count = 0
     if replace:
         delete_repository_by_name(repo.repo_name, client=db)
+        debug_event(logger, "loader_snapshot_removed")
 
     db.execute_write(
         """
@@ -389,7 +398,7 @@ def load_repository(
     )
 
     status_counts = dict(sorted(Counter(str(row["status"]) for row in callsite_rows).items()))
-    return {
+    response = {
         "nodes": (
             1
             + len(file_rows)
@@ -408,6 +417,19 @@ def load_repository(
         "parse_diagnostics": sum(len(file.diagnostics) for file in repo.files),
         "batches": batch_count,
     }
+    debug_event(
+        logger,
+        "loader_completed",
+        files=len(file_rows),
+        types=len(type_rows),
+        callables=len(callable_rows),
+        imports=len(import_rows),
+        call_sites=len(callsite_rows),
+        diagnostics=len(diagnostic_rows),
+        batches=batch_count,
+        duration_ms=round((time.perf_counter() - started) * 1000, 2),
+    )
+    return response
 
 
 def delete_repository_by_name(repo_name: str, client: Neo4jClient | None = None) -> int:
@@ -514,7 +536,16 @@ def _write_batched(
 ) -> int:
     batches = 0
     for batch in _batched(rows, batch_size):
+        started = time.perf_counter()
+        debug_event(logger, "loader_batch_started", operation=operation, rows=len(batch))
         db.execute_write(query, {"rows": batch}, operation=operation)
+        debug_event(
+            logger,
+            "loader_batch_completed",
+            operation=operation,
+            rows=len(batch),
+            duration_ms=round((time.perf_counter() - started) * 1000, 2),
+        )
         batches += 1
     return batches
 

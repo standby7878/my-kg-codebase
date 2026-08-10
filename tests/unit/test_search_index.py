@@ -13,6 +13,7 @@ from codekg.ir import FileIR, RepositoryIR, SymbolIR
 from codekg.search_index import (
     build_symbol_text,
     callable_docs_from_repository,
+    iter_callable_docs_from_repository,
     normalize_name,
     validate_search_index_consistency,
 )
@@ -95,6 +96,42 @@ def test_callable_docs_fold_docstring_and_markdown_into_callable_text() -> None:
     assert "reliable standby" in docs[1].text
 
 
+def test_iter_callable_docs_preserves_legacy_document_order() -> None:
+    repo = RepositoryIR(
+        repo_name="sample",
+        commit="abc",
+        root_path="/repos/sample",
+        files=(
+            FileIR(
+                path="worker.py",
+                language="python",
+                loc=2,
+                module_qname="worker",
+                symbols=(
+                    SymbolIR(
+                        kind="function",
+                        name="first",
+                        qname="worker.first",
+                        signature="def first()",
+                        start_line=1,
+                        end_line=1,
+                    ),
+                    SymbolIR(
+                        kind="class",
+                        name="Ignored",
+                        qname="worker.Ignored",
+                        signature="class Ignored",
+                        start_line=2,
+                        end_line=2,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    assert list(iter_callable_docs_from_repository(repo)) == callable_docs_from_repository(repo)
+
+
 def test_build_symbol_text_never_reparses_comments() -> None:
     text = build_symbol_text(
         {
@@ -135,10 +172,23 @@ def test_upsert_symbol_docs_batches_at_zvec_write_limit(monkeypatch) -> None:
     collection = FakeCollection()
     monkeypatch.setattr(zvec_store, "_zvec", lambda: FakeZvec())
 
-    docs = [_doc(key=f"sample@abc:worker.py:worker_{index}:7") for index in range(1025)]
+    docs = (_doc(key=f"sample@abc:worker.py:worker_{index}:7") for index in range(1025))
 
     assert upsert_symbol_docs(collection, docs) == 1025
     assert collection.batch_sizes == [1024, 1]
+
+
+def test_upsert_symbol_docs_empty_iterable_skips_upsert(monkeypatch) -> None:
+    class FakeZvec:
+        Doc = object
+
+    class FakeCollection:
+        def upsert(self, docs):
+            raise AssertionError("empty input must not be upserted")
+
+    monkeypatch.setattr(zvec_store, "_zvec", lambda: FakeZvec())
+
+    assert upsert_symbol_docs(FakeCollection(), iter(())) == 0
 
 
 def test_real_zvec_fts_and_safe_key_liveness(tmp_path) -> None:

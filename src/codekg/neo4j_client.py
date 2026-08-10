@@ -6,6 +6,7 @@ Neo4j client, reduced to the needs of this Neo4j-only prototype.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from collections.abc import Mapping
@@ -14,9 +15,12 @@ from typing import Any
 from neo4j import GraphDatabase
 from neo4j.exceptions import Neo4jError
 
+from codekg.logging_config import debug_event
+
 DEFAULT_URI = "bolt://neo4j:7687"
 DEFAULT_USERNAME = "neo4j"
 DEFAULT_DATABASE = "neo4j"
+logger = logging.getLogger(__name__)
 
 
 class CodeKGNeo4jError(RuntimeError):
@@ -46,9 +50,17 @@ class Neo4jClient:
         if not self.password:
             raise CodeKGNeo4jError("NEO4J_PASSWORD must be set")
         self._driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
+        debug_event(
+            logger,
+            "neo4j_client_created",
+            database=self.database,
+            timeout_configured=self.transaction_timeout_seconds is not None,
+        )
 
     def verify(self) -> None:
+        debug_event(logger, "neo4j_verify_started", database=self.database)
         self._driver.verify_connectivity()
+        debug_event(logger, "neo4j_verify_completed", database=self.database)
 
     def execute_read(
         self,
@@ -60,6 +72,9 @@ class Neo4jClient:
         timeout_seconds: float | None = None,
     ) -> list[dict[str, Any]]:
         params = dict(params or {})
+        debug_event(
+            logger, "neo4j_read_started", operation=operation or "unnamed", max_rows=max_rows
+        )
         try:
             with self._driver.session(
                 database=self.database,
@@ -79,8 +94,18 @@ class Neo4jClient:
                 timeout = _transaction_timeout(timeout_seconds, self.transaction_timeout_seconds)
                 if timeout is not None:
                     work.timeout = timeout
-                return session.execute_read(work)
+                rows = session.execute_read(work)
+                debug_event(
+                    logger, "neo4j_read_completed", operation=operation or "unnamed", rows=len(rows)
+                )
+                return rows
         except Neo4jError as exc:
+            debug_event(
+                logger,
+                "neo4j_read_failed",
+                operation=operation or "unnamed",
+                error_type=type(exc).__name__,
+            )
             raise _operation_error("read", operation, query, exc) from exc
 
     def execute_write(
@@ -92,6 +117,7 @@ class Neo4jClient:
         timeout_seconds: float | None = None,
     ) -> list[dict[str, Any]]:
         params = dict(params or {})
+        debug_event(logger, "neo4j_write_started", operation=operation or "unnamed")
         try:
             with self._driver.session(database=self.database) as session:
 
@@ -104,11 +130,25 @@ class Neo4jClient:
                 timeout = _transaction_timeout(timeout_seconds, self.transaction_timeout_seconds)
                 if timeout is not None:
                     work.timeout = timeout
-                return session.execute_write(work)
+                rows = session.execute_write(work)
+                debug_event(
+                    logger,
+                    "neo4j_write_completed",
+                    operation=operation or "unnamed",
+                    rows=len(rows),
+                )
+                return rows
         except Neo4jError as exc:
+            debug_event(
+                logger,
+                "neo4j_write_failed",
+                operation=operation or "unnamed",
+                error_type=type(exc).__name__,
+            )
             raise _operation_error("write", operation, query, exc) from exc
 
     def close(self) -> None:
+        debug_event(logger, "neo4j_client_closing", database=self.database)
         self._driver.close()
 
 
@@ -170,5 +210,4 @@ def _operation_error(
     exc: Neo4jError,
 ) -> CodeKGNeo4jError:
     context = operation or "unnamed operation"
-    statement = " ".join(query.split())[:160]
-    return CodeKGNeo4jError(f"Neo4j {mode} failed during {context}: {exc}; query={statement!r}")
+    return CodeKGNeo4jError(f"Neo4j {mode} failed during {context}: {exc}")
