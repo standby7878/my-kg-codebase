@@ -161,6 +161,22 @@ diagnosis without replacing the active generation. Treat generation volumes as
 immutable; inspect or remove them only after confirming that they are not the
 active generation.
 
+For recorded repeatable stress measurements, use the corpus runner rather than
+timing an ad-hoc Compose command:
+
+```bash
+bash tools/stress_corpus/run-ingestion-stress.sh --preset medium --build
+```
+
+Docker with the Compose plugin is required. The runner verifies the corpus and
+preflights Docker, Compose v2, and the local image before every run. It retains
+stdout/stderr/status files on failure, and writes a JSON and Markdown median
+summary that excludes warm-ups and failed runs. A successful bulk run publishes
+a persistent generation and updates the Compose runtime pointer; the runner
+does not hand-edit it or delete Docker volumes. See
+[`tools/stress_corpus/README.md`](tools/stress_corpus/README.md) for options
+and cleanup precautions.
+
 #### Inspect or copy the active bulk CSV snapshot
 
 Determine the CSV-staging volume for the active graph generation, then list

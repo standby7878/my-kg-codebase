@@ -194,24 +194,31 @@ bulk_index_sources() {
         repository_paths+=("/repos/$basename")
     done
 
+    echo "CODEKG_PHASE_START export $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     CODEKG_BULK_STAGING_VOLUME="$staging_volume" \
         CODEKG_ZVEC_DATA_VOLUME="$zvec_volume" \
         dc run --rm --no-deps "${mounts[@]}" bulk-exporter \
         codekg bulk-export /data/bulk "${repository_paths[@]}"
+    echo "CODEKG_PHASE_END export $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "CODEKG_PHASE_START zvec $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     CODEKG_BULK_STAGING_VOLUME="$staging_volume" \
         CODEKG_ZVEC_DATA_VOLUME="$zvec_volume" \
         dc run --rm --no-deps "${mounts[@]}" bulk-exporter \
         codekg bulk-zvec "${repository_paths[@]}"
+    echo "CODEKG_PHASE_END zvec $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "CODEKG_PHASE_START import $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     CODEKG_BULK_STAGING_VOLUME="$staging_volume" \
         CODEKG_NEO4J_DATA_VOLUME="$graph_volume" \
         CODEKG_NEO4J_LOGS_VOLUME="$logs_volume" \
         dc run --rm --no-deps bulk-importer
+    echo "CODEKG_PHASE_END import $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
     if [ -f "$RUNTIME_ENV_FILE" ]; then
         backup_runtime="$(mktemp "${PROFILE_DIR}/.runtime-backup.XXXXXX")"
         cp "$RUNTIME_ENV_FILE" "$backup_runtime"
     fi
 
+    echo "CODEKG_PHASE_START publish $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     dc stop mcp neo4j
     write_runtime_generation "$graph_volume" "$zvec_volume" "$logs_volume"
 
@@ -226,6 +233,8 @@ bulk_index_sources() {
         dc up -d neo4j schema_bootstrap mcp
         return 1
     fi
+    echo "CODEKG_PHASE_END publish $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "CODEKG_PHASE_START validation $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if ! CODEKG_BULK_STAGING_VOLUME="$staging_volume" \
         dc run --rm --no-deps "${mounts[@]}" bulk-exporter \
         codekg validate-bulk-index "${repository_paths[@]}"; then
@@ -234,6 +243,7 @@ bulk_index_sources() {
         dc up -d neo4j schema_bootstrap mcp
         return 1
     fi
+    echo "CODEKG_PHASE_END validation $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     rm -f "$backup_runtime"
     dc up -d mcp
     echo "Published bulk generation ${generation}"

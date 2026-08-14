@@ -88,3 +88,32 @@ It currently invokes separate bulk export, Zvec indexing, and validation
 stages. Record the phase timings separately. The future `build-snapshot`
 workflow is the planned hook for a single-scan, disk-spooled pipeline; do not
 assume it exists until it is implemented.
+
+## Recorded stress runs
+
+Use the runner to generate a missing corpus, verify its manifest before every
+test, and record repeated **bulk-only** ingestion measurements:
+
+```bash
+bash tools/stress_corpus/run-ingestion-stress.sh --preset medium
+```
+
+It performs one warm-up and three measured runs by default. Results are placed
+in the ignored `.stress-results/` directory. Each run retains stdout, stderr,
+exit status, elapsed wall-clock seconds, parsed CLI metrics when emitted, phase
+timings, and the published runtime-volume pointer plus bulk CSV manifest when
+available. `summary.json` and `summary.md` report medians of successful
+measured runs only. Failed runs are retained and excluded from those medians.
+
+The runner requires Docker plus the Docker Compose plugin and a working local
+CodeKG image. Pass `--build` to build before measuring. Use `--dry-run` to
+inspect the resolved paths and exact command without generating a corpus or
+starting Docker. `--run-dir` must name a new directory, so a prior result can
+never be overwritten.
+
+The runner preflights the Docker daemon, Compose v2, and (unless `--build` is
+used) the local image before any ingestion run; its output is retained in
+`preflight.log`. `index-sources --mode bulk` publishes a new persistent Compose
+generation and updates the Compose runtime pointer on every successful run.
+The runner does not hand-edit that pointer or delete volumes; inspect and clean
+old generations manually only after confirming they are not active.

@@ -12,5 +12,6 @@ project_export*.txt
 compose/dev-local/runtime.env
 codekg-csv-export/
 /.stress-corpora/
+/.stress-results/
 /runs/
 /third_party/
