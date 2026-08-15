@@ -245,7 +245,9 @@ bulk_index_sources() {
     fi
     echo "CODEKG_PHASE_END validation $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     rm -f "$backup_runtime"
+    echo "CODEKG_PHASE_START activation $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     dc up -d mcp
+    echo "CODEKG_PHASE_END activation $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "Published bulk generation ${generation}"
 }
 

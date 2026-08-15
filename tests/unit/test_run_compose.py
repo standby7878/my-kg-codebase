@@ -90,9 +90,20 @@ def test_index_sources_defaults_to_staged_bulk_publish(tmp_path: Path) -> None:
     assert any("bulk-exporter" in invocation for invocation in invocations)
     assert any("bulk-importer" in invocation for invocation in invocations)
     assert (tmp_path / "runtime.env").is_file()
-    for phase in ("export", "zvec", "import", "publish", "validation"):
+    for phase in ("export", "zvec", "import", "publish", "validation", "activation"):
         assert f"CODEKG_PHASE_START {phase}" in result.stdout
         assert f"CODEKG_PHASE_END {phase}" in result.stdout
+    assert result.stdout.index("CODEKG_PHASE_START publish") < result.stdout.index(
+        "CODEKG_PHASE_END publish"
+    ) < result.stdout.index(
+        "CODEKG_PHASE_START validation"
+    )
+    assert result.stdout.index("CODEKG_PHASE_END validation") < result.stdout.index(
+        "CODEKG_PHASE_START activation"
+    ) < result.stdout.index(
+        "CODEKG_PHASE_END activation"
+    )
+    assert invocations[-1][-3:] == ["up", "-d", "mcp"]
 
 
 def test_bulk_validation_failure_restores_runtime_env_and_restarts_services(
