@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from codekg.bulk_export import export_repositories, load_bulk_export
+from codekg.bulk_export import export_repositories, export_repository_path, load_bulk_export
 from codekg.ir import (
     CallIR,
     FileIR,
@@ -18,6 +18,18 @@ from codekg.ir import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_single_root_empty_repository_publishes_repository_manifest(tmp_path: Path) -> None:
+    root = tmp_path / "markdown-only"
+    root.mkdir()
+    (root / "README.md").write_text("# Notes\n", encoding="utf-8")
+
+    exported = export_repository_path(root, tmp_path / "output", workers=1)
+
+    assert exported.manifest_path == tmp_path / "output" / "manifest.json"
+    assert exported.counts == {"nodes": 1, "nodes_Repository": 1}
+    assert exported.node_groups["Repository"]
 
 
 def _repo(

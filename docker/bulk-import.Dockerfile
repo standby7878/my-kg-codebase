@@ -1,5 +1,10 @@
 FROM neo4j:5.26-community
 
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends jq \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY docker/bulk-import.sh /usr/local/bin/codekg-bulk-import
 
 RUN chmod 0555 /usr/local/bin/codekg-bulk-import

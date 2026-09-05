@@ -4,7 +4,8 @@
 
 - Docker with Docker Compose (the `docker compose` plugin).
 - Python 3.12.
-- The vendored `zvec` dependency available in the checkout.
+- The vendored `zvec` dependency available in the checkout for the lexical
+  description index (FTS only; no embeddings or vector index).
 
 Create and activate a virtual environment, then install the project’s test
 dependencies:
@@ -69,7 +70,7 @@ test suites and require a signed-off corpus and ground truth before execution.
 This runbook has two deliberately separate layers:
 
 1. **Repository corpus:** pinned Python checkouts that CodeKG indexes into
-   Neo4j and zvec.
+   Neo4j and a zvec-backed lexical description index.
 2. **Benchmark corpus:** frozen prompts, truth records, schedules, and result
    logs under [`benchmark/`](benchmark/README.md).
 
@@ -117,9 +118,10 @@ Build the local image, start Neo4j plus the HTTP MCP server, then index every
 configured repository. Indexing is an operator action; MCP clients cannot
 trigger it. `index-sources` defaults to the staged bulk path (`--mode auto`):
 it exports the full configured corpus to CSV, creates a new Neo4j store with
-`neo4j-admin database import full`, builds the matching zvec index, validates
-the callable keys, and then publishes the new generation. The running graph is
-left in place if export, import, schema setup, or validation fails.
+`neo4j-admin database import full`, builds the matching zvec-backed lexical
+description index, validates the callable keys, and then publishes the new
+generation. This FTS index contains no embeddings or vectors. The running graph
+is left in place if export, import, schema setup, or validation fails.
 
 ```bash
 bash run-compose.sh dev-local build
@@ -154,7 +156,7 @@ container-wide measurement. Verify graph semantics by comparing CSV headers,
 manifest counts, node keys, relationship identities, and callable document
 keys/text. Byte-for-byte CSV equality is optional.
 
-The active graph, zvec, and log volume names are recorded in the ignored
+The active graph, lexical-description-index (`zvec`), and log volume names are recorded in the ignored
 `compose/dev-local/runtime.env` pointer file. The matching CSV-staging volume
 uses the same generation suffix. This makes the bulk CSVs available for
 diagnosis without replacing the active generation. Treat generation volumes as
@@ -393,7 +395,8 @@ ORDER BY repository, file, line;
 ```
 
 Re-run `index-sources` whenever a pinned checkout intentionally changes. It
-replaces that repository's Neo4j snapshot and derived zvec records.
+replaces that repository's Neo4j snapshot and derived lexical-description-index
+records.
 
 ### 3. Inspect the live MCP server
 
@@ -506,8 +509,8 @@ solely because this tool returned it.
 For every tool, also test one bounded empty-result case, such as a nonexistent
 repository or symbol search, and verify that it returns an empty result or a
 clear symbol-resolution error rather than unrelated data. Lexical-search
-failures should be treated as a zvec publication or mount problem; they should
-not silently fall back to graph search.
+failures should be treated as a lexical-description-index (`zvec`) publication
+or mount problem; they should not silently fall back to graph search.
 
 The Inspector is a local development tool. Do not expose its UI or the CodeKG
 MCP endpoint beyond loopback.

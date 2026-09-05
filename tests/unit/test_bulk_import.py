@@ -35,6 +35,29 @@ def test_build_import_command_places_database_before_input_flags(tmp_path: Path)
     ]
 
 
+def test_build_import_command_keeps_header_and_shards_in_one_ordered_group(tmp_path: Path) -> None:
+    header = tmp_path / "header.csv"
+    shard_one = tmp_path / "part-000.csv"
+    shard_two = tmp_path / "part-001.csv"
+    for path in (header, shard_one, shard_two):
+        path.write_text("", encoding="utf-8")
+    export = SimpleNamespace(
+        node_files={"Function": (header, shard_one, shard_two)}, relationship_files={}
+    )
+
+    command = build_import_command(export)
+
+    assert command[-1] == f"--nodes=Function={header},{shard_one},{shard_two}"
+
+
+def test_build_import_command_rejects_comma_in_group_filename(tmp_path: Path) -> None:
+    node = tmp_path / "nodes,part.csv"
+    node.write_text("", encoding="utf-8")
+
+    with pytest.raises(BulkImportError, match="unsupported comma"):
+        build_import_command(SimpleNamespace(node_files={"Function": node}, relationship_files={}))
+
+
 def test_run_bulk_import_loads_manifest_and_passes_expected_runner_options(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -81,6 +104,9 @@ def test_docker_bulk_import_enables_multiline_fields() -> None:
     assert (
         "set -- neo4j-admin database import full neo4j --id-type=string --multiline-fields=true"
     ) in content
+    assert "/import/manifest.json" in content
+    assert "jq -r --arg kind" in content
+    assert "codekg-import-entries" in content
 
 
 def test_invalid_manifest_fails_before_runner(

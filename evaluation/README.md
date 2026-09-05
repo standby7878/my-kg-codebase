@@ -3,7 +3,7 @@
 `codekg evaluate` measures the complete local CodeKG pipeline:
 
 ```text
-source files → Python IR → Neo4j graph → isolated zvec descriptions → public lexical query
+source files → Python IR → Neo4j graph → isolated zvec-backed lexical description index → public lexical query
 ```
 
 It never clones, downloads, or calls a network service beyond the locally
@@ -17,8 +17,9 @@ Run it from the project root after Neo4j is available:
 codekg evaluate
 ```
 
-The command writes `evaluation/report.json` and uses one zvec collection per
-corpus under `.codekg-evaluation-zvec`. Both locations can be changed with the
+The command writes `evaluation/report.json` and uses one zvec-backed lexical
+description index per corpus under `.codekg-evaluation-zvec`. This FTS-only
+index contains no embeddings or vectors. Both locations can be changed with the
 `--output` and `--zvec-root` options. The JSON writer sorts keys and omits a
 wall-clock timestamp, making structural portions of reports diff-friendly;
 timing values naturally vary by host.

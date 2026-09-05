@@ -10,8 +10,10 @@ the loader turns successful resolutions into graph relationships.
 from __future__ import annotations
 
 import ast
+import json
 import re
-from collections import defaultdict
+import sqlite3
+from collections import OrderedDict, defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
@@ -54,6 +56,14 @@ class SymbolRef:
 
 
 @dataclass(frozen=True)
+class BaseState:
+    """The resolved direct bases for one type, including incomplete state."""
+
+    bases: tuple[str, ...] = ()
+    incomplete: bool = False
+
+
+@dataclass(frozen=True)
 class CallResolution:
     """The resolver's complete, lossless conclusion for a call site."""
 
@@ -81,6 +91,163 @@ class CallResolution:
         return self.status in {"constructor_exact_local", "constructor_exact_import"}
 
 
+class ResolverIndex:
+    """Lookup boundary used by the resolution algorithm.
+
+    The in-memory implementation keeps the transactional path unchanged.  The
+    sharded exporter supplies the same operations from its SQLite registry;
+    importantly, candidate lists remain list-valued and key ordered.
+    """
+
+    def owners(self, path: str, qname: str) -> tuple[SymbolRef, ...]:
+        raise NotImplementedError
+
+    def callables(self, qname: str) -> tuple[SymbolRef, ...]:
+        raise NotImplementedError
+
+    def types(self, qname: str) -> tuple[SymbolRef, ...]:
+        raise NotImplementedError
+
+    def file(self, path: str) -> FileIR | None:
+        raise NotImplementedError
+
+    def files(self) -> Iterable[FileIR]:
+        raise NotImplementedError
+
+    def base_state(self, type_qname: str) -> BaseState:
+        raise NotImplementedError
+
+
+class InMemoryResolverIndex(ResolverIndex):
+    """Legacy resolver data with the lookup contract used by bulk export."""
+
+    def __init__(
+        self,
+        repo: RepositoryIR,
+        *,
+        owners_by_file_qname: Mapping[tuple[str, str], Iterable[SymbolRef]],
+        callables: Iterable[SymbolRef],
+        types: Iterable[SymbolRef],
+    ) -> None:
+        self._owners = {
+            key: tuple(sorted(values, key=lambda value: value.key))
+            for key, values in owners_by_file_qname.items()
+        }
+        self._callables = _group_by_qname(callables)
+        self._types = _group_by_qname(types)
+        self._files = {file.path: file for file in repo.files}
+        self._base_states = _base_states_from_files(repo.files, self)
+
+    def owners(self, path: str, qname: str) -> tuple[SymbolRef, ...]:
+        return self._owners.get((path, qname), ())
+
+    def callables(self, qname: str) -> tuple[SymbolRef, ...]:
+        return self._callables.get(qname, ())
+
+    def types(self, qname: str) -> tuple[SymbolRef, ...]:
+        return self._types.get(qname, ())
+
+    def file(self, path: str) -> FileIR | None:
+        return self._files.get(path)
+
+    def files(self) -> Iterable[FileIR]:
+        return self._files.values()
+
+    def base_state(self, type_qname: str) -> BaseState:
+        return self._base_states.get(type_qname, BaseState())
+
+
+class SqliteResolverIndex(ResolverIndex):
+    """Read-only lookup backend for the sharded export resolver registry."""
+
+    def __init__(self, path: str) -> None:
+        self.connection = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+        self.connection.execute("PRAGMA cache_size=-32768")
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def owners(self, path: str, qname: str) -> tuple[SymbolRef, ...]:
+        # Module initializers are not in symbols, so callers add their local
+        # ModuleInit owner directly before asking this backend.
+        return self._refs(
+            "SELECT key, qname, path, kind, parent_qname, return_annotation "
+            "FROM symbols WHERE path = ? AND qname = ? ORDER BY key",
+            (path, qname),
+        )
+
+    def callables(self, qname: str) -> tuple[SymbolRef, ...]:
+        return self._refs(
+            "SELECT key, qname, path, kind, parent_qname, return_annotation "
+            "FROM symbols WHERE qname = ? AND kind IN ('function', 'method') ORDER BY key",
+            (qname,),
+        )
+
+    def types(self, qname: str) -> tuple[SymbolRef, ...]:
+        return self._refs(
+            "SELECT key, qname, path, kind, parent_qname, return_annotation "
+            "FROM symbols WHERE qname = ? AND kind = 'type' ORDER BY key",
+            (qname,),
+        )
+
+    def file(self, path: str) -> FileIR | None:
+        from codekg.bulk_spool import _file_from_payload
+
+        row = self.connection.execute(
+            "SELECT payload FROM files WHERE path = ?", (path,)
+        ).fetchone()
+        return _file_from_payload(json.loads(row[0])) if row else None
+
+    def files(self) -> Iterable[FileIR]:
+        from codekg.bulk_spool import _file_from_payload
+
+        for (payload,) in self.connection.execute("SELECT payload FROM files ORDER BY ordinal"):
+            yield _file_from_payload(json.loads(payload))
+
+    def base_state(self, type_qname: str) -> BaseState:
+        """Resolve only ``type_qname``'s bases without enumerating the registry.
+
+        The query retains the legacy file/ordinal order and reconstructs only
+        the small file contexts needed to expand import aliases.
+        """
+        from codekg.bulk_spool import _file_from_payload
+
+        bases: list[str] = []
+        rows = self.connection.execute(
+            "SELECT inheritance.base_name, inheritance.base_qname, files.payload "
+            "FROM inheritance JOIN files ON files.path = inheritance.path "
+            "WHERE inheritance.type_qname = ? "
+            "ORDER BY files.ordinal, inheritance.ordinal",
+            (type_qname,),
+        )
+        for base_name, base_qname, payload in rows:
+            file = _file_from_payload(json.loads(payload))
+            if len(self.types(type_qname)) != 1:
+                return BaseState(incomplete=True)
+            candidates = _inheritance_candidates(
+                str(base_name), str(base_qname) if base_qname is not None else None,
+                _import_bindings(file),
+            )
+            parent_refs = {
+                ref.key: ref for qname in candidates for ref in self.types(qname)
+            }
+            if len(parent_refs) != 1:
+                return BaseState(incomplete=True)
+            bases.append(next(iter(parent_refs.values())).qname)
+        return BaseState(tuple(bases))
+
+    def external_module_owner(self, module: str) -> str | None:
+        """Return the deterministic file owner for a shared external module."""
+        row = self.connection.execute(
+            "SELECT path FROM imports WHERE module = ? ORDER BY path LIMIT 1", (module,)
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    def _refs(self, query: str, values: tuple[str, ...]) -> tuple[SymbolRef, ...]:
+        rows = self.connection.execute(query, values)
+        return tuple(SymbolRef(*row[:4], row[4], row[5] or None) for row in rows)
+
+
 def resolve_call_sites(
     repo: RepositoryIR,
     *,
@@ -96,10 +263,12 @@ def resolve_call_sites(
     """
 
     resolver = _Resolver(
-        repo,
+        InMemoryResolverIndex(
+            repo,
         owners_by_file_qname=owners_by_file_qname,
         callables=callables,
         types=types,
+        ),
     )
     return tuple(resolver.resolve(file, call) for file in repo.files for call in file.calls)
 
@@ -107,25 +276,15 @@ def resolve_call_sites(
 class _Resolver:
     def __init__(
         self,
-        repo: RepositoryIR,
-        *,
-        owners_by_file_qname: Mapping[tuple[str, str], Iterable[SymbolRef]],
-        callables: Iterable[SymbolRef],
-        types: Iterable[SymbolRef],
+        index: ResolverIndex,
     ) -> None:
-        self.repo = repo
-        self.owners_by_file_qname = {
-            key: tuple(sorted(values, key=lambda value: value.key))
-            for key, values in owners_by_file_qname.items()
-        }
-        self.callables_by_qname: dict[str, tuple[SymbolRef, ...]] = _group_by_qname(callables)
-        self.types_by_qname: dict[str, tuple[SymbolRef, ...]] = _group_by_qname(types)
-        self.file_by_path = {file.path: file for file in repo.files}
-        self._bases, self._incomplete_types = self._resolved_bases()
-        self._mro_cache: dict[str, tuple[str, ...] | None] = {}
+        self.index = index
+        self._mro_cache: OrderedDict[str, tuple[str, ...] | None] = OrderedDict()
+        self._mro_cache_limit = 4096
+        self._mro_cache_max_length = 256
 
     def resolve(self, file: FileIR, call: CallIR) -> CallResolution:
-        owners = self.owners_by_file_qname.get((file.path, call.owner_qname), ())
+        owners = self.index.owners(file.path, call.owner_qname)
         if not owners:
             return CallResolution(call, file.path, None, "owner_unresolved", ())
         if len(owners) != 1:
@@ -270,7 +429,7 @@ class _Resolver:
         factories = self._callable_candidates(candidates)
         if len(factories) != 1 or factories[0].return_annotation is None:
             return None
-        factory_file = self.file_by_path.get(factories[0].path)
+        factory_file = self.index.file(factories[0].path)
         if factory_file is None:
             return None
         return self._annotation_type(factory_file, factories[0].return_annotation)
@@ -367,7 +526,7 @@ class _Resolver:
 
     def _type_candidates(self, qnames: Iterable[str]) -> tuple[SymbolRef, ...]:
         candidates = {
-            ref.key: ref for qname in qnames for ref in self.types_by_qname.get(qname, ())
+            ref.key: ref for qname in qnames for ref in self.index.types(qname)
         }
         return tuple(sorted(candidates.values(), key=lambda ref: ref.key))
 
@@ -451,7 +610,7 @@ class _Resolver:
         )
 
     def _owner_type_for_call(self, owner: SymbolRef) -> str | None:
-        if owner.parent_qname and len(self.types_by_qname.get(owner.parent_qname, ())) == 1:
+        if owner.parent_qname and len(self.index.types(owner.parent_qname)) == 1:
             return owner.parent_qname
         return None
 
@@ -488,7 +647,7 @@ class _Resolver:
 
     def _callable_candidates(self, qnames: Iterable[str]) -> tuple[SymbolRef, ...]:
         candidates = {
-            ref.key: ref for qname in qnames for ref in self.callables_by_qname.get(qname, ())
+            ref.key: ref for qname in qnames for ref in self.index.callables(qname)
         }
         return tuple(candidates[key] for key in sorted(candidates))
 
@@ -497,60 +656,75 @@ class _Resolver:
             return ()
         return tuple(
             ref
-            for ref in self.callables_by_qname.get(f"{type_qname}.{method_name}", ())
+            for ref in self.index.callables(f"{type_qname}.{method_name}")
             if ref.kind == "method" and ref.parent_qname == type_qname
         )
 
-    def _resolved_bases(self) -> tuple[dict[str, tuple[str, ...]], set[str]]:
-        bases: dict[str, tuple[str, ...]] = {}
-        incomplete: set[str] = set()
-        for file in self.repo.files:
-            bindings = _import_bindings(file)
-            for inheritance in file.inheritance:
-                children = self.types_by_qname.get(inheritance.type_qname, ())
-                if len(children) != 1:
-                    incomplete.add(inheritance.type_qname)
-                    continue
-                candidate_qnames = _inheritance_candidates(
-                    inheritance.base_name, inheritance.base_qname, bindings
-                )
-                parent_refs = {
-                    ref.key: ref
-                    for qname in candidate_qnames
-                    for ref in self.types_by_qname.get(qname, ())
-                }
-                if len(parent_refs) != 1:
-                    incomplete.add(inheritance.type_qname)
-                    continue
-                bases.setdefault(inheritance.type_qname, ())
-                parent_qname = next(iter(parent_refs.values())).qname
-                bases[inheritance.type_qname] = (*bases[inheritance.type_qname], parent_qname)
-        return bases, incomplete
-
     def _mro(self, type_qname: str, active: frozenset[str] = frozenset()) -> tuple[str, ...] | None:
         if type_qname in self._mro_cache:
+            self._mro_cache.move_to_end(type_qname)
             return self._mro_cache[type_qname]
-        if type_qname in active or type_qname in self._incomplete_types:
-            self._mro_cache[type_qname] = None
+        state = self.index.base_state(type_qname)
+        if type_qname in active or state.incomplete:
+            self._cache_mro(type_qname, None)
             return None
-        if len(self.types_by_qname.get(type_qname, ())) != 1:
-            self._mro_cache[type_qname] = None
+        if len(self.index.types(type_qname)) != 1:
+            self._cache_mro(type_qname, None)
             return None
-        parents = self._bases.get(type_qname, ())
+        parents = state.bases
         parent_mros: list[tuple[str, ...]] = []
         for parent in parents:
             parent_mro = self._mro(parent, active | {type_qname})
             if parent_mro is None:
-                self._mro_cache[type_qname] = None
+                self._cache_mro(type_qname, None)
                 return None
             parent_mros.append(parent_mro)
         merged = _c3_merge([*parent_mros, parents])
         if merged is None:
-            self._mro_cache[type_qname] = None
+            self._cache_mro(type_qname, None)
             return None
         mro = (type_qname, *merged)
-        self._mro_cache[type_qname] = mro
+        self._cache_mro(type_qname, mro)
         return mro
+
+    def _cache_mro(self, type_qname: str, value: tuple[str, ...] | None) -> None:
+        # Long inheritance chains are valid, but retaining them defeats the
+        # exporter memory bound.  They are recomputed on demand instead.
+        if value is not None and len(value) > self._mro_cache_max_length:
+            return
+        self._mro_cache[type_qname] = value
+        self._mro_cache.move_to_end(type_qname)
+        if len(self._mro_cache) > self._mro_cache_limit:
+            self._mro_cache.popitem(last=False)
+
+
+def _base_states_from_files(files: Iterable[FileIR], index: ResolverIndex) -> dict[str, BaseState]:
+    """Build legacy in-memory base state once; SQLite resolves it lazily."""
+    bases: dict[str, list[str]] = {}
+    incomplete: set[str] = set()
+    for file in files:
+        bindings = _import_bindings(file)
+        for inheritance in file.inheritance:
+            children = index.types(inheritance.type_qname)
+            if len(children) != 1:
+                incomplete.add(inheritance.type_qname)
+                continue
+            candidate_qnames = _inheritance_candidates(
+                inheritance.base_name, inheritance.base_qname, bindings
+            )
+            parent_refs = {
+                ref.key: ref for qname in candidate_qnames for ref in index.types(qname)
+            }
+            if len(parent_refs) != 1:
+                incomplete.add(inheritance.type_qname)
+                continue
+            bases.setdefault(inheritance.type_qname, []).append(
+                next(iter(parent_refs.values())).qname
+            )
+    return {
+        qname: BaseState(tuple(values), qname in incomplete)
+        for qname, values in bases.items()
+    } | {qname: BaseState((), True) for qname in incomplete if qname not in bases}
 
 
 def _is_direct_receiver_call(call: CallIR, receiver: str) -> bool:

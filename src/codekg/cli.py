@@ -141,17 +141,24 @@ def evaluate(
 def bulk_export(
     output: Path,
     paths: Annotated[list[Path], typer.Argument(min=1)],
+    workers: int = typer.Option(1, "--workers", min=1),
 ) -> None:
     """Export snapshots scanned from repository paths."""
 
-    from codekg.bulk_export import export_repositories
+    from codekg.bulk_export import export_repositories, export_repository_path
     from codekg.ingest import scan_repository
 
     debug_event(logger, "cli_command_started", command="bulk-export", repositories=len(paths))
     started = time.perf_counter()
-    repositories = [scan_repository(path) for path in paths]
-    scanned_at = time.perf_counter()
-    result = export_repositories(repositories, output)
+    if len(paths) == 1:
+        result = export_repository_path(paths[0], output, workers=workers)
+        scanned_at = time.perf_counter()
+    else:
+        if workers != 1:
+            raise typer.BadParameter("--workers is supported only for a single repository root")
+        repositories = [scan_repository(path) for path in paths]
+        scanned_at = time.perf_counter()
+        result = export_repositories(repositories, output)
     finished = time.perf_counter()
     console.print(
         {
@@ -188,7 +195,7 @@ def bulk_import(
 
 @app.command("bulk-zvec")
 def bulk_zvec(paths: Annotated[list[Path], typer.Argument(min=1)]) -> None:
-    """Build the derived zvec index from repository snapshots."""
+    """Build the derived zvec-backed lexical description index (FTS only)."""
 
     from codekg.ingest import scan_repository
     from codekg.search_index import iter_callable_docs_from_repository
@@ -224,7 +231,7 @@ def bulk_zvec(paths: Annotated[list[Path], typer.Argument(min=1)]) -> None:
 
 @app.command("validate-bulk-index")
 def validate_bulk_index(paths: Annotated[list[Path], typer.Argument(min=1)]) -> None:
-    """Validate staged zvec descriptions against live graph callables."""
+    """Validate staged lexical-description records against live graph callables."""
 
     from codekg.ingest import scan_repository
     from codekg.search_index import (

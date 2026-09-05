@@ -88,7 +88,8 @@ short SHA even though the app image does not install the `git` binary.
 Indexed source repositories are local input data for the KG, not part of the
 CodeKG package. Keep them at the configured paths. Markdown
 specifications, design notes, and API documentation must live inside the code
-repository they describe; they enrich lexical search. An independent
+repository they describe; they enrich the zvec-backed lexical description index
+(FTS only, with no embeddings or vector index). An independent
 specifications-only repository is not indexed independently.
 
 Current extraction level:

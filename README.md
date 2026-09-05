@@ -2,8 +2,9 @@
 
 CodeKG builds a local Neo4j knowledge graph from Python repositories and exposes
 read-only code queries through an MCP server. It also creates a local lexical
-index for function and method descriptions. The services run with Docker
-Compose and are reachable only from the local machine.
+description index for functions and methods, implemented with zvec full-text
+search (FTS). It does not create embeddings or a vector index. The services run
+with Docker Compose and are reachable only from the local machine.
 
 ## Prerequisites
 
@@ -99,9 +100,9 @@ bash run-compose.sh dev-local index-sources
 
 `index-sources` defaults to a staged bulk build: CodeKG exports the complete
 configured corpus to CSV, creates a fresh Neo4j store with `neo4j-admin`,
-builds the matching zvec index, validates their exact callable keys, then
-briefly restarts Neo4j and MCP on the new generation. The previous generation
-remains available if staging or validation fails.
+builds the matching zvec-backed lexical description index, validates their
+exact callable keys, then briefly restarts Neo4j and MCP on the new generation.
+The previous generation remains available if staging or validation fails.
 
 Use transactional writes only for a targeted update or operational debugging:
 

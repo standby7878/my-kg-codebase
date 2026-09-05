@@ -42,8 +42,18 @@ def build_import_command(
     if not isinstance(neo4j_admin, str) or not neo4j_admin:
         raise BulkImportError("neo4j_admin must be a non-empty string")
 
-    nodes = _file_arguments(export, "node_files", "node")
-    relationships = _file_arguments(export, "relationship_files", "relationship")
+    nodes = _file_arguments(
+        export,
+        "node_groups" if getattr(export, "node_groups", None) else "node_files",
+        "node",
+    )
+    relationships = _file_arguments(
+        export,
+        "relationship_groups"
+        if getattr(export, "relationship_groups", None)
+        else "relationship_files",
+        "relationship",
+    )
     if not nodes and not relationships:
         raise BulkImportError("bulk export contains no node or relationship files")
 
@@ -141,10 +151,17 @@ def _file_arguments(export: Any, attribute: str, kind: str) -> list[tuple[str, s
                 raise BulkImportError(f"invalid {kind} file entry: {entry!r}") from exc
         if not isinstance(label, str) or not label or "=" in label:
             raise BulkImportError(f"invalid {kind} label: {label!r}")
-        candidate = Path(file_path) if isinstance(file_path, (str, Path)) else None
-        if candidate is None or not candidate.is_file():
+        paths = (file_path,) if isinstance(file_path, (str, Path)) else tuple(file_path or ())
+        if not paths:
+            raise BulkImportError(f"missing {kind} files for {label!r}: {file_path!r}")
+        candidates = tuple(Path(path) if isinstance(path, (str, Path)) else None for path in paths)
+        if any(path is None or not path.is_file() for path in candidates):
             raise BulkImportError(f"missing {kind} file for {label!r}: {file_path!r}")
-        result.append((label, str(candidate)))
+        if any("," in str(path) for path in candidates if path is not None):
+            raise BulkImportError(
+                f"unsupported comma in {kind} filename for {label!r}: {file_path!r}"
+            )
+        result.append((label, ",".join(str(path) for path in candidates)))
     return result
 
 

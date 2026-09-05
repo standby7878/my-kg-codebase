@@ -6,11 +6,13 @@ import csv
 import json
 import logging
 import os
+import sqlite3
 import tempfile
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,134 @@ from codekg.logging_config import debug_event
 logger = logging.getLogger(__name__)
 
 
+def _extract_spool(root_value: str, paths: tuple[str, ...], spool_value: str) -> str:
+    """Worker entry point: parse a bounded batch and publish one spool."""
+    from codekg.bulk_spool import create_spool
+    from codekg.ingest import _scan_file
+
+    root = Path(root_value)
+    spool = Path(spool_value)
+    create_spool(spool, (_scan_file(root, Path(path)) for path in paths))
+    return str(spool)
+
+
+def export_repository_path(root: Path, output_dir: Path, *, workers: int = 1) -> BulkExport:
+    """Export one logical repository through durable extraction staging.
+
+    The public single-root entry point intentionally owns repository identity
+    once.  Spooling is also useful for recovery and makes subsequent pipeline
+    stages independent of the source tree.
+    """
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+    from codekg.bulk_identity import content_hash
+    from codekg.bulk_spool import build_registry
+    from codekg.ingest import _git_commit
+
+    root = root.resolve()
+    if not root.is_dir():
+        raise ValueError(f"Repository path does not exist or is not a directory: {root}")
+    output_dir = Path(output_dir)
+    generation = output_dir / "generations" / f"{int(time.time_ns())}"
+    spool_dir = generation / ".building" / "spools"
+    generation.mkdir(parents=True, exist_ok=True)
+    spool_dir.mkdir(parents=True, exist_ok=True)
+    catalog = sqlite3.connect(generation / ".building" / "schedule.sqlite")
+    catalog.execute("CREATE TABLE spools (ordinal INTEGER PRIMARY KEY, path TEXT NOT NULL)")
+    try:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            pending = set()
+            for ordinal, paths in enumerate(_source_batches(root)):
+                spool = spool_dir / f"extract-{ordinal:06d}.sqlite"
+                catalog.execute("INSERT INTO spools VALUES (?, ?)", (ordinal, str(spool)))
+                while len(pending) >= workers * 2:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for completed in done:
+                        completed.result()
+                pending.add(
+                    executor.submit(
+                        _extract_spool, str(root), tuple(str(path) for path in paths), str(spool)
+                    )
+                )
+            for completed in pending:
+                completed.result()
+        catalog.commit()
+        commit = _git_commit(root) or content_hash(root)
+        build_registry(
+            generation / ".building" / "resolver.sqlite",
+            (Path(row[0]) for row in catalog.execute("SELECT path FROM spools ORDER BY ordinal")),
+            repo_prefix=f"{root.name}@{commit}",
+        )
+        from codekg.bulk_projection import project_repository
+
+        repo = RepositoryIR(repo_name=root.name, commit=commit, root_path=str(root))
+        projection_spools = (
+            Path(row[0]) for row in catalog.execute("SELECT path FROM spools ORDER BY ordinal")
+        )
+        result = project_repository(
+            repo,
+            projection_spools,
+            generation / ".building" / "resolver.sqlite",
+            generation,
+            workers=workers,
+        )
+    finally:
+        catalog.close()
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    manifest.update(
+        {
+            "mode": "sharded-monorepo",
+            "workers": workers,
+            "repository": {
+                "repo_name": repo.repo_name,
+                "commit": repo.commit,
+                "root_path": repo.root_path,
+            },
+        }
+    )
+    result.manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    published = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    generation_name = result.manifest_path.parent.relative_to(output_dir)
+    published["version"] = 2
+    published["output_dir"] = "."
+    for section in ("nodes", "relationships"):
+        for entry in published[section].values():
+            if "files" in entry:
+                entry["files"] = [str(generation_name / value) for value in entry["files"]]
+            else:
+                entry["file"] = str(generation_name / entry["file"])
+    top_manifest = output_dir / "manifest.json"
+    temporary = output_dir / ".manifest.json.tmp"
+    temporary.write_text(
+        json.dumps(published, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, top_manifest)
+    # Public callers and the Docker importer must consume the generation
+    # pointer that was atomically published, never the private build manifest.
+    return load_bulk_export(top_manifest)
+
+
+def _source_batches(root: Path) -> Iterable[tuple[Path, ...]]:
+    """Yield deterministic, bounded extraction work without retaining it all."""
+    from codekg.ingest import _iter_source_files
+
+    batch: list[Path] = []
+    bytes_used = 0
+    for path in _iter_source_files(root):
+        size = path.stat().st_size
+        if batch and (len(batch) >= 128 or bytes_used + size > 32 * 1024 * 1024):
+            yield tuple(batch)
+            batch, bytes_used = [], 0
+        batch.append(path)
+        bytes_used += size
+    if batch:
+        yield tuple(batch)
+
+
 @dataclass(frozen=True)
 class BulkExport:
     """The files and counts published by :func:`export_repositories`."""
@@ -41,6 +171,8 @@ class BulkExport:
     node_files: Mapping[str, Path]
     relationship_files: Mapping[str, Path]
     counts: Mapping[str, int]
+    node_groups: Mapping[str, tuple[Path, ...]] = field(default_factory=dict)
+    relationship_groups: Mapping[str, tuple[Path, ...]] = field(default_factory=dict)
 
 
 _NODE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
@@ -228,7 +360,15 @@ def export_repositories(repositories: Iterable[RepositoryIR], output_dir: Path) 
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
-    result = BulkExport(manifest_path, output_dir, node_files, relationship_files, graph["counts"])
+    result = BulkExport(
+        manifest_path,
+        output_dir,
+        node_files,
+        relationship_files,
+        graph["counts"],
+        {label: (path,) for label, path in node_files.items()},
+        {kind: (path,) for kind, path in relationship_files.items()},
+    )
     debug_event(
         logger,
         "bulk_export_completed",
@@ -246,11 +386,25 @@ def load_bulk_export(manifest_path: Path) -> BulkExport:
     output_dir = Path(data["output_dir"])
     if not output_dir.is_absolute():
         output_dir = manifest_path.parent / output_dir
-    node_files = {label: output_dir / entry["file"] for label, entry in data["nodes"].items()}
-    relationship_files = {
-        kind: output_dir / entry["file"] for kind, entry in data["relationships"].items()
+    node_groups = {
+        label: tuple(output_dir / value for value in (entry.get("files") or [entry["file"]]))
+        for label, entry in data["nodes"].items()
     }
-    result = BulkExport(manifest_path, output_dir, node_files, relationship_files, data["counts"])
+    relationship_groups = {
+        kind: tuple(output_dir / value for value in (entry.get("files") or [entry["file"]]))
+        for kind, entry in data["relationships"].items()
+    }
+    node_files = {label: paths[0] for label, paths in node_groups.items()}
+    relationship_files = {kind: paths[0] for kind, paths in relationship_groups.items()}
+    result = BulkExport(
+        manifest_path,
+        output_dir,
+        node_files,
+        relationship_files,
+        data["counts"],
+        node_groups,
+        relationship_groups,
+    )
     debug_event(
         logger,
         "bulk_export_manifest_load_completed",
