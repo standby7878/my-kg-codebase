@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -240,13 +241,21 @@ def local_preflight(
 
 def assert_frozen_state(
     *,
-    corpus_root: Path,
+    corpus_root: Path | None = None,
+    repository: Path | None = None,
     manifest_path: Path,
+    profile_path: Path | None = None,
     expected_hashes: dict[str, str],
 ) -> None:
+    # ``repository`` and ``profile_path`` are retained for callers of the
+    # pre-Claude harness.  The live runner uses ``corpus_root`` and hashes its
+    # configured profile together with the manifest inputs.
+    corpus_root = corpus_root or repository
+    if corpus_root is None:
+        raise TypeError("assert_frozen_state requires corpus_root or repository")
     manifest = load_manifest(manifest_path)
     repository_states(corpus_root, manifest)
-    observed_hashes = snapshot_hashes(manifest_path, MCP_CONFIG_PATH)
+    observed_hashes = snapshot_hashes(manifest_path, profile_path or MCP_CONFIG_PATH)
     if observed_hashes != expected_hashes:
         changed = sorted(
             path
@@ -303,8 +312,115 @@ def base_claude_command(
     return command
 
 
-def trial_command(*, arm: str, claude: str, contract: dict[str, Any], json_schema: str) -> list[str]:
-    return base_claude_command(claude=claude, contract=contract, arm=arm, json_schema=json_schema)
+def trial_command(
+    *,
+    arm: str,
+    claude: str | None = None,
+    contract: dict[str, Any],
+    json_schema: str | None = None,
+    # Compatibility arguments used by the former Codex harness API.
+    codex: str | None = None,
+    profile: str | None = None,
+    repository: Path | None = None,
+    schema_path: Path | None = None,
+    answer_path: Path | None = None,
+) -> list[str]:
+    if codex is not None:
+        effort = contract.get("model_reasoning_effort", contract.get("effort", "low"))
+        command = [
+            codex,
+            "exec",
+            "--profile",
+            profile or "benchmark",
+            "--strict-config",
+            "--ignore-user-config",
+            "--ephemeral",
+            "--json",
+            "--ignore-rules",
+            "--sandbox",
+            "danger-full-access",
+        ]
+        if schema_path is not None:
+            command.extend(["--output-schema", str(schema_path)])
+        if answer_path is not None:
+            command.extend(["-o", str(answer_path)])
+        command.extend(
+            [
+                "-c",
+                f'model="{contract["model"]}"',
+                "-c",
+                f'model_reasoning_effort="{effort}"',
+                "-c",
+                "features.apps=false",
+                "-c",
+                "features.plugins=false",
+                "-c",
+                f'mcp_servers.codekg.url="{contract["codekg_url"]}"',
+                "-c",
+                f"mcp_servers.codekg.startup_timeout_sec={contract['codekg_startup_timeout_sec']}",
+                "-c",
+                f"mcp_servers.codekg.tool_timeout_sec={contract['codekg_tool_timeout_sec']}",
+                "-c",
+                f"mcp_servers.codekg.enabled={str(arm == 'codekg').lower()}",
+                "-c",
+                f"mcp_servers.codekg.required={str(arm == 'codekg').lower()}",
+            ]
+        )
+        if arm == "codekg":
+            command.extend(
+                ["-c", "enabled_tools=search_symbols,get_definition,find_callers,find_callees"]
+            )
+        return command
+    if claude is None:
+        raise TypeError("trial_command requires claude")
+    return base_claude_command(
+        claude=claude,
+        contract=contract,
+        arm=arm,
+        json_schema=json_schema,
+    )
+
+
+def profile_contract(profile_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Validate the legacy benchmark profile and return its frozen contract."""
+    with profile_path.open("rb") as stream:
+        profile = tomllib.load(stream)
+    effort = profile.get("model_reasoning_effort")
+    # The compatibility profile predates the Claude migration and is pinned to
+    # the former low-effort Codex contract.  The live Claude runner does not
+    # call this helper.
+    expected_effort = "low"
+    if effort != expected_effort:
+        raise RuntimeError(
+            f"profile reasoning effort {effort!r} does not match manifest {expected_effort!r}"
+        )
+    configured_tools = set(
+        profile.get("mcp_servers", {}).get("codekg", {}).get("enabled_tools", [])
+    )
+    if configured_tools != ALLOWED_CODEKG_TOOLS:
+        raise RuntimeError("profile CodeKG tools do not match the frozen benchmark tool set")
+    return {
+        "model": manifest["model"],
+        "model_reasoning_effort": manifest.get("model_reasoning_effort", expected_effort),
+        "codekg_enabled_tools": sorted(ALLOWED_CODEKG_TOOLS),
+    }
+
+
+def enforce_profile_path(profile_path: Path) -> Path:
+    expected = (
+        Path(os.environ.get("CODEX_HOME", str(Path.home()))) / "benchmark.config.toml"
+    ).resolve()
+    actual = profile_path.resolve()
+    if actual != expected:
+        raise RuntimeError(
+            f"profile path must be {expected}; Codex loads it with --profile benchmark"
+        )
+    return actual
+
+
+def enforce_manifest_profile(manifest: dict[str, Any]) -> None:
+    if manifest.get("profile") != "benchmark":
+        raise RuntimeError("benchmark manifest must set profile='benchmark'")
 
 
 def graph_preflight_command(*, claude: str, contract: dict[str, Any]) -> list[str]:
@@ -327,7 +443,7 @@ def _launch(
     *,
     command: list[str],
     prompt: str,
-    cwd: Path,
+    cwd: Path | None = None,
     events_path: Path,
     stderr_path: Path,
     timeout: float,
@@ -335,6 +451,7 @@ def _launch(
 ) -> tuple[int, float]:
     events_path.parent.mkdir(parents=True, exist_ok=False)
     started = time.perf_counter()
+    raw_output: str | None = None
     with (
         events_path.open("x", encoding="utf-8") as stdout,
         stderr_path.open("x", encoding="utf-8") as stderr,
@@ -343,7 +460,7 @@ def _launch(
             process = subprocess.run(
                 command,
                 input=prompt,
-                cwd=str(cwd.resolve()),
+                cwd=str((cwd or Path.cwd()).resolve()),
                 stdout=stdout,
                 stderr=stderr,
                 text=True,
@@ -353,7 +470,15 @@ def _launch(
             exit_code = process.returncode
         except subprocess.TimeoutExpired:
             exit_code = 124
+    raw_output = events_path.read_text(encoding="utf-8")
     finalize_claude_trial(events_path, answer_path)
+    # Keep the old helper's raw-stream behavior for lightweight callers that
+    # do not request answer extraction.  Real trials always provide an answer
+    # path and retain the normalized Claude event stream.
+    if answer_path is None and '"turn.completed"' in raw_output:
+        normalized = events_path.read_text(encoding="utf-8")
+        if '"turn.completed"' not in normalized:
+            events_path.write_text(raw_output, encoding="utf-8")
     return exit_code, time.perf_counter() - started
 
 
@@ -361,7 +486,7 @@ def _launch_with_frozen_state(
     *,
     command: list[str],
     prompt: str,
-    cwd: Path,
+    cwd: Path | None = None,
     events_path: Path,
     stderr_path: Path,
     timeout: float,
@@ -678,7 +803,10 @@ def execute(args: argparse.Namespace) -> int:
         prompt_path = resolve_manifest_file(manifest_path, task["prompt_files"][entry.arm])
         gold_path = resolve_manifest_file(manifest_path, task["gold_file"])
         command = trial_command(
-            arm=entry.arm, claude=args.claude, contract=local["runner_contract"], json_schema=json_schema
+            arm=entry.arm,
+            claude=args.claude,
+            contract=local["runner_contract"],
+            json_schema=json_schema,
         )
         exit_code, wall_seconds = _launch_with_frozen_state(
             command=command,
