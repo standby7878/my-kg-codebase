@@ -1,0 +1,5035 @@
+================================================================================
+EVALUATION HARNESS EXPORT - CodeKG
+================================================================================
+Generated on: su 2.8.2026 12.45.12 +0300
+Harness directory: /media/alex/MYSSD/BACKUP/workspace/my-kg-codebase/evaluation
+Export file: /media/alex/MYSSD/BACKUP/workspace/my-kg-codebase/evaluation/evaluation_harness_export.txt
+Source: Git-tracked and untracked non-ignored evaluation harness files
+================================================================================
+
+TABLE OF CONTENTS:
+- aggregate_benchmark.py
+- benchmark_lib.py
+- benchmark-manifest.json
+- codex-answer.schema.json
+- convert2txt.sh
+- corpora.json
+- gold/001-requests-prepare-request.gold.json
+- gold/002-requests-environment-settings.gold.json
+- gold/003-click-command-context.gold.json
+- gold/004-click-parse-arguments.gold.json
+- gold/005-engine-connect.gold.json
+- gold/006-engine-execute-context.gold.json
+- gold/007-pool-record-checkout.gold.json
+- gold/008-pool-queue-acquire.gold.json
+- gold/009-sql-visit-select.gold.json
+- gold/010-sql-compose-select-body.gold.json
+- measure_mcp_response_sizes.py
+- prompts/001-requests-prepare-request-codekg.txt
+- prompts/001-requests-prepare-request-native.txt
+- prompts/002-requests-environment-settings-codekg.txt
+- prompts/002-requests-environment-settings-native.txt
+- prompts/003-click-command-context-codekg.txt
+- prompts/003-click-command-context-native.txt
+- prompts/004-click-parse-arguments-codekg.txt
+- prompts/004-click-parse-arguments-native.txt
+- prompts/005-engine-connect-codekg.txt
+- prompts/005-engine-connect-native.txt
+- prompts/006-engine-execute-context-codekg.txt
+- prompts/006-engine-execute-context-native.txt
+- prompts/007-pool-record-checkout-codekg.txt
+- prompts/007-pool-record-checkout-native.txt
+- prompts/008-pool-queue-acquire-codekg.txt
+- prompts/008-pool-queue-acquire-native.txt
+- prompts/009-sql-visit-select-codekg.txt
+- prompts/009-sql-visit-select-native.txt
+- prompts/010-sql-compose-select-body-codekg.txt
+- prompts/010-sql-compose-select-body-native.txt
+- prompts/patroni-intent-001.txt
+- README.md
+- run_benchmark.py
+- tests/test_benchmark.py
+- truth/synthetic-phase1.json
+- validate_benchmark.py
+
+Total Files: 43
+
+================================================================================
+FILE: aggregate_benchmark.py
+================================================================================
+#!/usr/bin/env python3
+"""Aggregate the ten-task multi-repository CodeKG/native benchmark suite."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import defaultdict
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+from benchmark_lib import (
+    MANIFEST_PATH,
+    load_manifest,
+    read_events,
+    read_json,
+    suite_schedule,
+    summarize_values,
+    write_json_new,
+)
+
+SCALAR_METRICS = (
+    "wall_seconds",
+    "turns",
+    "tool_calls",
+    "response_bytes",
+    "search_calls",
+    "candidate_count",
+    "target_rank",
+    "searches_before_target",
+    "reciprocal_rank",
+    "unsupported_claim_count",
+    "relationship_location_completeness",
+)
+TOKEN_METRICS = (
+    "input",
+    "cached_input",
+    "uncached_input",
+    "cache_hit_ratio",
+    "output",
+    "reasoning",
+)
+RATE_METRICS = (
+    "infrastructure_success",
+    "valid",
+    "evidence_compliant",
+    "correct",
+    "success",
+    "recall_at_1",
+    "recall_at_5",
+)
+
+
+def _number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _summary(trials: Sequence[dict[str, Any]], seed: int) -> dict[str, Any]:
+    summary: dict[str, Any] = {"count": len(trials), "rates": {}, "metrics": {}, "tokens": {}}
+    for name in RATE_METRICS:
+        values = [bool(trial["metrics"].get(name)) for trial in trials]
+        summary["rates"][name] = sum(values) / len(values) if values else None
+    for offset, name in enumerate(SCALAR_METRICS):
+        values = [
+            number
+            for trial in trials
+            if (number := _number(trial["metrics"].get(name))) is not None
+        ]
+        summary["metrics"][name] = summarize_values(values, seed=seed + offset)
+    for offset, name in enumerate(TOKEN_METRICS, start=len(SCALAR_METRICS)):
+        values = [
+            number
+            for trial in trials
+            if (number := _number(trial["metrics"].get("tokens", {}).get(name))) is not None
+        ]
+        summary["tokens"][name] = summarize_values(values, seed=seed + offset)
+    return summary
+
+
+def _paired_deltas(trials: Sequence[dict[str, Any]], seed: int) -> dict[str, Any]:
+    by_task: dict[int, dict[str, dict[str, Any]]] = defaultdict(dict)
+    for trial in trials:
+        by_task[trial["metadata"]["task_index"]][trial["metadata"]["arm"]] = trial
+    result: dict[str, Any] = {
+        "direction": "codekg_minus_native",
+        "complete_pairs": sum(set(pair) == {"codekg", "native"} for pair in by_task.values()),
+        "metrics": {},
+        "tokens": {},
+    }
+    for offset, name in enumerate(SCALAR_METRICS):
+        values = []
+        for pair in by_task.values():
+            if set(pair) != {"codekg", "native"}:
+                continue
+            codekg = _number(pair["codekg"]["metrics"].get(name))
+            native = _number(pair["native"]["metrics"].get(name))
+            if codekg is not None and native is not None:
+                values.append(codekg - native)
+        result["metrics"][name] = summarize_values(values, seed=seed + offset)
+    for offset, name in enumerate(TOKEN_METRICS, start=len(SCALAR_METRICS)):
+        values = []
+        for pair in by_task.values():
+            if set(pair) != {"codekg", "native"}:
+                continue
+            codekg = _number(pair["codekg"]["metrics"].get("tokens", {}).get(name))
+            native = _number(pair["native"]["metrics"].get("tokens", {}).get(name))
+            if codekg is not None and native is not None:
+                values.append(codekg - native)
+        result["tokens"][name] = summarize_values(values, seed=seed + offset)
+    return result
+
+
+def aggregate(run_dir: Path, manifest_path: Path) -> dict[str, Any]:
+    manifest = load_manifest(manifest_path)
+    all_trials = []
+    for metadata_path in sorted((run_dir / "tasks").glob("*/*/metadata.json")):
+        metadata = read_json(metadata_path)
+        metrics_path = metadata_path.parent / "metrics.json"
+        validation_path = metadata_path.parent / "validation.json"
+        if not metrics_path.is_file() or not validation_path.is_file():
+            raise ValueError(f"incomplete trial artifacts: {metadata_path.parent}")
+        events, event_errors = read_events(metadata_path.parent / "events.jsonl")
+        if event_errors:
+            raise ValueError(f"invalid trial events: {metadata_path.parent}: {event_errors}")
+        thread_ids = [
+            event.get("thread_id") for event in events if event.get("type") == "thread.started"
+        ]
+        if len(thread_ids) != 1 or not isinstance(thread_ids[0], str) or not thread_ids[0]:
+            raise ValueError(f"trial has invalid thread identity: {metadata_path.parent}")
+        all_trials.append(
+            {
+                "metadata": metadata,
+                "metrics": read_json(metrics_path),
+                "validation": read_json(validation_path),
+                "thread_id": thread_ids[0],
+            }
+        )
+    expected_entries = suite_schedule(
+        tasks=manifest["tasks"],
+        arms=manifest["arms"],
+        seed=manifest["seed"],
+    )
+    expected_membership = sorted(
+        (
+            entry.ordinal,
+            entry.task_index,
+            entry.task_id,
+            entry.repository,
+            entry.arm,
+        )
+        for entry in expected_entries
+    )
+    observed_membership = []
+    for trial in all_trials:
+        metadata = trial["metadata"]
+        ordinal = metadata.get("ordinal")
+        arm = metadata.get("arm")
+        task_index = metadata.get("task_index")
+        task_id = metadata.get("task_id")
+        repository = metadata.get("repository")
+        if (
+            isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+            or not isinstance(arm, str)
+            or isinstance(task_index, bool)
+            or not isinstance(task_index, int)
+            or not isinstance(task_id, str)
+            or not isinstance(repository, str)
+        ):
+            raise ValueError(f"trial has malformed schedule metadata: {metadata}")
+        observed_membership.append((ordinal, task_index, task_id, repository, arm))
+    observed_membership.sort()
+    if observed_membership != expected_membership:
+        raise ValueError(
+            "trial artifacts do not match the frozen schedule: "
+            f"expected={expected_membership}, observed={observed_membership}"
+        )
+    thread_ids = [trial["thread_id"] for trial in all_trials]
+    if len(thread_ids) != len(set(thread_ids)):
+        raise ValueError("trials reused a Codex thread_id")
+    trials = all_trials
+    expected = len(manifest["arms"]) * len(manifest["tasks"])
+    if len(trials) != expected:
+        raise ValueError(f"expected {expected} measured trials, found {len(trials)}")
+    by_arm = {
+        arm: [trial for trial in trials if trial["metadata"]["arm"] == arm]
+        for arm in manifest["arms"]
+    }
+    valid_by_arm = {
+        arm: [trial for trial in arm_trials if trial["metrics"].get("valid")]
+        for arm, arm_trials in by_arm.items()
+    }
+    seed = int(manifest["seed"])
+    return {
+        "suite_id": manifest["suite_id"],
+        "repositories": manifest["repositories"],
+        "expected_measured_trials": expected,
+        "observed_measured_trials": len(trials),
+        "intention_to_treat": {
+            arm: _summary(arm_trials, seed + index * 100)
+            for index, (arm, arm_trials) in enumerate(by_arm.items())
+        },
+        "valid_only": {
+            arm: _summary(arm_trials, seed + 1_000 + index * 100)
+            for index, (arm, arm_trials) in enumerate(valid_by_arm.items())
+        },
+        "paired_deltas": _paired_deltas(trials, seed + 2_000),
+        "trial_outcomes": [
+            {
+                "arm": trial["metadata"]["arm"],
+                "task_index": trial["metadata"]["task_index"],
+                "task_id": trial["metadata"]["task_id"],
+                "repository": trial["metadata"]["repository"],
+                "valid": trial["metrics"].get("valid"),
+                "correct": trial["metrics"].get("correct"),
+                "success": trial["metrics"].get("success"),
+                "evidence_compliant": trial["metrics"].get("evidence_compliant"),
+            }
+            for trial in trials
+        ],
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("run_dir", type=Path)
+    parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    report = aggregate(args.run_dir.resolve(), args.manifest.resolve())
+    if args.output:
+        write_json_new(args.output.resolve(), report)
+    print(json.dumps(report, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"aggregation error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+
+
+================================================================================
+FILE: benchmark_lib.py
+================================================================================
+"""Shared, dependency-free helpers for the multi-repository Codex benchmark."""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import math
+import os
+import random
+import re
+import statistics
+import subprocess
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+EVALUATION_DIR = Path(__file__).resolve().parent
+MANIFEST_PATH = EVALUATION_DIR / "benchmark-manifest.json"
+ALLOWED_CODEKG_TOOLS = {
+    "search_symbols",
+    "get_definition",
+    "find_callers",
+    "find_callees",
+}
+SNAPSHOT_SUFFIXES = {".py", ".md"}
+SNAPSHOT_SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "env",
+    "node_modules",
+    "venv",
+    "vendor",
+}
+
+
+def read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json_new(path: Path, value: object) -> None:
+    """Create a JSON artifact without replacing an existing result."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    with os.fdopen(os.open(path, flags, 0o644), "w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def write_text_new(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    with os.fdopen(os.open(path, flags, 0o644), "w", encoding="utf-8") as handle:
+        handle.write(value)
+
+
+def load_manifest(path: Path = MANIFEST_PATH) -> dict[str, Any]:
+    value = read_json(path)
+    if not isinstance(value, dict) or value.get("version") != 2:
+        raise ValueError(f"unsupported benchmark manifest: {path}")
+    repositories = value.get("repositories")
+    tasks = value.get("tasks")
+    if not isinstance(repositories, list) or not repositories:
+        raise ValueError("benchmark manifest must contain repositories")
+    if not isinstance(tasks, list) or len(tasks) != 10:
+        raise ValueError("benchmark manifest must contain exactly ten tasks")
+    repository_names = [item.get("name") for item in repositories if isinstance(item, dict)]
+    invalid_repository_names = len(repository_names) != len(repositories)
+    duplicate_repository_names = len(set(repository_names)) != len(repositories)
+    if invalid_repository_names or duplicate_repository_names:
+        raise ValueError("benchmark repository names must be unique strings")
+    expected_indices = list(range(1, len(tasks) + 1))
+    indices = [item.get("index") for item in tasks if isinstance(item, dict)]
+    if indices != expected_indices:
+        raise ValueError(f"benchmark task indices must be contiguous: {expected_indices}")
+    task_ids = [item.get("task_id") for item in tasks if isinstance(item, dict)]
+    slugs = [item.get("slug") for item in tasks if isinstance(item, dict)]
+    if len(set(task_ids)) != len(tasks) or len(set(slugs)) != len(tasks):
+        raise ValueError("benchmark task IDs and slugs must be unique")
+    if any(item.get("repository") not in repository_names for item in tasks):
+        raise ValueError("benchmark task references an unknown repository")
+    return value
+
+
+def resolve_manifest_file(manifest_path: Path, relative: str) -> Path:
+    path = (manifest_path.resolve().parent / relative).resolve()
+    path.relative_to(manifest_path.resolve().parent)
+    return path
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def source_snapshot_hash(root: Path) -> str:
+    """Match CodeKG's content identity for mounted non-Git source subtrees."""
+    digest = hashlib.sha256()
+    paths = [
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in SNAPSHOT_SUFFIXES
+        and not any(part in SNAPSHOT_SKIP_DIRS for part in path.relative_to(root).parts)
+    ]
+    for path in sorted(paths):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
+def repository_snapshot_commit(repository: Path, identity: str) -> str:
+    if identity == "content":
+        return source_snapshot_hash(repository)
+    if identity != "git":
+        raise ValueError(f"unsupported repository identity: {identity}")
+    process = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode:
+        return ""
+    return process.stdout.strip()
+
+
+def snapshot_hashes(manifest_path: Path, profile_path: Path) -> dict[str, str]:
+    manifest = load_manifest(manifest_path)
+    relative_files = [manifest["schema_file"]]
+    for task in manifest["tasks"]:
+        relative_files.append(task["gold_file"])
+        relative_files.extend(task["prompt_files"].values())
+    files = [
+        manifest_path,
+        *(resolve_manifest_file(manifest_path, item) for item in relative_files),
+    ]
+    files.extend(
+        [
+            EVALUATION_DIR / "benchmark_lib.py",
+            EVALUATION_DIR / "run_benchmark.py",
+            EVALUATION_DIR / "validate_benchmark.py",
+            EVALUATION_DIR / "aggregate_benchmark.py",
+            profile_path,
+        ]
+    )
+    return {str(path.resolve()): sha256_file(path) for path in files}
+
+
+@dataclass(frozen=True)
+class ScheduleEntry:
+    ordinal: int
+    task_index: int
+    task_id: str
+    slug: str
+    repository: str
+    arm: str
+
+    @property
+    def trial_name(self) -> str:
+        return f"{self.task_index:02d}-{self.slug}"
+
+
+def suite_schedule(
+    *, tasks: Sequence[Mapping[str, Any]], arms: Sequence[str], seed: int
+) -> list[ScheduleEntry]:
+    if list(arms) != ["codekg", "native"]:
+        raise ValueError("the benchmark requires codekg and native arms")
+    if not tasks or len(tasks) % 2:
+        raise ValueError("the benchmark requires a positive even task count")
+
+    randomizer = random.Random(seed)
+    first_arms = ["codekg"] * (len(tasks) // 2) + ["native"] * (len(tasks) // 2)
+    randomizer.shuffle(first_arms)
+    entries: list[ScheduleEntry] = []
+    for task, first in zip(tasks, first_arms, strict=True):
+        second = "native" if first == "codekg" else "codekg"
+        for arm in (first, second):
+            entries.append(
+                ScheduleEntry(
+                    ordinal=len(entries),
+                    task_index=int(task["index"]),
+                    task_id=str(task["task_id"]),
+                    slug=str(task["slug"]),
+                    repository=str(task["repository"]),
+                    arm=arm,
+                )
+            )
+    return entries
+
+
+def read_events(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    events: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            errors.append(f"events.jsonl line {line_number}: {exc.msg}")
+            continue
+        if not isinstance(value, dict):
+            errors.append(f"events.jsonl line {line_number}: event is not an object")
+            continue
+        events.append(value)
+    return events, errors
+
+
+def completed_items(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    result = []
+    for event in events:
+        item = event.get("item")
+        if event.get("type") == "item.completed" and isinstance(item, dict):
+            result.append(item)
+    return result
+
+
+def successful_mcp_items(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in completed_items(events)
+        if item.get("type") == "mcp_tool_call"
+        and item.get("status") == "completed"
+        and not item.get("error")
+        and isinstance(item.get("result"), dict)
+    ]
+
+
+def structured_content(item: Mapping[str, Any]) -> Any:
+    result = item.get("result")
+    if not isinstance(result, Mapping):
+        return None
+    return result.get("structured_content", result.get("structuredContent"))
+
+
+def result_rows(item: Mapping[str, Any]) -> list[dict[str, Any]]:
+    structured = structured_content(item)
+    if isinstance(structured, list):
+        return [row for row in structured if isinstance(row, dict)]
+    if not isinstance(structured, Mapping):
+        return []
+    for key in ("results", "result"):
+        rows = structured.get(key)
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
+        if isinstance(rows, dict):
+            return [rows]
+    return []
+
+
+def _walk(value: Any) -> Iterable[Any]:
+    yield value
+    if isinstance(value, Mapping):
+        for nested in value.values():
+            yield from _walk(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _walk(nested)
+
+
+def _all_strings(value: Any) -> set[str]:
+    return {item for item in _walk(value) if isinstance(item, str)}
+
+
+def _valid_relative_path(value: object) -> bool:
+    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+        return False
+    if value.startswith("/") or re.match(r"^[A-Za-z]:", value):
+        return False
+    path = PurePosixPath(value)
+    return all(part not in {"", ".", ".."} for part in path.parts)
+
+
+def validate_answer_schema(answer: object) -> list[str]:
+    if not isinstance(answer, dict):
+        return ["answer is not a JSON object"]
+    errors: list[str] = []
+    required = {"task_id", "answer", "symbols", "files", "evidence", "confidence"}
+    unknown = set(answer) - required
+    missing = required - set(answer)
+    if missing:
+        errors.append(f"answer missing fields: {sorted(missing)}")
+    if unknown:
+        errors.append(f"answer has unknown fields: {sorted(unknown)}")
+    if not isinstance(answer.get("task_id"), str):
+        errors.append("task_id must be a string")
+    if not isinstance(answer.get("answer"), str) or not answer["answer"].strip():
+        errors.append("answer must be a nonempty string")
+    symbols = answer.get("symbols")
+    if not isinstance(symbols, list) or any(not isinstance(item, str) for item in symbols):
+        errors.append("symbols must be an array of strings")
+    elif len(symbols) < 2 or len(set(symbols)) != len(symbols):
+        errors.append("symbols must contain at least two unique entries")
+    files = answer.get("files")
+    if not isinstance(files, list):
+        errors.append("files must be an array")
+    else:
+        if not files:
+            errors.append("files must contain at least one entry")
+        elif all(isinstance(item, str) for item in files) and len(set(files)) != len(files):
+            errors.append("files entries must be unique")
+        for path in files:
+            if not _valid_relative_path(path):
+                errors.append(f"invalid repository-relative POSIX path: {path!r}")
+    evidence = answer.get("evidence")
+    if not isinstance(evidence, list):
+        errors.append("evidence must be an array")
+    else:
+        if len(evidence) < 2:
+            errors.append("evidence must contain the primary symbol and a related symbol")
+        for index, item in enumerate(evidence):
+            if not isinstance(item, dict):
+                errors.append(f"evidence[{index}] must be an object")
+                continue
+            if set(item) != {"symbol", "file", "start_line", "end_line"}:
+                errors.append(f"evidence[{index}] has incorrect fields")
+            if not isinstance(item.get("symbol"), str) or not item.get("symbol"):
+                errors.append(f"evidence[{index}].symbol must be a nonempty string")
+            if not _valid_relative_path(item.get("file")):
+                errors.append(f"evidence[{index}].file is not a relative POSIX path")
+            start = item.get("start_line")
+            end = item.get("end_line")
+            if isinstance(start, bool) or not isinstance(start, int) or start < 1:
+                errors.append(f"evidence[{index}].start_line must be a positive integer")
+            if isinstance(end, bool) or not isinstance(end, int) or end < 1:
+                errors.append(f"evidence[{index}].end_line must be a positive integer")
+            if isinstance(start, int) and isinstance(end, int) and end < start:
+                errors.append(f"evidence[{index}] has end_line before start_line")
+    confidence = answer.get("confidence")
+    if (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not 0 <= confidence <= 1
+    ):
+        errors.append("confidence must be a number between 0 and 1")
+    if (
+        isinstance(symbols, list)
+        and all(isinstance(item, str) for item in symbols)
+        and isinstance(evidence, list)
+    ):
+        evidence_symbols = {item.get("symbol") for item in evidence if isinstance(item, Mapping)}
+        if (
+            all(isinstance(item, str) for item in evidence_symbols)
+            and set(symbols) != evidence_symbols
+        ):
+            errors.append("symbols must equal the symbols represented in evidence")
+    if (
+        isinstance(files, list)
+        and all(isinstance(item, str) for item in files)
+        and isinstance(evidence, list)
+    ):
+        evidence_files = {item.get("file") for item in evidence if isinstance(item, Mapping)}
+        if all(isinstance(item, str) for item in evidence_files) and set(files) != evidence_files:
+            errors.append("files must equal the files represented in evidence")
+    return errors
+
+
+def validate_repository_identity_and_paths(
+    answer: Mapping[str, Any],
+    repository: Path,
+    expected_commit: str,
+    identity: str,
+) -> list[str]:
+    errors: list[str] = []
+    observed_commit = repository_snapshot_commit(repository, identity)
+    if not observed_commit or not observed_commit.startswith(expected_commit):
+        errors.append(
+            f"repository commit mismatch: expected {expected_commit}, "
+            f"got {observed_commit or '<unavailable>'}"
+        )
+    files = answer.get("files")
+    evidence = answer.get("evidence")
+    paths = [
+        *(files if isinstance(files, list) else []),
+        *[
+            item.get("file")
+            for item in (evidence if isinstance(evidence, list) else [])
+            if isinstance(item, Mapping)
+        ],
+    ]
+    for value in paths:
+        if not _valid_relative_path(value):
+            continue
+        resolved = (repository / str(value)).resolve()
+        try:
+            resolved.relative_to(repository.resolve())
+        except ValueError:
+            errors.append(f"reported path escapes repository through a symlink: {value}")
+            continue
+        if not resolved.is_file():
+            errors.append(f"reported path does not exist in repository: {value}")
+    return errors
+
+
+def _answer_from_final_message(events: Sequence[dict[str, Any]]) -> Any:
+    messages = [
+        item.get("text")
+        for item in completed_items(events)
+        if item.get("type") == "agent_message" and isinstance(item.get("text"), str)
+    ]
+    if not messages:
+        return None
+    try:
+        return json.loads(messages[-1])
+    except json.JSONDecodeError:
+        return None
+
+
+def _identifier(arguments: object) -> str | None:
+    if not isinstance(arguments, Mapping):
+        return None
+    for key in ("identifier", "symbol_id", "key"):
+        value = arguments.get(key)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def validate_codekg_protocol(
+    events: Sequence[dict[str, Any]], repository: str
+) -> tuple[list[str], dict[str, Any]]:
+    errors: list[str] = []
+    all_items = completed_items(events)
+    mcp_items = [item for item in all_items if item.get("type") == "mcp_tool_call"]
+    commands = [item for item in all_items if item.get("type") == "command_execution"]
+    if commands:
+        errors.append("CodeKG arm used a shell command")
+    if any("web" in str(item.get("type", "")).lower() for item in all_items):
+        errors.append("CodeKG arm used web search")
+    wrong_server = [item for item in mcp_items if item.get("server") != "codekg"]
+    if wrong_server:
+        errors.append("CodeKG arm used an MCP server other than codekg")
+    tools = [str(item.get("tool")) for item in mcp_items]
+    forbidden = sorted(set(tools) - ALLOWED_CODEKG_TOOLS)
+    if forbidden:
+        errors.append(f"CodeKG arm used disallowed tools: {forbidden}")
+    failed_tools = [
+        str(item.get("tool"))
+        for item in mcp_items
+        if item.get("status") != "completed" or item.get("error") or item.get("result") is None
+    ]
+    if failed_tools:
+        errors.append(f"CodeKG arm had failed or incomplete tool calls: {failed_tools}")
+
+    successful = successful_mcp_items(events)
+    by_tool: dict[str, list[dict[str, Any]]] = {}
+    for item in successful:
+        by_tool.setdefault(str(item.get("tool")), []).append(item)
+    searches = by_tool.get("search_symbols", [])
+    if not 1 <= len(searches) <= 2:
+        errors.append("CodeKG arm must complete one or two search_symbols calls")
+    for search in searches:
+        arguments = search.get("arguments")
+        if not isinstance(arguments, Mapping):
+            errors.append("search_symbols arguments are missing")
+            continue
+        if arguments.get("repository") != repository:
+            errors.append(f"search_symbols must use repository={repository}")
+        if arguments.get("scope") != "source":
+            errors.append("search_symbols must use scope=source")
+        limit = arguments.get("limit")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 5:
+            errors.append("search_symbols limit must be an integer from 1 to 5")
+
+    definitions = by_tool.get("get_definition", [])
+    callers = by_tool.get("find_callers", [])
+    callees = by_tool.get("find_callees", [])
+    if len(definitions) != 1:
+        errors.append("CodeKG arm must complete exactly one get_definition call")
+    if len(callers) != 1:
+        errors.append("CodeKG arm must complete exactly one find_callers call")
+    if len(callees) != 1:
+        errors.append("CodeKG arm must complete exactly one find_callees call")
+
+    selected = _identifier(definitions[0].get("arguments")) if len(definitions) == 1 else None
+    if selected:
+        search_strings = {
+            value for search in searches for value in _all_strings(structured_content(search))
+        }
+        if selected not in search_strings:
+            errors.append("get_definition identifier was not returned by search_symbols")
+        for relationship in [*callers, *callees]:
+            if _identifier(relationship.get("arguments")) != selected:
+                errors.append("definition and relationship calls must use the same symbol ID")
+    elif definitions:
+        errors.append("get_definition did not use an exact symbol identifier")
+
+    successful_order = [str(item.get("tool")) for item in successful]
+    if searches and definitions and callers and callees:
+        search_position = max(
+            index for index, tool in enumerate(successful_order) if tool == "search_symbols"
+        )
+        definition_position = successful_order.index("get_definition")
+        caller_position = successful_order.index("find_callers")
+        callee_position = successful_order.index("find_callees")
+        if not search_position < definition_position < min(caller_position, callee_position):
+            errors.append(
+                "required CodeKG calls were not completed in search/definition/relations order"
+            )
+    relation_rows = [row for item in [*callers, *callees] for row in result_rows(item)]
+    if not relation_rows:
+        errors.append("both relationship calls were empty")
+    if len(searches) == 2:
+        first_search = structured_content(searches[0])
+        if isinstance(first_search, Mapping) and isinstance(
+            first_search.get("recommended_symbol_id"), str
+        ):
+            errors.append("a second search followed a recommended candidate")
+    return errors, {
+        "selected_symbol_id": selected,
+        "search_calls": len(searches),
+        "relationship_rows": len(relation_rows),
+    }
+
+
+def validate_codekg_provenance(
+    answer: Mapping[str, Any], events: Sequence[dict[str, Any]]
+) -> list[str]:
+    errors: list[str] = []
+    payloads = [structured_content(item) for item in successful_mcp_items(events)]
+    strings: set[str] = set()
+    records: set[tuple[str, int, int]] = set()
+    for payload in payloads:
+        strings.update(_all_strings(payload))
+        for value in _walk(payload):
+            if not isinstance(value, Mapping):
+                continue
+            file = value.get("file")
+            start = value.get("start_line")
+            end = value.get("end_line")
+            if isinstance(file, str) and isinstance(start, int) and isinstance(end, int):
+                records.add((file, start, end))
+    symbols = answer.get("symbols")
+    files = answer.get("files")
+    evidence_items = answer.get("evidence")
+    for symbol in symbols if isinstance(symbols, list) else []:
+        if symbol not in strings:
+            errors.append(f"reported symbol was not returned by CodeKG: {symbol}")
+    for path in files if isinstance(files, list) else []:
+        if path not in strings:
+            errors.append(f"reported file was not returned by CodeKG: {path}")
+    for evidence in evidence_items if isinstance(evidence_items, list) else []:
+        if not isinstance(evidence, Mapping):
+            continue
+        symbol = evidence.get("symbol")
+        record = (evidence.get("file"), evidence.get("start_line"), evidence.get("end_line"))
+        if symbol not in strings:
+            errors.append(f"evidence symbol was not returned by CodeKG: {symbol}")
+        if record not in records:
+            errors.append(f"evidence range was not returned by CodeKG: {record}")
+    return errors
+
+
+def validate_codekg_result_scope(
+    events: Sequence[dict[str, Any]], *, repository: str, commit: str
+) -> list[str]:
+    errors: list[str] = []
+    short_commit = commit[:12]
+    symbol_prefix = f"{repository}@{short_commit}:"
+    for item in successful_mcp_items(events):
+        payload = structured_content(item)
+        for value in _walk(payload):
+            if not isinstance(value, Mapping):
+                continue
+            for key in ("repository", "repo"):
+                observed_repository = value.get(key)
+                if isinstance(observed_repository, str) and observed_repository != repository:
+                    errors.append(
+                        f"{item.get('tool')} returned cross-repository {key}: {observed_repository}"
+                    )
+            observed_commit = value.get("commit")
+            if (
+                isinstance(observed_commit, str)
+                and not commit.startswith(observed_commit)
+                and not observed_commit.startswith(commit)
+            ):
+                errors.append(f"{item.get('tool')} returned wrong commit: {observed_commit}")
+            for key in ("symbol_id", "key"):
+                identifier = value.get(key)
+                if (
+                    isinstance(identifier, str)
+                    and "@" in identifier
+                    and not identifier.startswith(symbol_prefix)
+                ):
+                    errors.append(f"{item.get('tool')} returned cross-snapshot {key}: {identifier}")
+    return errors
+
+
+def _definition_ranges(repository: Path) -> dict[tuple[str, str], tuple[int, int]]:
+    result: dict[tuple[str, str], tuple[int, int]] = {}
+    for path in repository.rglob("*.py"):
+        relative = path.relative_to(repository).as_posix()
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+
+        def visit(
+            nodes: Iterable[ast.stmt],
+            prefix: tuple[str, ...] = (),
+            relative_path: str = relative,
+        ) -> None:
+            for node in nodes:
+                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    name = ".".join((*prefix, node.name))
+                    result[(relative_path, name)] = (
+                        node.lineno,
+                        node.end_lineno or node.lineno,
+                    )
+                    visit(node.body, (*prefix, node.name), relative_path)
+
+        visit(tree.body)
+    return result
+
+
+def _command_proves_numbered_range(
+    command_item: Mapping[str, Any], file: str, start_line: int, end_line: int
+) -> bool:
+    command = command_item.get("command")
+    output = command_item.get("aggregated_output")
+    if not isinstance(command, str) or not isinstance(output, str):
+        return False
+    path_pattern = rf"(?<![A-Za-z0-9_./-]){re.escape(file)}(?![A-Za-z0-9_./-])"
+    if re.search(path_pattern, command) is None:
+        return False
+    numbered_lines = set()
+    for line in output.splitlines():
+        match = re.match(r"^[ \t]*(\d+)(?:\t| +)", line)
+        if match:
+            numbered_lines.add(int(match.group(1)))
+    return set(range(start_line, end_line + 1)).issubset(numbered_lines)
+
+
+def validate_native(
+    answer: Mapping[str, Any], events: Sequence[dict[str, Any]], repository: Path
+) -> list[str]:
+    errors: list[str] = []
+    items = completed_items(events)
+    if any(item.get("type") == "mcp_tool_call" for item in items):
+        errors.append("native arm used an MCP tool")
+    if any("web" in str(item.get("type", "")).lower() for item in items):
+        errors.append("native arm used web search")
+    commands = [
+        item
+        for item in items
+        if item.get("type") == "command_execution"
+        and item.get("status") == "completed"
+        and item.get("exit_code") == 0
+    ]
+    if not commands:
+        return [*errors, "native arm completed no successful shell command"]
+    command_text = "\n".join(
+        f"{item.get('command', '')}\n{item.get('aggregated_output', '')}" for item in commands
+    )
+    if not re.search(r"\b(rg|grep|find)\b", command_text):
+        errors.append("native arm did not perform a recognizable repository search")
+    ranges = _definition_ranges(repository)
+    answer_evidence = answer.get("evidence")
+    for evidence in answer_evidence if isinstance(answer_evidence, list) else []:
+        if not isinstance(evidence, Mapping):
+            continue
+        file = evidence.get("file")
+        symbol = evidence.get("symbol")
+        start_line = evidence.get("start_line")
+        end_line = evidence.get("end_line")
+        if (
+            not isinstance(file, str)
+            or isinstance(start_line, bool)
+            or not isinstance(start_line, int)
+            or isinstance(end_line, bool)
+            or not isinstance(end_line, int)
+            or end_line < start_line
+        ):
+            errors.append(f"native evidence file was not inspected: {file}")
+            continue
+        if not any(
+            _command_proves_numbered_range(command, file, start_line, end_line)
+            for command in commands
+        ):
+            errors.append(
+                "native evidence definition was not inspected with numbered "
+                f"full-definition output: {file}:{start_line}-{end_line}"
+            )
+        suffix = str(symbol).split(":")[-2 if str(symbol).count(":") >= 2 else -1]
+        suffix = suffix.removeprefix("src.")
+        candidates = [
+            bounds
+            for (candidate_file, name), bounds in ranges.items()
+            if candidate_file == file and (suffix.endswith(name) or name.endswith(suffix))
+        ]
+        reported = (start_line, end_line)
+        if reported not in candidates:
+            errors.append(f"native evidence does not match an AST definition: {symbol} {reported}")
+    return errors
+
+
+def _matches_symbol(value: str, accepted_suffixes: Sequence[str]) -> bool:
+    return any(value.endswith(suffix) or suffix in value for suffix in accepted_suffixes)
+
+
+def grade_answer(answer: Mapping[str, Any], gold: Mapping[str, Any]) -> dict[str, Any]:
+    answer_evidence = answer.get("evidence")
+    evidence = [
+        item
+        for item in (answer_evidence if isinstance(answer_evidence, list) else [])
+        if isinstance(item, Mapping)
+    ]
+    primary = gold["primary"]
+    primary_matches = [
+        item
+        for item in evidence
+        if item.get("file") == primary["file"]
+        and item.get("start_line") == primary["start_line"]
+        and item.get("end_line") == primary["end_line"]
+        and _matches_symbol(str(item.get("symbol", "")), primary["accepted_suffixes"])
+    ]
+    relevant_matches = []
+    for expected in gold["relevant"]:
+        matched = any(
+            item.get("file") == expected["file"]
+            and item.get("start_line") == expected["start_line"]
+            and item.get("end_line") == expected["end_line"]
+            and _matches_symbol(str(item.get("symbol", "")), expected["accepted_suffixes"])
+            for item in evidence
+        )
+        relevant_matches.append({"symbol": expected["symbol"], "matched": matched})
+    infra_answer = str(answer.get("answer", "")).startswith("INFRA_ERROR:")
+    return {
+        "primary_correct": bool(primary_matches),
+        "relevant_correct": any(item["matched"] for item in relevant_matches),
+        "relevant_matches": relevant_matches,
+        "correct": bool(primary_matches) and any(item["matched"] for item in relevant_matches),
+        "infra_error_answer": infra_answer,
+    }
+
+
+def _target_search_metrics(
+    events: Sequence[dict[str, Any]], suffixes: Sequence[str]
+) -> tuple[int | None, int | None]:
+    search_number = 0
+    for item in successful_mcp_items(events):
+        if item.get("tool") != "search_symbols":
+            continue
+        search_number += 1
+        for rank, row in enumerate(result_rows(item), start=1):
+            strings = _all_strings(row)
+            if any(_matches_symbol(value, suffixes) for value in strings):
+                return rank, search_number - 1
+    return None, None
+
+
+def collect_metrics(
+    *,
+    arm: str,
+    events: Sequence[dict[str, Any]],
+    answer: Mapping[str, Any],
+    gold: Mapping[str, Any],
+    wall_seconds: float | None,
+    exit_code: int | None,
+    valid: bool,
+    evidence_compliant: bool,
+    correctness: Mapping[str, Any],
+    unsupported_claim_count: int,
+) -> dict[str, Any]:
+    usage = {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+    }
+    for event in events:
+        if event.get("type") != "turn.completed" or not isinstance(event.get("usage"), Mapping):
+            continue
+        for key in usage:
+            value = event["usage"].get(key, 0)
+            if isinstance(value, int):
+                usage[key] += value
+    uncached = max(0, usage["input_tokens"] - usage["cached_input_tokens"])
+    input_tokens = usage["input_tokens"]
+    target_rank, searches_before_target = _target_search_metrics(
+        events, gold["primary"]["accepted_suffixes"]
+    )
+    mcp_items = [item for item in completed_items(events) if item.get("type") == "mcp_tool_call"]
+    response_bytes = sum(
+        len(json.dumps(item.get("result"), separators=(",", ":"), ensure_ascii=False).encode())
+        for item in mcp_items
+        if item.get("result") is not None
+    )
+    relationship_rows = [
+        row
+        for item in successful_mcp_items(events)
+        if item.get("tool") in {"find_callers", "find_callees"}
+        for row in result_rows(item)
+    ]
+    complete_relationships = sum(
+        isinstance(row.get("file"), str)
+        and isinstance(row.get("start_line"), int)
+        and isinstance(row.get("end_line"), int)
+        for row in relationship_rows
+    )
+    search_items = [
+        item for item in successful_mcp_items(events) if item.get("tool") == "search_symbols"
+    ]
+    failed_operations = [
+        item
+        for item in completed_items(events)
+        if item.get("type") in {"mcp_tool_call", "command_execution"}
+        and (
+            item.get("status") != "completed"
+            or item.get("error")
+            or (item.get("type") == "command_execution" and item.get("exit_code") not in {None, 0})
+        )
+    ]
+    return {
+        "arm": arm,
+        "infrastructure_success": exit_code in {None, 0} and not failed_operations,
+        "valid": valid,
+        "evidence_compliant": evidence_compliant,
+        "unsupported_claim_count": unsupported_claim_count,
+        "correct": bool(correctness.get("correct")),
+        "success": valid and bool(correctness.get("correct")),
+        "wall_seconds": wall_seconds,
+        "turns": sum(event.get("type") == "turn.started" for event in events),
+        "tool_calls": len(
+            [
+                item
+                for item in completed_items(events)
+                if item.get("type") in {"mcp_tool_call", "command_execution"}
+            ]
+        ),
+        "response_bytes": response_bytes,
+        "search_calls": len(search_items),
+        "candidate_count": sum(len(result_rows(item)) for item in search_items),
+        "target_rank": target_rank,
+        "searches_before_target": searches_before_target,
+        "recall_at_1": target_rank == 1,
+        "recall_at_5": target_rank is not None and target_rank <= 5,
+        "reciprocal_rank": 1 / target_rank if target_rank else 0.0,
+        "relationship_rows": len(relationship_rows),
+        "relationship_location_completeness": (
+            complete_relationships / len(relationship_rows) if relationship_rows else None
+        ),
+        "tokens": {
+            "input": input_tokens,
+            "cached_input": usage["cached_input_tokens"],
+            "uncached_input": uncached,
+            "cache_hit_ratio": usage["cached_input_tokens"] / input_tokens
+            if input_tokens
+            else None,
+            "output": usage["output_tokens"],
+            "reasoning": usage["reasoning_output_tokens"],
+        },
+    }
+
+
+def validate_trial(
+    *,
+    arm: str,
+    events_path: Path,
+    answer_path: Path,
+    repository: Path,
+    gold_path: Path,
+    wall_seconds: float | None = None,
+    exit_code: int | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    events, event_errors = read_events(events_path)
+    thread_ids = [
+        event.get("thread_id") for event in events if event.get("type") == "thread.started"
+    ]
+    if len(thread_ids) != 1 or not isinstance(thread_ids[0], str) or not thread_ids[0]:
+        event_errors.append("trial must contain exactly one nonempty thread.started thread_id")
+    try:
+        answer = read_json(answer_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        answer = {}
+        event_errors.append(f"cannot read answer.json: {exc}")
+    gold = read_json(gold_path)
+    errors = [*event_errors, *validate_answer_schema(answer)]
+    if isinstance(answer, Mapping) and answer.get("task_id") != gold["task_id"]:
+        errors.append(f"answer task_id does not match {gold['task_id']}")
+    final_answer = _answer_from_final_message(events)
+    if final_answer is None:
+        errors.append("final JSONL agent message is not a JSON object")
+    elif final_answer != answer:
+        errors.append("final JSONL agent message does not match answer.json")
+    protocol: dict[str, Any] = {}
+    provenance_errors: list[str] = []
+    if isinstance(answer, Mapping):
+        if arm == "codekg":
+            protocol_errors, protocol = validate_codekg_protocol(events, gold["repository"])
+            errors.extend(protocol_errors)
+            provenance_errors = validate_codekg_provenance(answer, events)
+            errors.extend(
+                validate_codekg_result_scope(
+                    events,
+                    repository=gold["repository"],
+                    commit=gold["commit"],
+                )
+            )
+        elif arm == "native":
+            provenance_errors = validate_native(answer, events, repository)
+        else:
+            errors.append(f"unknown arm: {arm}")
+    errors.extend(provenance_errors)
+    if isinstance(answer, Mapping):
+        errors.extend(
+            validate_repository_identity_and_paths(
+                answer,
+                repository,
+                gold["commit"],
+                gold["identity"],
+            )
+        )
+    if arm == "codekg" and isinstance(answer, Mapping):
+        relationship_strings = {
+            value
+            for item in successful_mcp_items(events)
+            if item.get("tool") in {"find_callers", "find_callees"}
+            for value in _all_strings(structured_content(item))
+        }
+        relevant_suffixes = [
+            suffix for relevant in gold["relevant"] for suffix in relevant["accepted_suffixes"]
+        ]
+        if not any(_matches_symbol(value, relevant_suffixes) for value in relationship_strings):
+            errors.append("relationship results did not contain a gold-relevant symbol")
+    correctness = grade_answer(answer, gold) if isinstance(answer, Mapping) else {"correct": False}
+    answer_evidence = answer.get("evidence") if isinstance(answer, Mapping) else None
+    evidence_compliant = (
+        not provenance_errors and isinstance(answer_evidence, list) and len(answer_evidence) >= 2
+    )
+    valid = not errors and exit_code in {None, 0}
+    validation = {
+        "arm": arm,
+        "valid": valid,
+        "errors": errors,
+        "protocol": protocol,
+        "correctness": correctness,
+        "evidence_compliant": evidence_compliant,
+        "unsupported_claim_count": len(provenance_errors),
+    }
+    metrics = collect_metrics(
+        arm=arm,
+        events=events,
+        answer=answer if isinstance(answer, Mapping) else {},
+        gold=gold,
+        wall_seconds=wall_seconds,
+        exit_code=exit_code,
+        valid=valid,
+        evidence_compliant=evidence_compliant,
+        correctness=correctness,
+        unsupported_claim_count=len(provenance_errors),
+    )
+    return validation, metrics
+
+
+def percentile(values: Sequence[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = max(0, math.ceil(fraction * len(ordered)) - 1)
+    return ordered[position]
+
+
+def bootstrap_median_ci(
+    values: Sequence[float], *, seed: int, samples: int = 10_000
+) -> list[float] | None:
+    if not values:
+        return None
+    randomizer = random.Random(seed)
+    medians = []
+    for _ in range(samples):
+        sample = [randomizer.choice(values) for _ in values]
+        medians.append(statistics.median(sample))
+    medians.sort()
+    return [
+        medians[math.floor(0.025 * (samples - 1))],
+        medians[math.floor(0.975 * (samples - 1))],
+    ]
+
+
+def summarize_values(values: Sequence[float], *, seed: int) -> dict[str, Any]:
+    return {
+        "samples": list(values),
+        "median": statistics.median(values) if values else None,
+        "p95": percentile(values, 0.95),
+        "bootstrap_median_95_ci": bootstrap_median_ci(values, seed=seed),
+    }
+
+
+
+================================================================================
+FILE: benchmark-manifest.json
+================================================================================
+{
+  "version": 2,
+  "suite_id": "codekg-native-intent-suite-001",
+  "profile": "benchmark",
+  "model": "gpt-5.4-mini",
+  "model_reasoning_effort": "low",
+  "seed": 20260727,
+  "arms": [
+    "codekg",
+    "native"
+  ],
+  "codekg_tools": [
+    "search_symbols",
+    "get_definition",
+    "find_callers",
+    "find_callees"
+  ],
+  "schema_file": "codex-answer.schema.json",
+  "repositories": [
+    {
+      "name": "requests",
+      "source_path": "requests",
+      "identity": "git",
+      "indexed_commit": "f361ead047be",
+      "git_commit": "f361ead047be5cb873174218582f7d8b9fcd9f49"
+    },
+    {
+      "name": "click",
+      "source_path": "click",
+      "identity": "git",
+      "indexed_commit": "333c28d79cd9",
+      "git_commit": "333c28d79cd982990ee98eef61ec20ab1a4f38ba"
+    },
+    {
+      "name": "engine",
+      "source_path": "sqlalchemy/lib/sqlalchemy/engine",
+      "identity": "content",
+      "indexed_commit": "48d85015f44c",
+      "git_commit": "13cbc1af77e11c908ddd798be6941e995356e1a1"
+    },
+    {
+      "name": "pool",
+      "source_path": "sqlalchemy/lib/sqlalchemy/pool",
+      "identity": "content",
+      "indexed_commit": "814c2342b1cf",
+      "git_commit": "13cbc1af77e11c908ddd798be6941e995356e1a1"
+    },
+    {
+      "name": "sql",
+      "source_path": "sqlalchemy/lib/sqlalchemy/sql",
+      "identity": "content",
+      "indexed_commit": "24b988e6a06d",
+      "git_commit": "13cbc1af77e11c908ddd798be6941e995356e1a1"
+    }
+  ],
+  "tasks": [
+    {
+      "index": 1,
+      "task_id": "requests-intent-001",
+      "slug": "requests-prepare-request",
+      "repository": "requests",
+      "prompt_files": {
+        "codekg": "prompts/001-requests-prepare-request-codekg.txt",
+        "native": "prompts/001-requests-prepare-request-native.txt"
+      },
+      "gold_file": "gold/001-requests-prepare-request.gold.json"
+    },
+    {
+      "index": 2,
+      "task_id": "requests-intent-002",
+      "slug": "requests-environment-settings",
+      "repository": "requests",
+      "prompt_files": {
+        "codekg": "prompts/002-requests-environment-settings-codekg.txt",
+        "native": "prompts/002-requests-environment-settings-native.txt"
+      },
+      "gold_file": "gold/002-requests-environment-settings.gold.json"
+    },
+    {
+      "index": 3,
+      "task_id": "click-intent-001",
+      "slug": "click-command-context",
+      "repository": "click",
+      "prompt_files": {
+        "codekg": "prompts/003-click-command-context-codekg.txt",
+        "native": "prompts/003-click-command-context-native.txt"
+      },
+      "gold_file": "gold/003-click-command-context.gold.json"
+    },
+    {
+      "index": 4,
+      "task_id": "click-intent-002",
+      "slug": "click-parse-arguments",
+      "repository": "click",
+      "prompt_files": {
+        "codekg": "prompts/004-click-parse-arguments-codekg.txt",
+        "native": "prompts/004-click-parse-arguments-native.txt"
+      },
+      "gold_file": "gold/004-click-parse-arguments.gold.json"
+    },
+    {
+      "index": 5,
+      "task_id": "engine-intent-001",
+      "slug": "engine-connect",
+      "repository": "engine",
+      "prompt_files": {
+        "codekg": "prompts/005-engine-connect-codekg.txt",
+        "native": "prompts/005-engine-connect-native.txt"
+      },
+      "gold_file": "gold/005-engine-connect.gold.json"
+    },
+    {
+      "index": 6,
+      "task_id": "engine-intent-002",
+      "slug": "engine-execute-context",
+      "repository": "engine",
+      "prompt_files": {
+        "codekg": "prompts/006-engine-execute-context-codekg.txt",
+        "native": "prompts/006-engine-execute-context-native.txt"
+      },
+      "gold_file": "gold/006-engine-execute-context.gold.json"
+    },
+    {
+      "index": 7,
+      "task_id": "pool-intent-001",
+      "slug": "pool-record-checkout",
+      "repository": "pool",
+      "prompt_files": {
+        "codekg": "prompts/007-pool-record-checkout-codekg.txt",
+        "native": "prompts/007-pool-record-checkout-native.txt"
+      },
+      "gold_file": "gold/007-pool-record-checkout.gold.json"
+    },
+    {
+      "index": 8,
+      "task_id": "pool-intent-002",
+      "slug": "pool-queue-acquire",
+      "repository": "pool",
+      "prompt_files": {
+        "codekg": "prompts/008-pool-queue-acquire-codekg.txt",
+        "native": "prompts/008-pool-queue-acquire-native.txt"
+      },
+      "gold_file": "gold/008-pool-queue-acquire.gold.json"
+    },
+    {
+      "index": 9,
+      "task_id": "sql-intent-001",
+      "slug": "sql-visit-select",
+      "repository": "sql",
+      "prompt_files": {
+        "codekg": "prompts/009-sql-visit-select-codekg.txt",
+        "native": "prompts/009-sql-visit-select-native.txt"
+      },
+      "gold_file": "gold/009-sql-visit-select.gold.json"
+    },
+    {
+      "index": 10,
+      "task_id": "sql-intent-002",
+      "slug": "sql-compose-select-body",
+      "repository": "sql",
+      "prompt_files": {
+        "codekg": "prompts/010-sql-compose-select-body-codekg.txt",
+        "native": "prompts/010-sql-compose-select-body-native.txt"
+      },
+      "gold_file": "gold/010-sql-compose-select-body.gold.json"
+    }
+  ]
+}
+
+
+
+================================================================================
+FILE: codex-answer.schema.json
+================================================================================
+{
+  "type": "object",
+  "properties": {
+    "task_id": {
+      "type": "string"
+    },
+    "answer": {
+      "type": "string",
+      "minLength": 1
+    },
+    "symbols": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "properties": {
+          "symbol": { "type": "string", "minLength": 1 },
+          "file": {
+            "type": "string",
+            "minLength": 1
+          },
+          "start_line": { "type": "integer", "minimum": 1 },
+          "end_line": { "type": "integer", "minimum": 1 }
+        },
+        "required": ["symbol", "file", "start_line", "end_line"],
+        "additionalProperties": false
+      }
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    }
+  },
+  "required": [
+    "task_id",
+    "answer",
+    "symbols",
+    "files",
+    "evidence",
+    "confidence"
+  ],
+  "additionalProperties": false
+}
+
+
+
+================================================================================
+FILE: convert2txt.sh
+================================================================================
+#!/bin/bash
+
+# Export the complete evaluation and benchmark harness to one text file.
+# Usage: ./evaluation/convert2txt.sh [output_file]
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_DIR="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+OUTPUT_FILE="${1:-$SCRIPT_DIR/evaluation_harness_export.txt}"
+OUTPUT_DIR="$(dirname "$OUTPUT_FILE")"
+
+if [[ ! -d "$OUTPUT_DIR" ]]; then
+    echo "Error: Output directory does not exist: $OUTPUT_DIR" >&2
+    exit 1
+fi
+
+OUTPUT_FILE_ABS="$(cd "$OUTPUT_DIR" && pwd -P)/$(basename "$OUTPUT_FILE")"
+
+is_harness_source() {
+    local relative_path="$1"
+
+    case "$relative_path" in
+        __pycache__/*|*/__pycache__/*|.pytest_cache/*|*/.pytest_cache/*)
+            return 1
+            ;;
+        results/*|runs/*|output/*|artifacts/*)
+            return 1
+            ;;
+        report.json|report-*.json|*.pyc|*.pyo|*.log)
+            return 1
+            ;;
+        *.py|*.json|*.txt|*.md|*.sh|*.toml|*.yaml|*.yml)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+declare -a files_to_process=()
+
+while IFS= read -r -d '' repository_path; do
+    relative_path="${repository_path#evaluation/}"
+    full_path="$PROJECT_DIR/$repository_path"
+
+    [[ -f "$full_path" ]] || continue
+    [[ "$(cd "$(dirname "$full_path")" && pwd -P)/$(basename "$full_path")" == "$OUTPUT_FILE_ABS" ]] && continue
+    is_harness_source "$relative_path" || continue
+    files_to_process+=("$relative_path")
+done < <(
+    git -C "$PROJECT_DIR" ls-files -z --cached --others --exclude-standard -- evaluation \
+        | sort -z
+)
+
+: > "$OUTPUT_FILE_ABS"
+
+cat <<EOF >> "$OUTPUT_FILE_ABS"
+================================================================================
+EVALUATION HARNESS EXPORT - CodeKG
+================================================================================
+Generated on: $(date)
+Harness directory: $SCRIPT_DIR
+Export file: $OUTPUT_FILE_ABS
+Source: Git-tracked and untracked non-ignored evaluation harness files
+================================================================================
+
+TABLE OF CONTENTS:
+EOF
+
+for relative_path in "${files_to_process[@]}"; do
+    printf -- '- %s\n' "$relative_path" >> "$OUTPUT_FILE_ABS"
+done
+
+printf '\nTotal Files: %d\n\n' "${#files_to_process[@]}" >> "$OUTPUT_FILE_ABS"
+
+for relative_path in "${files_to_process[@]}"; do
+    full_path="$SCRIPT_DIR/$relative_path"
+    cat <<EOF >> "$OUTPUT_FILE_ABS"
+================================================================================
+FILE: $relative_path
+================================================================================
+EOF
+    cat "$full_path" >> "$OUTPUT_FILE_ABS"
+    printf '\n\n\n' >> "$OUTPUT_FILE_ABS"
+done
+
+cat <<EOF >> "$OUTPUT_FILE_ABS"
+================================================================================
+END OF EVALUATION HARNESS EXPORT - CodeKG
+================================================================================
+Total files processed: ${#files_to_process[@]}
+Generated on: $(date)
+EOF
+
+echo "Evaluation harness export completed successfully."
+echo "Files processed: ${#files_to_process[@]}"
+echo "Output file: $OUTPUT_FILE_ABS"
+echo "File size: $(du -h "$OUTPUT_FILE_ABS" | cut -f1)"
+
+
+
+================================================================================
+FILE: corpora.json
+================================================================================
+{
+  "version": 1,
+  "corpora": [
+    {
+      "id": "synthetic-phase1",
+      "kind": "synthetic",
+      "path": "tests/fixtures/structural_phase1",
+      "required": true,
+      "pin": {
+        "content_sha256": "b96918abaaae5808ebb9a2876e49f589de04a94c2ca9fdd95679f4553d776423"
+      },
+      "ground_truth": "evaluation/truth/synthetic-phase1.json"
+    },
+    {
+      "id": "codekg-dogfood",
+      "kind": "dogfood",
+      "path": ".",
+      "required": true,
+      "pin": {
+        "working_tree": "report"
+      }
+    },
+    {
+      "id": "optional-external",
+      "kind": "external",
+      "path_env": "CODEKG_EVAL_EXTERNAL_PATH",
+      "required": false,
+      "pin": {
+        "git_commit_env": "CODEKG_EVAL_EXTERNAL_COMMIT"
+      }
+    },
+    {
+      "id": "requests",
+      "kind": "external",
+      "path_env": "CODEKG_REQUESTS_PATH",
+      "required": false,
+      "pin": {
+        "git_commit": "f361ead047be5cb873174218582f7d8b9fcd9f49"
+      }
+    },
+    {
+      "id": "click",
+      "kind": "external",
+      "path_env": "CODEKG_CLICK_PATH",
+      "required": false,
+      "pin": {
+        "git_commit": "333c28d79cd982990ee98eef61ec20ab1a4f38ba"
+      }
+    },
+    {
+      "id": "sqlalchemy-engine",
+      "kind": "external",
+      "path_env": "CODEKG_SQLALCHEMY_ENGINE_PATH",
+      "required": false,
+      "pin": {
+        "git_commit": "13cbc1af77e11c908ddd798be6941e995356e1a1"
+      }
+    },
+    {
+      "id": "sqlalchemy-pool",
+      "kind": "external",
+      "path_env": "CODEKG_SQLALCHEMY_POOL_PATH",
+      "required": false,
+      "pin": {
+        "git_commit": "13cbc1af77e11c908ddd798be6941e995356e1a1"
+      }
+    },
+    {
+      "id": "sqlalchemy-sql",
+      "kind": "external",
+      "path_env": "CODEKG_SQLALCHEMY_SQL_PATH",
+      "required": false,
+      "pin": {
+        "git_commit": "13cbc1af77e11c908ddd798be6941e995356e1a1"
+      }
+    }
+  ]
+}
+
+
+
+================================================================================
+FILE: gold/001-requests-prepare-request.gold.json
+================================================================================
+{
+  "task_id": "requests-intent-001",
+  "repository": "requests",
+  "commit": "f361ead047be",
+  "identity": "git",
+  "category": "intent_symbol_discovery",
+  "primary": {
+    "symbol": "src.requests.sessions.Session.prepare_request",
+    "accepted_suffixes": [
+      "Session.prepare_request",
+      "sessions.Session.prepare_request"
+    ],
+    "file": "src/requests/sessions.py",
+    "start_line": 511,
+    "end_line": 555
+  },
+  "relevant": [
+    {
+      "symbol": "src.requests.sessions.Session.request",
+      "accepted_suffixes": [
+        "Session.request",
+        "sessions.Session.request"
+      ],
+      "file": "src/requests/sessions.py",
+      "start_line": 557,
+      "end_line": 653,
+      "relationship": "caller"
+    },
+    {
+      "symbol": "src.requests.models.PreparedRequest.prepare",
+      "accepted_suffixes": [
+        "PreparedRequest.prepare",
+        "models.PreparedRequest.prepare"
+      ],
+      "file": "src/requests/models.py",
+      "start_line": 424,
+      "end_line": 451,
+      "relationship": "callee"
+    }
+  ]
+}
+
+
+
+================================================================================
+FILE: gold/002-requests-environment-settings.gold.json
+================================================================================
+{
+  "task_id": "requests-intent-002",
+  "repository": "requests",
+  "commit": "f361ead047be",
+  "identity": "git",
+  "category": "intent_symbol_discovery",
+  "primary": {
+    "symbol": "src.requests.sessions.Session.merge_environment_settings",
+    "accepted_suffixes": [
+      "Session.merge_environment_settings",
+      "sessions.Session.merge_environment_settings"
+    ],
+    "file": "src/requests/sessions.py",
+    "start_line": 831,
+    "end_line": 868
+  },
+  "relevant": [
+    {
+      "symbol": "src.requests.sessions.Session.request",
+      "accepted_suffixes": ["Session.request", "sessions.Session.request"],
+      "file": "src/requests/sessions.py",
+      "start_line": 557,
+      "end_line": 653,
+      "relationship": "caller"
+    },
+    {
+      "symbol": "src.requests.utils.get_environ_proxies",
+      "accepted_suffixes": ["get_environ_proxies", "utils.get_environ_proxies"],
+      "file": "src/requests/utils.py",
+      "start_line": 873,
+      "end_line": 882,
+      "relationship": "callee"
+    }
+  ]
+}
+
+
+
+================================================================================
+FILE: gold/003-click-command-context.gold.json
+================================================================================
+{
+  "task_id": "click-intent-001",
+  "repository": "click",
+  "commit": "333c28d79cd9",
+  "identity": "git",
+  "category": "intent_symbol_discovery",
+  "primary": {
+    "symbol": "src.click.core.Command.make_context",
+    "accepted_suffixes": ["Command.make_context", "core.Command.make_context"],
+    "file": "src/click/core.py",
+    "start_line": 1321,
+    "end_line": 1356
+  },
+  "relevant": [
+    {
+      "symbol": "src.click.core.Command.parse_args",
+      "accepted_suffixes": ["Command.parse_args", "core.Command.parse_args"],
+      "file": "src/click/core.py",
+      "start_line": 1358,
+      "end_line": 1392,
+      "relationship": "callee"
+    }
+  ]
+}
+
+
+
+================================================================================
+FILE: gold/004-click-parse-arguments.gold.json
+================================================================================
+{
+  "task_id": "click-intent-002",
+  "repository": "click",
+  "commit": "333c28d79cd9",
+  "identity": "git",
+  "category": "intent_symbol_discovery",
+  "primary": {
+    "symbol": "src.click.core.Command.parse_args",
+    "accepted_suffixes": ["Command.parse_args", "core.Command.parse_args"],
+    "file": "src/click/core.py",
+    "start_line": 1358,
+    "end_line": 1392
+  },
+  "relevant": [
+    {
+      "symbol": "src.click.core.Command.make_context",
+      "accepted_suffixes": ["Command.make_context", "core.Command.make_context"],
+      "file": "src/click/core.py",
+      "start_line": 1321,
+      "end_line": 1356,
+      "relationship": "caller"
+    },
+    {
+      "symbol": "src.click.core.Command.make_parser",
+      "accepted_suffixes": ["Command.make_parser", "core.Command.make_parser"],
+      "file": "src/click/core.py",
+      "start_line": 1219,
+      "end_line": 1224,
+      "relationship": "callee"
+    }
+  ]
+}
+
+
+
+================================================================================
+FILE: gold/005-engine-connect.gold.json
+================================================================================
+{
+  "task_id": "engine-intent-001",
+  "repository": "engine",
+  "commit": "48d85015f44c",
+  "identity": "content",
+  "category": "intent_symbol_discovery",
+  "primary": {
+    "symbol": "base.Engine.connect",
+    "accepted_suffixes": ["Engine.connect", "base.Engine.connect"],
+    "file": "base.py",
+    "start_line": 3237,
+    "end_line": 3260
+  },
+  "relevant": [
+    {
+      "symbol": "base.Engine.begin",
+      "accepted_suffixes": ["Engine.begin", "base.Engine.begin"],
+      "file": "base.py",
+      "start_line": 3200,
+      "end_line": 3226,
+      "relationship": "caller"
+    },
+    {
+      "symbol": "base.Engine.raw_connection",
+      "accepted_suffixes": ["Engine.raw_connection", "base.Engine.raw_connection"],
+      "file": "base.py",
+      "start_line": 3262,
+      "end_line": 3284,
+      "relationship": "caller"
+    }
+  ]
+}
+
+
+
+================================================================================
+FILE: gold/006-engine-execute-context.gold.json
+================================================================================
+{
+  "task_id": "engine-intent-002",
+  "repository": "engine",
+  "commit": "48d85015f44c",
+  "identity": "content",
+  "category": "intent_symbol_discovery",
+  "primary": {
+    "symbol": "base.Connection._execute_context",
+    "accepted_suffixes": ["Connection._execute_context", "base.Connection._execute_context"],
+    "file": "base.py",
+    "start_line": 1767,
+    "end_line": 1824
+  },
+  "relevant": [
+    {
+      "symbol": "base.Connection._execute_clauseelement",
+      "accepted_suffixes": [
+        "Connection._execute_clauseelement",
+        "base.Connection._execute_clauseelement"
+      ],
+      "file": "base.py",
+      "start_line": 1618,
+      "end_line": 1690,
+      "relationship": "caller"
+    },
+    {
+      "symbol": "base.Connection._exec_single_context",
+      "accepted_suffixes": [
+        "Connection._exec_single_context",
+        "base.Connection._exec_single_context"
+      ],
+      "file": "base.py",
+      "start_line": 1826,
+      "end_line": 1966,
+      "relationship": "callee"
+    }
+  ]
+}
+
+
+
+================================================================================
+FILE: gold/007-pool-record-checkout.gold.json
+================================================================================
+{
+  "task_id": "pool-intent-001",
+  "repository": "pool",
+  "commit": "814c2342b1cf",
+  "identity": "content",
+  "category": "intent_symbol_discovery",
+  "primary": {
+    "symbol": "base._ConnectionRecord.checkout",
+    "accepted_suffixes": [
+      "_ConnectionRecord.checkout",
+      "base._ConnectionRecord.checkout"
+    ],
+    "file": "base.py",
+    "start_line": 706,
+    "end_line": 739
+  },
+  "relevant": [
+    {
+      "symbol": "base._ConnectionFairy.__init__",
+      "accepted_suffixes": [
+        "_ConnectionFairy.__init__",
+        "base._ConnectionFairy.__init__"
+      ],
+      "file": "base.py",
+      "start_line": 1232,
+      "end_line": 1243,
+      "relationship": "callee"
+    },
+    {
+      "symbol": "base._finalize_fairy",
+      "accepted_suffixes": ["_finalize_fairy", "base._finalize_fairy"],
+      "file": "base.py",
+      "start_line": 915,
+      "end_line": 1044,
+      "relationship": "callee"
+    }
+  ]
+}
+
+
+
+================================================================================
+FILE: gold/008-pool-queue-acquire.gold.json
+================================================================================
+{
+  "task_id": "pool-intent-002",
+  "repository": "pool",
+  "commit": "814c2342b1cf",
+  "identity": "content",
+  "category": "intent_symbol_discovery",
+  "primary": {
+    "symbol": "impl.QueuePool._do_get",
+    "accepted_suffixes": ["QueuePool._do_get", "impl.QueuePool._do_get"],
+    "file": "impl.py",
+    "start_line": 150,
+    "end_line": 180
+  },
+  "relevant": [
+    {
+      "symbol": "impl.QueuePool._inc_overflow",
+      "accepted_suffixes": ["QueuePool._inc_overflow", "impl.QueuePool._inc_overflow"],
+      "file": "impl.py",
+      "start_line": 182,
+      "end_line": 191,
+      "relationship": "callee"
+    },
+    {
+      "symbol": "impl.QueuePool._dec_overflow",
+      "accepted_suffixes": ["QueuePool._dec_overflow", "impl.QueuePool._dec_overflow"],
+      "file": "impl.py",
+      "start_line": 193,
+      "end_line": 199,
+      "relationship": "callee"
+    }
+  ]
+}
+
+
+
+================================================================================
+FILE: gold/009-sql-visit-select.gold.json
+================================================================================
+{
+  "task_id": "sql-intent-001",
+  "repository": "sql",
+  "commit": "24b988e6a06d",
+  "identity": "content",
+  "category": "intent_symbol_discovery",
+  "primary": {
+    "symbol": "compiler.SQLCompiler.visit_select",
+    "accepted_suffixes": ["SQLCompiler.visit_select", "compiler.SQLCompiler.visit_select"],
+    "file": "compiler.py",
+    "start_line": 4973,
+    "end_line": 5194
+  },
+  "relevant": [
+    {
+      "symbol": "compiler.SQLCompiler._setup_select_stack",
+      "accepted_suffixes": [
+        "SQLCompiler._setup_select_stack",
+        "compiler.SQLCompiler._setup_select_stack"
+      ],
+      "file": "compiler.py",
+      "start_line": 5208,
+      "end_line": 5258,
+      "relationship": "callee"
+    },
+    {
+      "symbol": "compiler.SQLCompiler._compose_select_body",
+      "accepted_suffixes": [
+        "SQLCompiler._compose_select_body",
+        "compiler.SQLCompiler._compose_select_body"
+      ],
+      "file": "compiler.py",
+      "start_line": 5260,
+      "end_line": 5358,
+      "relationship": "callee"
+    }
+  ]
+}
+
+
+
+================================================================================
+FILE: gold/010-sql-compose-select-body.gold.json
+================================================================================
+{
+  "task_id": "sql-intent-002",
+  "repository": "sql",
+  "commit": "24b988e6a06d",
+  "identity": "content",
+  "category": "intent_symbol_discovery",
+  "primary": {
+    "symbol": "compiler.SQLCompiler._compose_select_body",
+    "accepted_suffixes": [
+      "SQLCompiler._compose_select_body",
+      "compiler.SQLCompiler._compose_select_body"
+    ],
+    "file": "compiler.py",
+    "start_line": 5260,
+    "end_line": 5358
+  },
+  "relevant": [
+    {
+      "symbol": "compiler.SQLCompiler.visit_select",
+      "accepted_suffixes": ["SQLCompiler.visit_select", "compiler.SQLCompiler.visit_select"],
+      "file": "compiler.py",
+      "start_line": 4973,
+      "end_line": 5194,
+      "relationship": "caller"
+    },
+    {
+      "symbol": "compiler.SQLCompiler.order_by_clause",
+      "accepted_suffixes": [
+        "SQLCompiler.order_by_clause",
+        "compiler.SQLCompiler.order_by_clause"
+      ],
+      "file": "compiler.py",
+      "start_line": 5456,
+      "end_line": 5466,
+      "relationship": "callee"
+    }
+  ]
+}
+
+
+
+================================================================================
+FILE: measure_mcp_response_sizes.py
+================================================================================
+"""Compare serialized MCP response sizes from before/after JSON captures.
+
+Each input is a JSON object keyed by tool name. A value may be either a
+CallToolResult-shaped object or a JSON-RPC envelope whose ``result`` is that
+object. Both ``structuredContent`` and ``structured_content`` are accepted.
+
+Example capture shape:
+
+    {
+      "list_repositories": {
+        "content": [{"type": "text", "text": "Found 5 indexed repositories."}],
+        "structuredContent": {"result": [{"repo_name": "requests"}]},
+        "isError": false
+      }
+    }
+
+Run:
+
+    python evaluation/measure_mcp_response_sizes.py \
+      --before runs/mcp-response-before.json \
+      --after runs/mcp-response-after.json \
+      --output runs/mcp-response-size-report.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+
+def _compact_bytes(value: object) -> int:
+    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode())
+
+
+def _call_result(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("each tool capture must be a JSON object")
+    nested = value.get("result")
+    if isinstance(nested, dict) and "content" in nested:
+        return nested
+    return value
+
+
+def _dimensions(value: object) -> dict[str, int]:
+    result = _call_result(value)
+    content = result.get("content", [])
+    structured = result.get("structuredContent", result.get("structured_content"))
+    text_bytes = 0
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_bytes += len(str(item.get("text", "")).encode())
+    return {
+        "text_bytes": text_bytes,
+        "structured_bytes": _compact_bytes(structured),
+        "wire_bytes": _compact_bytes(result),
+    }
+
+
+def _delta(before: int, after: int) -> dict[str, int | float | None]:
+    reduction = before - after
+    return {
+        "bytes": after - before,
+        "reduction_bytes": reduction,
+        "reduction_percent": round(reduction * 100 / before, 2) if before else None,
+    }
+
+
+def compare(before: dict[str, object], after: dict[str, object]) -> dict[str, object]:
+    if set(before) != set(after):
+        missing_after = sorted(set(before) - set(after))
+        missing_before = sorted(set(after) - set(before))
+        raise ValueError(
+            "capture tool sets differ: "
+            f"missing_after={missing_after}, missing_before={missing_before}"
+        )
+
+    tools: dict[str, object] = {}
+    before_totals = {"text_bytes": 0, "structured_bytes": 0, "wire_bytes": 0}
+    after_totals = {"text_bytes": 0, "structured_bytes": 0, "wire_bytes": 0}
+    for name in sorted(before):
+        before_dimensions = _dimensions(before[name])
+        after_dimensions = _dimensions(after[name])
+        for dimension in before_totals:
+            before_totals[dimension] += before_dimensions[dimension]
+            after_totals[dimension] += after_dimensions[dimension]
+        before_result = _call_result(before[name])
+        after_result = _call_result(after[name])
+        before_structured = before_result.get(
+            "structuredContent", before_result.get("structured_content")
+        )
+        after_structured = after_result.get(
+            "structuredContent", after_result.get("structured_content")
+        )
+        tools[name] = {
+            "before": before_dimensions,
+            "after": after_dimensions,
+            "delta": {
+                dimension: _delta(before_dimensions[dimension], after_dimensions[dimension])
+                for dimension in before_dimensions
+            },
+            "structured_equal": before_structured == after_structured,
+        }
+
+    return {
+        "tools": tools,
+        "totals": {
+            "before": before_totals,
+            "after": after_totals,
+            "delta": {
+                dimension: _delta(before_totals[dimension], after_totals[dimension])
+                for dimension in before_totals
+            },
+        },
+    }
+
+
+def _read_capture(path: Path) -> dict[str, object]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"{path} must contain a JSON object keyed by tool name")
+    return value
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--before", type=Path, required=True)
+    parser.add_argument("--after", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+
+    report = compare(_read_capture(args.before), _read_capture(args.after))
+    rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    if args.output is None:
+        print(rendered, end="")
+        return
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(rendered, encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================================================
+FILE: prompts/001-requests-prepare-request-codekg.txt
+================================================================================
+Task index: 01
+Task ID: requests-intent-001
+
+Repository under evaluation: requests
+
+Objective:
+Identify the method responsible for taking a high-level Request together with session-level state, merging the relevant session defaults, and producing the PreparedRequest that will later be sent.
+
+Mandatory MCP protocol:
+1. Batch preflight has already verified that repository `requests` is indexed and available. The measured task begins with `search_symbols`; do not repeat preflight.
+2. The canonical measured CodeKG profile exposes exactly these four tools: `search_symbols`, `get_definition`, `find_callers`, and `find_callees`. Use only those tools, in this sequence: `search_symbols`, `get_definition`, then both `find_callers` and `find_callees`.
+3. Do not call `list_repositories`; it is a preflight-only tool and is unavailable in the measured profile.
+4. Use CodeKG MCP tools as the only repository-investigation mechanism.
+5. Do not use shell commands, grep, ripgrep, find, cat, direct filesystem reads, web search, or prior model knowledge as evidence.
+6. Search only repository "requests" with `scope: "source"`.
+7. Start with exactly one `search_symbols` call with `limit` no greater than 5.
+8. Treat search as candidate discovery only. If it returns a plausible top candidate or a `recommended_symbol_id`, do not issue another search. Immediately call `get_definition` with that exact `symbol_id`.
+9. Treat `get_definition` as structural verification of indexed symbol metadata and line bounds. Then call both `find_callers` and `find_callees` with that same exact `symbol_id`.
+10. A second, reformulated search is allowed only when the first search has no plausible candidate. No more than two search calls are allowed.
+11. This is a structural-grounding task. Do not make body-level behavioral claims that are not established by definition metadata and caller/callee relationships.
+12. Do not report any symbol, file, line range, caller, or helper unless it appeared in a successful MCP result.
+13. Exact repository-relative POSIX paths and positive, non-null, complete definition line ranges are required.
+14. If `get_definition`, `find_callers`, and `find_callees` have not all succeeded for the selected symbol ID, the run is incomplete and must not return a normal technical answer.
+15. At least one relationship result must be nonempty and directly relevant.
+16. If any required MCP call fails, is cancelled, or times out, stop and set the answer field to:
+    INFRA_ERROR: mcp_call_failed
+
+What to distinguish:
+- The method that builds the PreparedRequest using session-level state.
+- The higher-level method that orchestrates the request.
+- The lower-level PreparedRequest method that performs detailed preparation, if delegation occurs.
+
+Return:
+- The primary implementation symbol.
+- Its repository-relative source file and exact line range.
+- One directly relevant caller or delegated helper, with file and line range.
+- A concise explanation of why the primary symbol is the correct responsibility boundary.
+- The final answer must conform to the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/001-requests-prepare-request-native.txt
+================================================================================
+Task index: 01
+Task ID: requests-intent-001
+
+Repository under evaluation: requests
+
+Objective:
+Identify the method responsible for taking a high-level Request together with session-level state, merging the relevant session defaults, and producing the PreparedRequest that will later be sent.
+
+Mandatory native-search protocol:
+1. Your first action must be an actual shell command that prints the working directory and Git root, then searches the repository for likely symbols.
+2. Investigate only the repository provided as the current working directory.
+3. Do not use web search, external documentation, MCP tools, or prior model knowledge as evidence.
+4. Run at least one repository search command and inspect its completed output before reasoning about the answer.
+5. Read the exact implementation source of the strongest candidate with
+   numbered output covering every line of its complete definition.
+6. Read at least one directly relevant caller or delegated helper the same way
+   to confirm the responsibility boundary. Prefer a separate, explicit
+   numbered inspection command for every symbol you intend to report.
+7. Do not modify any files.
+8. Exact repository-relative paths and non-null complete definition line ranges
+   are required. A caller or helper range must cover its complete definition,
+   not merely excerpt lines inspected during investigation.
+9. Every symbol included in `symbols`, `evidence`, or the answer must have its
+   whole definition inspected through its last syntax line. `end_line` must be
+   that last syntax line, with no trailing blank separator. Do not report an
+   extra caller or helper when its complete definition boundary was not
+   inspected, and never use approximate `+` line ranges. A grep match or file
+   mention is not inspection evidence: a successful command must name the
+   exact repository-relative file and emit numbered source output for every
+   line from the reported `start_line` through `end_line` (for example,
+   `nl -ba FILE | sed -n 'START,ENDp'`).
+10. Do not report any symbol, file, line range, or behavior unless verified from completed repository commands.
+11. You may return an infrastructure error only after an actual shell-tool attempt returns an explicit error and that command attempt/error is emitted in the run events. Uncertainty or lack of prior context is not an infrastructure failure.
+12. If repository access or a required command explicitly fails after being attempted, stop and set the answer field to:
+    INFRA_ERROR: native_search_failed
+
+What to distinguish:
+- The method that builds the PreparedRequest using session-level state.
+- The higher-level method that orchestrates the request.
+- The lower-level PreparedRequest method that performs detailed preparation, if delegation occurs.
+
+Return:
+- The primary implementation symbol.
+- Its repository-relative source file and exact line range.
+- One directly relevant caller or delegated helper, with file and line range.
+- A concise explanation of why the primary symbol is the correct responsibility boundary.
+- The final answer must conform to the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/002-requests-environment-settings-codekg.txt
+================================================================================
+Task index: 02
+Task ID: requests-intent-002
+Repository under evaluation: requests
+
+Objective:
+Identify the session method that combines request-provided proxy, stream,
+certificate, and TLS verification settings with environment-derived proxies
+and session defaults before a prepared request is sent.
+
+Mandatory CodeKG protocol:
+1. Preflight already verified the repository. Do not call `list_repositories`.
+2. Use only `search_symbols`, `get_definition`, `find_callers`, and
+   `find_callees`, in that sequence.
+3. Use CodeKG as the only repository-investigation mechanism. Do not use shell,
+   filesystem, web, or prior model knowledge as evidence.
+4. Search only repository `requests` with `scope: "source"`. Start with exactly
+   one hybrid search and `limit` no greater than 5.
+5. Search is candidate discovery only. If the first result has a plausible
+   candidate or `recommended_symbol_id`, immediately call `get_definition`
+   with that exact ID. A second search is allowed only if no candidate is
+   plausible.
+6. Call both relationship tools with the same exact selected ID. At least one
+   relationship result must be nonempty and directly relevant.
+7. Report only symbols, paths, and complete positive line ranges returned by
+   successful MCP results. Keep conclusions structural.
+8. If a required MCP call fails, return `INFRA_ERROR: mcp_call_failed` in the
+   answer field.
+
+Return the primary symbol plus one directly relevant caller or delegated
+helper, explain the responsibility boundary concisely, and conform to the
+supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/002-requests-environment-settings-native.txt
+================================================================================
+Task index: 02
+Task ID: requests-intent-002
+Repository under evaluation: requests
+
+Objective:
+Identify the session method that combines request-provided proxy, stream,
+certificate, and TLS verification settings with environment-derived proxies
+and session defaults before a prepared request is sent.
+
+Mandatory native protocol:
+1. The first action must be a shell command that prints the working directory
+   and Git root, then searches the current repository for likely symbols.
+2. Investigate only the current repository. Do not use MCP, web search,
+   external documentation, or prior model knowledge as evidence.
+3. Run at least one repository search and inspect its completed output.
+4. Read the complete numbered source definition of the strongest candidate and
+   at least one directly relevant caller or delegated helper.
+5. Every reported symbol and range must be backed by a successful command that
+   names the repository-relative file and emits every numbered source line.
+6. `end_line` must be the last syntax line, excluding trailing blank lines.
+7. Do not modify files.
+8. If repository access or a required command fails, return
+   `INFRA_ERROR: native_search_failed` in the answer field.
+
+Return the primary symbol plus one directly relevant caller or delegated
+helper, explain the responsibility boundary concisely, and conform to the
+supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/003-click-command-context-codekg.txt
+================================================================================
+Task index: 03
+Task ID: click-intent-001
+Repository under evaluation: click
+
+Objective:
+Identify the command method that creates a Click context for a command-line
+invocation, applies extra context settings, and delegates argument processing
+before returning the initialized context.
+
+Mandatory CodeKG protocol:
+1. Preflight already verified the repository. Do not call `list_repositories`.
+2. Use only `search_symbols`, `get_definition`, `find_callers`, and
+   `find_callees`, in that sequence.
+3. Use CodeKG only; do not use shell, filesystem, web, or prior knowledge.
+4. Search only repository `click` with `scope: "source"`. Start with exactly
+   one hybrid search and `limit` no greater than 5.
+5. If the first search yields a plausible candidate or recommended ID, call
+   `get_definition` immediately with that exact ID. A second search is allowed
+   only if no candidate is plausible.
+6. Call both relationship tools with the same exact ID; at least one result
+   must be nonempty and relevant.
+7. Report only MCP-returned symbols, relative paths, and complete positive
+   definition ranges. Keep claims structural.
+8. On a required MCP failure, return `INFRA_ERROR: mcp_call_failed`.
+
+Return the primary symbol and one caller or delegated helper, with a concise
+boundary explanation, using the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/003-click-command-context-native.txt
+================================================================================
+Task index: 03
+Task ID: click-intent-001
+Repository under evaluation: click
+
+Objective:
+Identify the command method that creates a Click context for a command-line
+invocation, applies extra context settings, and delegates argument processing
+before returning the initialized context.
+
+Mandatory native protocol:
+1. First run a shell command that prints the working directory and Git root,
+   then searches the current repository for likely symbols.
+2. Use only current-repository shell inspection; no MCP, web, external docs, or
+   prior knowledge.
+3. Inspect completed search output, then read the strongest candidate's entire
+   numbered definition and one relevant caller or delegated helper.
+4. Every reported symbol and range must have a successful command naming the
+   relative file and emitting all numbered lines.
+5. Use the last syntax line as `end_line`, excluding blank separators.
+6. Do not modify files. On a required command failure, return
+   `INFRA_ERROR: native_search_failed`.
+
+Return the primary symbol and one caller or delegated helper, with a concise
+boundary explanation, using the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/004-click-parse-arguments-codekg.txt
+================================================================================
+Task index: 04
+Task ID: click-intent-002
+Repository under evaluation: click
+
+Objective:
+Identify the command-level method that parses command-line arguments into a
+Click context, processes parameters in the required order, and records leftover
+arguments for later command invocation.
+
+Mandatory CodeKG protocol:
+1. Preflight already verified the repository. Do not call `list_repositories`.
+2. Use only `search_symbols`, `get_definition`, `find_callers`, and
+   `find_callees`, in that sequence.
+3. Use CodeKG only; shell, filesystem, web, and prior knowledge are forbidden.
+4. Search only repository `click`, `scope: "source"`, hybrid mode, starting
+   with exactly one call and `limit` no greater than 5.
+5. Follow a plausible result or recommended ID immediately with
+   `get_definition` using the exact ID. Search twice only if the first call has
+   no plausible candidate.
+6. Call both relationship tools with that exact ID and require at least one
+   relevant nonempty result.
+7. Report only MCP-returned structural evidence and complete line bounds.
+8. On required MCP failure, return `INFRA_ERROR: mcp_call_failed`.
+
+Return the primary symbol and one relevant caller or helper, explain the
+boundary concisely, and conform to the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/004-click-parse-arguments-native.txt
+================================================================================
+Task index: 04
+Task ID: click-intent-002
+Repository under evaluation: click
+
+Objective:
+Identify the command-level method that parses command-line arguments into a
+Click context, processes parameters in the required order, and records leftover
+arguments for later command invocation.
+
+Mandatory native protocol:
+1. First execute a shell command that prints the working directory and Git
+   root, then searches the current repository.
+2. Use only current-repository shell evidence; no MCP, web, external docs, or
+   prior knowledge.
+3. Inspect search results, then emit complete numbered source for the selected
+   definition and one relevant caller or helper.
+4. Every reported symbol and range must be fully covered by successful
+   numbered output naming the exact relative file.
+5. `end_line` is the last syntax line, never a blank separator.
+6. Do not modify files. On required command failure, return
+   `INFRA_ERROR: native_search_failed`.
+
+Return the primary symbol and one relevant caller or helper, explain the
+boundary concisely, and conform to the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/005-engine-connect-codekg.txt
+================================================================================
+Task index: 05
+Task ID: engine-intent-001
+Repository under evaluation: engine
+
+Objective:
+Identify the Engine method that returns a new high-level Connection object and
+serves as the connection-producing boundary used by Engine transaction and raw
+connection workflows.
+
+Mandatory CodeKG protocol:
+1. Preflight already verified the repository. Do not call `list_repositories`.
+2. Use only `search_symbols`, `get_definition`, `find_callers`, and
+   `find_callees`, in that sequence.
+3. Use CodeKG only; do not use shell, filesystem, web, or prior knowledge.
+4. Search only repository `engine` with `scope: "source"`, hybrid mode,
+   exactly one initial call, and `limit` no greater than 5.
+5. Follow a plausible candidate or recommended ID immediately with
+   `get_definition` using the exact ID. Search twice only if the first result
+   has no plausible candidate.
+6. Call both relationship tools with the selected ID and require at least one
+   relevant nonempty relationship.
+7. Report only returned structural evidence with exact relative paths and
+   complete positive ranges.
+8. On required MCP failure, return `INFRA_ERROR: mcp_call_failed`.
+
+Return the primary symbol and one directly relevant caller or helper, explain
+the boundary concisely, and conform to the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/005-engine-connect-native.txt
+================================================================================
+Task index: 05
+Task ID: engine-intent-001
+Repository under evaluation: engine
+
+Objective:
+Identify the Engine method that returns a new high-level Connection object and
+serves as the connection-producing boundary used by Engine transaction and raw
+connection workflows.
+
+Mandatory native protocol:
+1. First run a shell command that prints the working directory and Git root,
+   then searches the current repository.
+2. Use only current-repository shell evidence; no MCP, web, external docs, or
+   prior knowledge.
+3. Inspect the completed search output and read complete numbered source for
+   the selected definition plus one relevant caller or helper.
+4. Every reported symbol and range must be covered by successful numbered
+   output naming the exact relative file.
+5. Use the last syntax line as `end_line`, excluding blank separators.
+6. Do not modify files. On required command failure, return
+   `INFRA_ERROR: native_search_failed`.
+
+Return the primary symbol and one directly relevant caller or helper, explain
+the boundary concisely, and conform to the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/006-engine-execute-context-codekg.txt
+================================================================================
+Task index: 06
+Task ID: engine-intent-002
+Repository under evaluation: engine
+
+Objective:
+Identify the internal Connection execution stage that receives a dialect and
+execution-context constructor, establishes the DBAPI cursor context, and
+dispatches into single-row or insert-many execution paths.
+
+Mandatory CodeKG protocol:
+1. Preflight already verified the repository. Do not call `list_repositories`.
+2. Use only `search_symbols`, `get_definition`, `find_callers`, and
+   `find_callees`, in that sequence.
+3. Use CodeKG only; shell, filesystem, web, and prior knowledge are forbidden.
+4. Search only repository `engine`, `scope: "source"`, hybrid mode, starting
+   with exactly one call and `limit` no greater than 5.
+5. Follow a plausible result or recommended ID immediately with
+   `get_definition` using the exact ID. A second search requires no plausible
+   first result.
+6. Call both relationship tools with that exact ID; at least one relationship
+   must be nonempty and directly relevant.
+7. Report only returned symbols, relative paths, and complete positive line
+   ranges. Keep conclusions structural.
+8. On required MCP failure, return `INFRA_ERROR: mcp_call_failed`.
+
+Return the primary execution-stage symbol plus one caller or delegated helper,
+with a concise boundary explanation and the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/006-engine-execute-context-native.txt
+================================================================================
+Task index: 06
+Task ID: engine-intent-002
+Repository under evaluation: engine
+
+Objective:
+Identify the internal Connection execution stage that receives a dialect and
+execution-context constructor, establishes the DBAPI cursor context, and
+dispatches into single-row or insert-many execution paths.
+
+Mandatory native protocol:
+1. First execute a shell command that prints the working directory and Git
+   root, then searches the current repository.
+2. Use only current-repository shell evidence; no MCP, web, external docs, or
+   prior knowledge.
+3. Inspect search output, then read the complete numbered selected definition
+   and one directly relevant caller or delegated helper.
+4. Every reported range must be fully emitted by a successful command naming
+   the exact repository-relative file.
+5. `end_line` is the last syntax line, excluding blank separators.
+6. Do not modify files. On required command failure, return
+   `INFRA_ERROR: native_search_failed`.
+
+Return the primary execution-stage symbol plus one caller or delegated helper,
+with a concise boundary explanation and the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/007-pool-record-checkout-codekg.txt
+================================================================================
+Task index: 07
+Task ID: pool-intent-001
+Repository under evaluation: pool
+
+Objective:
+Identify the connection-record checkout method that obtains the DBAPI
+connection associated with a pool record and creates the temporary proxy/fairy
+object used to manage that checked-out connection.
+
+Mandatory CodeKG protocol:
+1. Preflight already verified the repository. Do not call `list_repositories`.
+2. Use only `search_symbols`, `get_definition`, `find_callers`, and
+   `find_callees`, in that sequence.
+3. Use CodeKG only; do not use shell, filesystem, web, or prior knowledge.
+4. Search only repository `pool` with `scope: "source"`, hybrid mode, exactly
+   one initial search, and `limit` no greater than 5.
+5. Immediately verify a plausible candidate or recommended ID through
+   `get_definition` with the exact ID. Search twice only after no plausible
+   candidate.
+6. Call both relationship tools with the same ID and require at least one
+   relevant nonempty result.
+7. Report only MCP-returned structural evidence and complete exact ranges.
+8. On required MCP failure, return `INFRA_ERROR: mcp_call_failed`.
+
+Return the primary symbol and one relevant caller or delegated helper, explain
+the responsibility boundary, and conform to the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/007-pool-record-checkout-native.txt
+================================================================================
+Task index: 07
+Task ID: pool-intent-001
+Repository under evaluation: pool
+
+Objective:
+Identify the connection-record checkout method that obtains the DBAPI
+connection associated with a pool record and creates the temporary proxy/fairy
+object used to manage that checked-out connection.
+
+Mandatory native protocol:
+1. First run a shell command that prints the working directory and Git root,
+   then searches the current repository.
+2. Use only current-repository shell inspection; no MCP, web, external docs, or
+   prior knowledge.
+3. Inspect search output and read complete numbered source for the strongest
+   candidate and one relevant caller or delegated helper.
+4. Every reported symbol and line range must be fully covered by successful
+   numbered output naming the exact relative file.
+5. Use the last syntax line as `end_line`, excluding blank separators.
+6. Do not modify files. On required command failure, return
+   `INFRA_ERROR: native_search_failed`.
+
+Return the primary symbol and one relevant caller or delegated helper, explain
+the responsibility boundary, and conform to the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/008-pool-queue-acquire-codekg.txt
+================================================================================
+Task index: 08
+Task ID: pool-intent-002
+Repository under evaluation: pool
+
+Objective:
+Identify the QueuePool acquisition method that attempts to obtain a queued
+connection record, applies timeout and overflow limits, and creates a new
+record only when overflow capacity permits.
+
+Mandatory CodeKG protocol:
+1. Preflight already verified the repository. Do not call `list_repositories`.
+2. Use only `search_symbols`, `get_definition`, `find_callers`, and
+   `find_callees`, in that sequence.
+3. Use CodeKG only; shell, filesystem, web, and prior knowledge are forbidden.
+4. Search only repository `pool`, `scope: "source"`, hybrid mode, with exactly
+   one initial search and `limit` no greater than 5.
+5. If the first search provides a plausible candidate or recommended ID, call
+   `get_definition` immediately with the exact ID. Search twice only if it does
+   not.
+6. Call both relationship tools using that ID. At least one relevant
+   relationship must be nonempty.
+7. Report only MCP-returned structural evidence with complete exact ranges.
+8. On required MCP failure, return `INFRA_ERROR: mcp_call_failed`.
+
+Return the primary acquisition symbol plus one overflow-related caller or
+helper, explain the boundary concisely, and use the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/008-pool-queue-acquire-native.txt
+================================================================================
+Task index: 08
+Task ID: pool-intent-002
+Repository under evaluation: pool
+
+Objective:
+Identify the QueuePool acquisition method that attempts to obtain a queued
+connection record, applies timeout and overflow limits, and creates a new
+record only when overflow capacity permits.
+
+Mandatory native protocol:
+1. First execute a shell command that prints the working directory and Git
+   root, then searches the current repository.
+2. Use only current-repository shell evidence; no MCP, web, external docs, or
+   prior knowledge.
+3. Inspect completed search results and read complete numbered source for the
+   selected definition and one overflow-related caller or helper.
+4. Every reported range must be fully emitted by a successful command naming
+   the exact relative file.
+5. `end_line` is the last syntax line, excluding trailing blanks.
+6. Do not modify files. On required command failure, return
+   `INFRA_ERROR: native_search_failed`.
+
+Return the primary acquisition symbol plus one overflow-related caller or
+helper, explain the boundary concisely, and use the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/009-sql-visit-select-codekg.txt
+================================================================================
+Task index: 09
+Task ID: sql-intent-001
+Repository under evaluation: sql
+
+Objective:
+Identify the SQL compiler visitor that turns a Select construct into its
+compiled SQL representation, coordinating select-stack setup, column
+rendering, common table expressions, and final body composition.
+
+Mandatory CodeKG protocol:
+1. Preflight already verified the repository. Do not call `list_repositories`.
+2. Use only `search_symbols`, `get_definition`, `find_callers`, and
+   `find_callees`, in that sequence.
+3. Use CodeKG only; do not use shell, filesystem, web, or prior knowledge.
+4. Search only repository `sql` with `scope: "source"`, hybrid mode, exactly
+   one initial call, and `limit` no greater than 5.
+5. Follow a plausible candidate or recommended ID immediately with
+   `get_definition` using the exact ID. A second search requires no plausible
+   first candidate.
+6. Call both relationship tools with the same ID and require at least one
+   directly relevant nonempty relationship.
+7. Report only returned structural evidence, relative paths, and complete
+   positive line ranges.
+8. On required MCP failure, return `INFRA_ERROR: mcp_call_failed`.
+
+Return the primary visitor plus one directly relevant delegated helper, explain
+the compiler boundary concisely, and conform to the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/009-sql-visit-select-native.txt
+================================================================================
+Task index: 09
+Task ID: sql-intent-001
+Repository under evaluation: sql
+
+Objective:
+Identify the SQL compiler visitor that turns a Select construct into its
+compiled SQL representation, coordinating select-stack setup, column
+rendering, common table expressions, and final body composition.
+
+Mandatory native protocol:
+1. First run a shell command that prints the working directory and Git root,
+   then searches the current repository.
+2. Use only current-repository shell evidence; no MCP, web, external docs, or
+   prior knowledge.
+3. Inspect search output, then read complete numbered source for the selected
+   definition and one directly relevant delegated helper.
+4. Every reported symbol and range must be fully covered by successful
+   numbered output naming the exact relative file.
+5. Use the last syntax line as `end_line`, excluding blank separators.
+6. Do not modify files. On required command failure, return
+   `INFRA_ERROR: native_search_failed`.
+
+Return the primary visitor plus one directly relevant delegated helper, explain
+the compiler boundary concisely, and conform to the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/010-sql-compose-select-body-codekg.txt
+================================================================================
+Task index: 10
+Task ID: sql-intent-002
+Repository under evaluation: sql
+
+Objective:
+Identify the SQL compiler helper that composes the body of an already-prepared
+Select statement by rendering FROM, WHERE, GROUP BY, HAVING, ORDER BY, row
+limits, and locking clauses.
+
+Mandatory CodeKG protocol:
+1. Preflight already verified the repository. Do not call `list_repositories`.
+2. Use only `search_symbols`, `get_definition`, `find_callers`, and
+   `find_callees`, in that sequence.
+3. Use CodeKG only; shell, filesystem, web, and prior knowledge are forbidden.
+4. Search only repository `sql`, `scope: "source"`, hybrid mode, starting with
+   exactly one call and `limit` no greater than 5.
+5. Immediately verify a plausible candidate or recommended ID using
+   `get_definition` with that exact ID. A second search is allowed only when
+   the first has no plausible candidate.
+6. Call both relationship tools with the selected ID; require at least one
+   relevant nonempty relationship.
+7. Report only MCP-returned symbols, relative paths, and complete ranges. Keep
+   claims structural.
+8. On required MCP failure, return `INFRA_ERROR: mcp_call_failed`.
+
+Return the body-composition helper plus its compiler caller or one clause
+helper, explain the boundary concisely, and use the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/010-sql-compose-select-body-native.txt
+================================================================================
+Task index: 10
+Task ID: sql-intent-002
+Repository under evaluation: sql
+
+Objective:
+Identify the SQL compiler helper that composes the body of an already-prepared
+Select statement by rendering FROM, WHERE, GROUP BY, HAVING, ORDER BY, row
+limits, and locking clauses.
+
+Mandatory native protocol:
+1. First execute a shell command that prints the working directory and Git
+   root, then searches the current repository.
+2. Use only current-repository shell evidence; no MCP, web, external docs, or
+   prior knowledge.
+3. Inspect search output and read complete numbered source for the strongest
+   candidate plus its compiler caller or one clause helper.
+4. Every reported symbol and range must be fully covered by successful
+   numbered output naming the exact relative file.
+5. `end_line` is the final syntax line, excluding blank separators.
+6. Do not modify files. On required command failure, return
+   `INFRA_ERROR: native_search_failed`.
+
+Return the body-composition helper plus its compiler caller or one clause
+helper, explain the boundary concisely, and use the supplied JSON schema.
+
+
+
+================================================================================
+FILE: prompts/patroni-intent-001.txt
+================================================================================
+Task ID: patroni-intent-001
+
+Repository under evaluation: Patroni
+
+Objective:
+Identify the function or method that is responsible for promoting a standby PostgreSQL node to primary.
+
+Instructions:
+
+* Investigate only the repository provided for this task.
+* Do not use web search or external documentation.
+* Do not modify any files.
+* Identify the most directly responsible implementation symbol, not merely a command handler, API endpoint, or configuration option.
+* Trace enough surrounding code to confirm that the symbol actually initiates or performs promotion.
+* Report exact symbol names and repository-relative file paths.
+* Include line ranges when available.
+* Distinguish the primary implementation from relevant callers or helper functions.
+* Do not invent symbols or paths.
+* Return the final answer using the supplied JSON schema.
+
+Expected evidence:
+
+* The principal promotion-related symbol.
+* Its repository-relative source file.
+* A concise explanation of why it is the responsible implementation.
+* Any directly relevant caller or helper needed to justify the conclusion.
+  ::: 
+
+
+
+
+
+================================================================================
+FILE: README.md
+================================================================================
+# Frozen corpus evaluation
+
+`codekg evaluate` measures the complete local CodeKG pipeline:
+
+```text
+source files → Python IR → Neo4j graph → isolated zvec descriptions → public lexical query
+```
+
+It never clones, downloads, or calls a network service beyond the locally
+configured Neo4j instance. The evaluation corpus is selected by
+[`corpora.json`](corpora.json); every selected source directory is pinned
+before it is indexed.
+
+Run it from the project root after Neo4j is available:
+
+```bash
+codekg evaluate
+```
+
+The command writes `evaluation/report.json` and uses one zvec collection per
+corpus under `.codekg-evaluation-zvec`. Both locations can be changed with the
+`--output` and `--zvec-root` options. The JSON writer sorts keys and omits a
+wall-clock timestamp, making structural portions of reports diff-friendly;
+timing values naturally vary by host.
+
+## Corpus contract
+
+Two corpora are required:
+
+* `synthetic-phase1` is the checked-in language fixture corpus. Its full
+  source-content SHA-256 protects the exact expected call-site statuses,
+  targets, and derived graph projections in `truth/synthetic-phase1.json`.
+* `codekg-dogfood` is this checkout under a `working_tree: report` policy. A
+  development checkout is often dirty, so its report records the observed Git
+  revision, dirty flag, and full source-content SHA-256 rather than falsely
+  claiming that its source matches HEAD. It gives the project a permanent
+  self-regression corpus without network or licensing concerns.
+
+An external corpus is optional. Set both of these variables to include one:
+
+```bash
+export CODEKG_EVAL_EXTERNAL_PATH=/local/path/to/pinned/repository
+export CODEKG_EVAL_EXTERNAL_COMMIT=$(git -C "$CODEKG_EVAL_EXTERNAL_PATH" rev-parse HEAD)
+codekg evaluate
+```
+
+If its path is unset, the report records a skip. By default a path with no
+matching commit environment value runs as `optional_unpinned` and records its
+observed revision/content identity. Add `--require-pins` to reject that case
+before indexing. A supplied commit pin must match exactly. To add stable named
+external corpora, add a new manifest entry with a fixed `git_commit` rather
+than replacing the optional example.
+
+## What the report checks
+
+For every selected corpus the report includes:
+
+* source/IR versus Neo4j counts for files, parse errors and diagnostics,
+  module initializers, types, callables, and call sites; all-corpus
+  `HAS_METHOD`, inheritance-clause/`INHERITS`, call-site status, and resolved
+  projection counts are reported separately;
+* scanner and index timing plus lexical-query p50/p95 timing. Every annotated
+  lexical query is issued exactly five times, and the report includes the five
+  samples and aggregate sample count;
+* public lexical-search Top-1, Recall@5, MRR, and zero-result rate;
+* for the synthetic corpus, the exact complete `HAS_METHOD` and internal
+  `INHERITS` edge sets, total call-site status distribution, projection
+  completeness, and every `CallSite` keyed by owner qualified name, source
+  line/column, ordinal, and raw callee. Missing, extra, swapped-target, or
+  changed-status call sites fail the gate.
+
+Before opening Neo4j or creating an evaluation zvec directory, the evaluator
+resolves every selected corpus, validates its pin policy, scans it, loads its
+truth file, and rejects duplicate repository names. Therefore a bad later
+corpus cannot partially index an earlier one.
+
+The synthetic gate deliberately covers module execution, two calls on one
+line, direct local calls, `cls`, `self`, `super`, dynamic receivers, nested
+scopes, and definition-time decorator/default/annotation calls. It is a
+correctness gate, not an attempt to claim semantic coverage of framework
+registration or reflection.
+
+## Multi-repository Codex benchmark
+
+This directory is the canonical package for the paired CodeKG-versus-native
+intent benchmark. It is separate from `codekg evaluate`. The frozen suite has
+ten tasks and runs each task once through each arm, for 20 measured Codex
+trials:
+
+| Index | CodeKG repository | Intent |
+|---:|---|---|
+| 01 | `requests` | prepare a request with session state |
+| 02 | `requests` | merge environment and session settings |
+| 03 | `click` | construct a command context |
+| 04 | `click` | parse command arguments |
+| 05 | `engine` | create a SQLAlchemy connection |
+| 06 | `engine` | execute through a dialect context |
+| 07 | `pool` | check out a pooled connection record |
+| 08 | `pool` | acquire from a queue pool |
+| 09 | `sql` | compile a select statement |
+| 10 | `sql` | compose a select body |
+
+The `engine`, `pool`, and `sql` indexes are separately content-pinned source
+subtrees of one pinned SQLAlchemy checkout. `requests` and `click` are pinned
+Git checkouts. Exact paths, identities, commits, prompts, and gold files are in
+[`benchmark-manifest.json`](benchmark-manifest.json). Prompt and gold filenames
+start with a three-digit task index.
+
+The CodeKG arm can use only `search_symbols`, `get_definition`,
+`find_callers`, and `find_callees`. The native arm has CodeKG disabled and uses
+repository commands. Both arms hold the model (`gpt-5.4-mini`), reasoning
+effort (`low`), output schema, rules, and sandbox constant. Multi-agent behavior
+is disabled and every trial uses a new ephemeral Codex process.
+
+### Run the whole suite
+
+Set the corpus root that contains `requests`, `click`, and `sqlalchemy`, and
+choose a new output directory:
+
+```bash
+CORPUS_ROOT=/media/alex/MYSSD/BACKUP/workspace/codekg-corpus
+RUN_DIR="$PWD/runs/codekg-native-intent-suite-$(date +%Y%m%d-%H%M%S)"
+```
+
+First run the free plan/preflight view. It verifies all pinned local sources,
+the benchmark profile, and the 20-entry seeded schedule without launching
+trials:
+
+```bash
+.venv/bin/python evaluation/run_benchmark.py plan \
+  --corpus-root "$CORPUS_ROOT"
+```
+
+Then start the complete sequential suite:
+
+```bash
+.venv/bin/python evaluation/run_benchmark.py run \
+  --execute \
+  --corpus-root "$CORPUS_ROOT" \
+  --output "$RUN_DIR"
+```
+
+The run performs a direct local MCP repository preflight and one Codex graph
+preflight before the 20 measured trials, so it launches 21 Codex processes in
+total. This can consume paid model usage.
+Do not reuse an output directory: artifacts are immutable and the runner
+refuses to overwrite them.
+
+`--profile benchmark` loads `$CODEX_HOME/benchmark.config.toml`, or
+`~/.codex/benchmark.config.toml` when `CODEX_HOME` is unset. If supplied,
+`--profile-path` is an integrity check and must resolve to that same file.
+The runner uses `--strict-config`, `--ignore-user-config`, `--ephemeral`, and
+sequential execution. It rechecks all frozen package hashes, source identities,
+Git commits, and clean working trees around every Codex process. Drift aborts
+the run and leaves completed artifacts in place.
+
+The seeded schedule pairs both arms for every task and balances ordering:
+CodeKG runs first for five tasks and native first for five. Failed or invalid
+trials are retained and never replaced.
+
+### Indexed artifact layout
+
+Every task has a two-digit output directory corresponding to its prompt index:
+
+```text
+$RUN_DIR/
+  run-metadata.json
+  tasks/
+    01-requests-prepare-request/
+      codekg/
+      native/
+    02-requests-environment-settings/
+      codekg/
+      native/
+    ...
+    10-sql-compose-select-body/
+      codekg/
+      native/
+```
+
+Each arm directory contains `answer.json`, `events.jsonl`, `stderr.log`,
+`metadata.json`, `validation.json`, and `metrics.json`.
+
+Validate one captured task arm:
+
+```bash
+.venv/bin/python evaluation/validate_benchmark.py \
+  "$RUN_DIR/tasks/03-click-command-context/codekg" \
+  --corpus-root "$CORPUS_ROOT"
+```
+
+Aggregate the complete suite:
+
+```bash
+.venv/bin/python evaluation/aggregate_benchmark.py \
+  "$RUN_DIR" \
+  --output "$RUN_DIR-summary.json"
+```
+
+Validation checks the JSONL/final-answer match, schema, repository identity,
+paths, complete ranges, tool protocol, native command evidence, and CodeKG
+provenance. Aggregation accepts only the exact frozen 20-entry schedule with
+one unique thread per trial. The report includes intention-to-treat and
+valid-only results, per-task outcomes, paired CodeKG-minus-native deltas,
+latency summaries, retrieval measures, evidence compliance, and token usage.
+
+Normal tests never launch paid trials:
+
+```bash
+.venv/bin/python -m pytest -q evaluation/tests
+```
+
+
+
+================================================================================
+FILE: run_benchmark.py
+================================================================================
+#!/usr/bin/env python3
+"""Run the paired multi-repository CodeKG/native benchmark.
+
+The default ``plan`` command is free and side-effect-light. ``run`` refuses to
+launch Codex unless ``--execute`` is supplied; a complete run performs one
+batch preflight and one CodeKG/native pair for each of ten indexed tasks.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+from typing import Any
+
+from benchmark_lib import (
+    ALLOWED_CODEKG_TOOLS,
+    MANIFEST_PATH,
+    completed_items,
+    load_manifest,
+    read_events,
+    read_json,
+    repository_snapshot_commit,
+    resolve_manifest_file,
+    result_rows,
+    snapshot_hashes,
+    structured_content,
+    successful_mcp_items,
+    suite_schedule,
+    validate_codekg_protocol,
+    validate_trial,
+    write_json_new,
+)
+
+
+def _git(repository: Path, *arguments: str) -> str:
+    process = subprocess.run(
+        ["git", "-C", str(repository), *arguments],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode:
+        raise RuntimeError(process.stderr.strip() or "git command failed")
+    return process.stdout.strip()
+
+
+def profile_contract(profile_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    with profile_path.open("rb") as handle:
+        profile = tomllib.load(handle)
+    codekg = profile.get("mcp_servers", {}).get("codekg", {})
+    if profile.get("model") != manifest["model"]:
+        raise RuntimeError("benchmark profile model does not match the manifest")
+    if profile.get("model_reasoning_effort") != manifest["model_reasoning_effort"]:
+        raise RuntimeError("benchmark profile reasoning effort does not match the manifest")
+    if set(codekg.get("enabled_tools", [])) != ALLOWED_CODEKG_TOOLS:
+        raise RuntimeError("benchmark profile must expose exactly the four CodeKG tools")
+    if codekg.get("enabled") is not True or codekg.get("required") is not True:
+        raise RuntimeError("benchmark profile must enable and require CodeKG")
+    if codekg.get("url") != "http://127.0.0.1:8765/mcp":
+        raise RuntimeError("benchmark profile must use the frozen loopback CodeKG URL")
+    if codekg.get("startup_timeout_sec") != 15:
+        raise RuntimeError("benchmark profile must use the frozen CodeKG startup timeout")
+    if codekg.get("tool_timeout_sec") != 30:
+        raise RuntimeError("benchmark profile must use the frozen CodeKG tool timeout")
+    if profile.get("web_search") != "disabled":
+        raise RuntimeError("benchmark profile must disable web search")
+    if profile.get("features", {}).get("multi_agent") is not False:
+        raise RuntimeError("benchmark profile must disable multi-agent execution")
+    return {
+        "model": profile["model"],
+        "model_reasoning_effort": profile["model_reasoning_effort"],
+        "web_search": profile["web_search"],
+        "multi_agent": profile["features"]["multi_agent"],
+        "codekg_enabled": codekg["enabled"],
+        "codekg_required": codekg["required"],
+        "codekg_url": codekg["url"],
+        "codekg_startup_timeout_sec": codekg["startup_timeout_sec"],
+        "codekg_tool_timeout_sec": codekg["tool_timeout_sec"],
+        "codekg_enabled_tools": codekg["enabled_tools"],
+    }
+
+
+def codex_version(codex: str) -> str:
+    process = subprocess.run(
+        [codex, "--version"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if process.returncode or not process.stdout.strip():
+        raise RuntimeError(process.stderr.strip() or "cannot determine Codex version")
+    return process.stdout.strip()
+
+
+def expected_profile_path() -> Path:
+    configured_root = os.environ.get("CODEX_HOME")
+    codex_root = Path(configured_root) if configured_root else Path.home() / ".codex"
+    return (codex_root / "benchmark.config.toml").resolve()
+
+
+def enforce_profile_path(profile_path: Path) -> Path:
+    resolved = profile_path.resolve()
+    expected = expected_profile_path()
+    if resolved != expected:
+        raise RuntimeError(
+            "--profile-path must identify the file loaded by '--profile benchmark': "
+            f"expected {expected}, got {resolved}"
+        )
+    return resolved
+
+
+def enforce_manifest_profile(manifest: dict[str, Any]) -> None:
+    if manifest.get("profile") != "benchmark":
+        raise RuntimeError("the frozen suite runner requires manifest profile='benchmark'")
+
+
+def repository_states(corpus_root: Path, manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    corpus_root = corpus_root.resolve()
+    states: dict[str, dict[str, Any]] = {}
+    checked_git_roots: set[Path] = set()
+    for config in manifest["repositories"]:
+        repository = (corpus_root / config["source_path"]).resolve()
+        try:
+            repository.relative_to(corpus_root)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"repository source_path escapes corpus root: {config['source_path']}"
+            ) from exc
+        if not repository.is_dir():
+            raise RuntimeError(f"repository path does not exist: {repository}")
+        git_root = Path(_git(repository, "rev-parse", "--show-toplevel")).resolve()
+        git_commit = _git(git_root, "rev-parse", "HEAD")
+        if git_commit != config["git_commit"]:
+            raise RuntimeError(
+                f"{config['name']} Git commit mismatch: "
+                f"expected {config['git_commit']}, got {git_commit}"
+            )
+        if git_root not in checked_git_roots:
+            checked_git_roots.add(git_root)
+            if _git(git_root, "status", "--porcelain"):
+                raise RuntimeError(
+                    f"checkout is dirty; benchmark requires a frozen corpus: {git_root}"
+                )
+        indexed_commit = repository_snapshot_commit(repository, config["identity"])
+        if not indexed_commit.startswith(config["indexed_commit"]):
+            raise RuntimeError(
+                f"{config['name']} indexed identity mismatch: "
+                f"expected {config['indexed_commit']}, got {indexed_commit}"
+            )
+        states[config["name"]] = {
+            "repository_root": str(repository),
+            "git_root": str(git_root),
+            "git_commit": git_commit,
+            "identity": config["identity"],
+            "indexed_commit": config["indexed_commit"],
+        }
+    return states
+
+
+def local_preflight(
+    *, corpus_root: Path, manifest_path: Path, profile_path: Path, codex: str
+) -> dict[str, Any]:
+    manifest = load_manifest(manifest_path)
+    enforce_manifest_profile(manifest)
+    profile_path = enforce_profile_path(profile_path)
+    repositories = repository_states(corpus_root, manifest)
+    if not profile_path.is_file():
+        raise RuntimeError(f"benchmark profile does not exist: {profile_path}")
+    contract = profile_contract(profile_path, manifest)
+    expected_files = [resolve_manifest_file(manifest_path, manifest["schema_file"])]
+    for task in manifest["tasks"]:
+        expected_files.append(resolve_manifest_file(manifest_path, task["gold_file"]))
+        expected_files.extend(
+            resolve_manifest_file(manifest_path, relative)
+            for relative in task["prompt_files"].values()
+        )
+    missing = [str(path) for path in expected_files if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"benchmark package is incomplete: {missing}")
+    return {
+        "corpus_root": str(corpus_root.resolve()),
+        "repositories": repositories,
+        "profile_path": str(profile_path.resolve()),
+        "profile_contract": contract,
+        "codex_version": codex_version(codex),
+        "hashes": snapshot_hashes(manifest_path, profile_path),
+    }
+
+
+def assert_frozen_state(
+    *,
+    corpus_root: Path,
+    manifest_path: Path,
+    profile_path: Path,
+    expected_hashes: dict[str, str],
+) -> None:
+    manifest = load_manifest(manifest_path)
+    repository_states(corpus_root, manifest)
+    observed_hashes = snapshot_hashes(manifest_path, profile_path)
+    if observed_hashes != expected_hashes:
+        changed = sorted(
+            path
+            for path in set(expected_hashes) | set(observed_hashes)
+            if expected_hashes.get(path) != observed_hashes.get(path)
+        )
+        raise RuntimeError(f"frozen benchmark inputs drifted: {changed}")
+
+
+def base_codex_command(
+    *,
+    codex: str,
+    profile: str,
+    contract: dict[str, Any],
+    repository: Path,
+    schema_path: Path | None,
+    answer_path: Path | None,
+) -> list[str]:
+    command = [
+        codex,
+        "--ask-for-approval",
+        "never",
+        "exec",
+        "--profile",
+        profile,
+        "--ignore-user-config",
+        "--strict-config",
+        "--ephemeral",
+        "--json",
+        "--sandbox",
+        "danger-full-access",
+        "--ignore-rules",
+        "--cd",
+        str(repository.resolve()),
+        "-c",
+        f"model={json.dumps(contract['model'])}",
+        "-c",
+        f"model_reasoning_effort={json.dumps(contract['model_reasoning_effort'])}",
+        "-c",
+        "features.multi_agent=false",
+        "-c",
+        "features.apps=false",
+        "-c",
+        "features.plugins=false",
+        "-c",
+        'web_search="disabled"',
+        "-c",
+        f"mcp_servers.codekg.url={json.dumps(contract['codekg_url'])}",
+        "-c",
+        (f"mcp_servers.codekg.startup_timeout_sec={contract['codekg_startup_timeout_sec']}"),
+        "-c",
+        f"mcp_servers.codekg.tool_timeout_sec={contract['codekg_tool_timeout_sec']}",
+    ]
+    if schema_path is not None:
+        command.extend(["--output-schema", str(schema_path.resolve())])
+    if answer_path is not None:
+        command.extend(["-o", str(answer_path.resolve())])
+    return command
+
+
+def trial_command(
+    *,
+    arm: str,
+    codex: str,
+    profile: str,
+    contract: dict[str, Any],
+    repository: Path,
+    schema_path: Path,
+    answer_path: Path,
+) -> list[str]:
+    command = base_codex_command(
+        codex=codex,
+        profile=profile,
+        contract=contract,
+        repository=repository,
+        schema_path=schema_path,
+        answer_path=answer_path,
+    )
+    if arm == "codekg":
+        command.extend(
+            [
+                "-c",
+                "mcp_servers.codekg.enabled=true",
+                "-c",
+                "mcp_servers.codekg.required=true",
+                "-c",
+                'mcp_servers.codekg.enabled_tools=["search_symbols","get_definition",'
+                '"find_callers","find_callees"]',
+            ]
+        )
+    elif arm == "native":
+        command.extend(
+            [
+                "-c",
+                "mcp_servers.codekg.enabled=false",
+                "-c",
+                "mcp_servers.codekg.required=false",
+            ]
+        )
+    else:
+        raise ValueError(f"unknown arm: {arm}")
+    return command
+
+
+def graph_preflight_command(
+    *, codex: str, profile: str, contract: dict[str, Any], repository: Path
+) -> list[str]:
+    command = base_codex_command(
+        codex=codex,
+        profile=profile,
+        contract=contract,
+        repository=repository,
+        schema_path=None,
+        answer_path=None,
+    )
+    command.extend(
+        [
+            "-c",
+            "mcp_servers.codekg.enabled=true",
+            "-c",
+            "mcp_servers.codekg.required=true",
+            "-c",
+            'mcp_servers.codekg.enabled_tools=["search_symbols","get_definition",'
+            '"find_callers","find_callees"]',
+        ]
+    )
+    return command
+
+
+def _launch(
+    *,
+    command: list[str],
+    prompt: str,
+    events_path: Path,
+    stderr_path: Path,
+    timeout: float,
+) -> tuple[int, float]:
+    events_path.parent.mkdir(parents=True, exist_ok=False)
+    started = time.perf_counter()
+    with (
+        events_path.open("x", encoding="utf-8") as stdout,
+        stderr_path.open("x", encoding="utf-8") as stderr,
+    ):
+        try:
+            process = subprocess.run(
+                command,
+                input=prompt,
+                stdout=stdout,
+                stderr=stderr,
+                text=True,
+                check=False,
+                timeout=timeout,
+            )
+            exit_code = process.returncode
+        except subprocess.TimeoutExpired:
+            exit_code = 124
+    return exit_code, time.perf_counter() - started
+
+
+def _launch_with_frozen_state(
+    *,
+    command: list[str],
+    prompt: str,
+    events_path: Path,
+    stderr_path: Path,
+    timeout: float,
+    frozen_state_arguments: dict[str, Any],
+) -> tuple[int, float]:
+    assert_frozen_state(**frozen_state_arguments)
+    try:
+        return _launch(
+            command=command,
+            prompt=prompt,
+            events_path=events_path,
+            stderr_path=stderr_path,
+            timeout=timeout,
+        )
+    finally:
+        assert_frozen_state(**frozen_state_arguments)
+
+
+def _direct_repository_preflight(
+    *,
+    url: str,
+    events_path: Path,
+    stderr_path: Path,
+    frozen_state_arguments: dict[str, Any],
+) -> tuple[int, float]:
+    """Call repository discovery directly so deferred-tool routing cannot hide it."""
+    assert_frozen_state(**frozen_state_arguments)
+    events_path.parent.mkdir(parents=True, exist_ok=False)
+    started = time.perf_counter()
+    exit_code = 0
+    item: dict[str, Any]
+    error_text = ""
+    try:
+        from fastmcp import Client
+
+        async def call() -> Any:
+            async with Client(url) as client:
+                return await client.call_tool("list_repositories", {})
+
+        result = asyncio.run(call())
+        item = {
+            "id": "repository-preflight",
+            "type": "mcp_tool_call",
+            "server": "codekg",
+            "tool": "list_repositories",
+            "arguments": {},
+            "result": {
+                "content": [
+                    value.model_dump(mode="json", exclude_none=True)
+                    for value in result.content
+                ],
+                "structured_content": result.structured_content,
+            },
+            "error": None,
+            "status": "completed",
+        }
+    except Exception as exc:  # pragma: no cover - exercised only by live infrastructure
+        exit_code = 1
+        error_text = f"{type(exc).__name__}: {exc}\n"
+        item = {
+            "id": "repository-preflight",
+            "type": "mcp_tool_call",
+            "server": "codekg",
+            "tool": "list_repositories",
+            "arguments": {},
+            "result": None,
+            "error": error_text.strip(),
+            "status": "failed",
+        }
+    events = [
+        {"type": "thread.started", "thread_id": "direct-mcp-repository-preflight"},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": item},
+        {"type": "turn.completed", "usage": {}},
+    ]
+    events_path.write_text(
+        "".join(json.dumps(event, separators=(",", ":")) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    stderr_path.write_text(error_text, encoding="utf-8")
+    assert_frozen_state(**frozen_state_arguments)
+    return exit_code, time.perf_counter() - started
+
+
+def validate_preflight(
+    events_path: Path, expected_repositories: dict[str, str], exit_code: int
+) -> list[str]:
+    errors: list[str] = []
+    if exit_code:
+        errors.append(f"Codex preflight exited with {exit_code}")
+    events, parse_errors = read_events(events_path)
+    errors.extend(parse_errors)
+    tools = [item for item in completed_items(events) if item.get("type") == "mcp_tool_call"]
+    if len(tools) != 1 or tools[0].get("tool") != "list_repositories":
+        errors.append("preflight must call list_repositories exactly once")
+        return errors
+    item = tools[0]
+    if item.get("status") != "completed" or item.get("error"):
+        errors.append("list_repositories did not complete successfully")
+        return errors
+    payload = structured_content(item)
+    rows: list[dict[str, Any]] = []
+    if isinstance(payload, dict) and isinstance(payload.get("result"), list):
+        rows = [row for row in payload["result"] if isinstance(row, dict)]
+    for repository, expected_commit in expected_repositories.items():
+        matching = [row for row in rows if row.get("repo_name") == repository]
+        if len(matching) != 1:
+            errors.append(f"preflight did not find exactly one indexed {repository} repository")
+            continue
+        indexed = matching[0].get("commit")
+        if not isinstance(indexed, str) or indexed != expected_commit:
+            errors.append(
+                f"indexed {repository} commit mismatch: expected {expected_commit}, got {indexed}"
+            )
+    return errors
+
+
+def validate_graph_preflight(events_path: Path, gold: dict[str, Any], exit_code: int) -> list[str]:
+    errors: list[str] = []
+    if exit_code:
+        errors.append(f"Codex graph preflight exited with {exit_code}")
+    events, parse_errors = read_events(events_path)
+    errors.extend(parse_errors)
+    protocol_errors, _ = validate_codekg_protocol(events, gold["repository"])
+    errors.extend(protocol_errors)
+    by_tool = {str(item.get("tool")): item for item in successful_mcp_items(events)}
+    expected = [
+        gold["primary"],
+        *gold["relevant"],
+    ]
+    observed = {
+        (
+            row.get("file"),
+            row.get("start_line"),
+            row.get("end_line"),
+        )
+        for item in by_tool.values()
+        for row in result_rows(item)
+    }
+    for symbol in expected:
+        record = (symbol["file"], symbol["start_line"], symbol["end_line"])
+        if record not in observed:
+            errors.append(f"graph preflight did not return expected definition range: {record}")
+    caller_rows = result_rows(by_tool.get("find_callers", {}))
+    callee_rows = result_rows(by_tool.get("find_callees", {}))
+    caller = next(item for item in gold["relevant"] if item["relationship"] == "caller")
+    callee = next(item for item in gold["relevant"] if item["relationship"] == "callee")
+    if (caller["file"], caller["start_line"], caller["end_line"]) not in {
+        (row.get("file"), row.get("start_line"), row.get("end_line")) for row in caller_rows
+    }:
+        errors.append(f"graph preflight is missing caller edge for {caller['symbol']}")
+    if (callee["file"], callee["start_line"], callee["end_line"]) not in {
+        (row.get("file"), row.get("start_line"), row.get("end_line")) for row in callee_rows
+    }:
+        errors.append(f"graph preflight is missing callee edge for {callee['symbol']}")
+    return errors
+
+
+def _frozen_schedule(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "ordinal": entry.ordinal,
+            "trial_name": entry.trial_name,
+            "task_index": entry.task_index,
+            "task_id": entry.task_id,
+            "slug": entry.slug,
+            "repository": entry.repository,
+            "arm": entry.arm,
+        }
+        for entry in suite_schedule(
+            tasks=manifest["tasks"],
+            arms=manifest["arms"],
+            seed=manifest["seed"],
+        )
+    ]
+
+
+def execute(args: argparse.Namespace) -> int:
+    manifest_path = args.manifest.resolve()
+    manifest = load_manifest(manifest_path)
+    corpus_root = args.corpus_root.resolve()
+    local = local_preflight(
+        corpus_root=corpus_root,
+        manifest_path=manifest_path,
+        profile_path=args.profile_path.resolve(),
+        codex=args.codex,
+    )
+    repository_paths = {
+        name: Path(state["repository_root"]) for name, state in local["repositories"].items()
+    }
+    tasks = {int(task["index"]): task for task in manifest["tasks"]}
+    schedule_entries = suite_schedule(
+        tasks=manifest["tasks"],
+        arms=manifest["arms"],
+        seed=manifest["seed"],
+    )
+    schedule = _frozen_schedule(manifest)
+    if args.command == "plan":
+        print(
+            json.dumps(
+                {
+                    "local_preflight": local,
+                    "schedule": schedule,
+                    "codekg_tools": sorted(ALLOWED_CODEKG_TOOLS),
+                    "note": "No Codex process was launched.",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    if not args.execute:
+        raise RuntimeError("refusing to launch paid trials without --execute")
+    run_dir = args.output.resolve()
+    run_dir.mkdir(parents=True, exist_ok=False)
+    write_json_new(
+        run_dir / "batch.json",
+        {
+            "manifest": manifest,
+            "local_preflight": local,
+            "schedule": schedule,
+        },
+    )
+    frozen_state_arguments = {
+        "corpus_root": corpus_root,
+        "manifest_path": manifest_path,
+        "profile_path": Path(local["profile_path"]),
+        "expected_hashes": local["hashes"],
+    }
+
+    first_task = manifest["tasks"][0]
+    first_repository = repository_paths[first_task["repository"]]
+    preflight_dir = run_dir / "preflight"
+    repository_preflight_dir = preflight_dir / "repository"
+    preflight_events = repository_preflight_dir / "events.jsonl"
+    preflight_exit, preflight_wall = _direct_repository_preflight(
+        url=local["profile_contract"]["codekg_url"],
+        events_path=preflight_events,
+        stderr_path=repository_preflight_dir / "stderr.log",
+        frozen_state_arguments=frozen_state_arguments,
+    )
+    expected_repositories = {
+        config["name"]: config["indexed_commit"] for config in manifest["repositories"]
+    }
+    preflight_errors = validate_preflight(
+        preflight_events,
+        expected_repositories,
+        preflight_exit,
+    )
+    write_json_new(
+        repository_preflight_dir / "result.json",
+        {
+            "exit_code": preflight_exit,
+            "wall_seconds": preflight_wall,
+            "valid": not preflight_errors,
+            "errors": preflight_errors,
+        },
+    )
+    if preflight_errors:
+        print("batch preflight failed; measured trials were not started", file=sys.stderr)
+        return 2
+
+    schema_path = resolve_manifest_file(manifest_path, manifest["schema_file"])
+    graph_gold_path = resolve_manifest_file(manifest_path, first_task["gold_file"])
+    graph_gold = read_json(graph_gold_path)
+    graph_preflight_dir = preflight_dir / "graph"
+    graph_events = graph_preflight_dir / "events.jsonl"
+    graph_exit, graph_wall = _launch_with_frozen_state(
+        command=graph_preflight_command(
+            codex=args.codex,
+            profile=manifest["profile"],
+            contract=local["profile_contract"],
+            repository=first_repository,
+        ),
+        prompt=(
+            "Preflight the indexed graph using exactly these calls in order: "
+            f"search_symbols(repository='{graph_gold['repository']}', scope='source', "
+            f"limit=1) for {graph_gold['primary']['symbol']}; get_definition for its "
+            "returned exact symbol ID; then both find_callers and find_callees for that "
+            "same ID. Do not use shell, web, or other tools. Return a terse structural "
+            "status only."
+        ),
+        events_path=graph_events,
+        stderr_path=graph_preflight_dir / "stderr.log",
+        timeout=args.timeout,
+        frozen_state_arguments=frozen_state_arguments,
+    )
+    graph_errors = validate_graph_preflight(graph_events, graph_gold, graph_exit)
+    write_json_new(
+        graph_preflight_dir / "result.json",
+        {
+            "exit_code": graph_exit,
+            "wall_seconds": graph_wall,
+            "valid": not graph_errors,
+            "errors": graph_errors,
+        },
+    )
+    write_json_new(
+        preflight_dir / "result.json",
+        {
+            "valid": not preflight_errors and not graph_errors,
+            "repository_errors": preflight_errors,
+            "graph_errors": graph_errors,
+        },
+    )
+    if graph_errors:
+        print("graph preflight failed; measured trials were not started", file=sys.stderr)
+        return 2
+
+    for entry in schedule_entries:
+        task = tasks[entry.task_index]
+        repository = repository_paths[entry.repository]
+        trial_dir = run_dir / "tasks" / entry.trial_name / entry.arm
+        answer_path = trial_dir / "answer.json"
+        prompt_path = resolve_manifest_file(manifest_path, task["prompt_files"][entry.arm])
+        gold_path = resolve_manifest_file(manifest_path, task["gold_file"])
+        command = trial_command(
+            arm=entry.arm,
+            codex=args.codex,
+            profile=manifest["profile"],
+            contract=local["profile_contract"],
+            repository=repository,
+            schema_path=schema_path,
+            answer_path=answer_path,
+        )
+        exit_code, wall_seconds = _launch_with_frozen_state(
+            command=command,
+            prompt=prompt_path.read_text(encoding="utf-8"),
+            events_path=trial_dir / "events.jsonl",
+            stderr_path=trial_dir / "stderr.log",
+            timeout=args.timeout,
+            frozen_state_arguments=frozen_state_arguments,
+        )
+        metadata = {
+            "ordinal": entry.ordinal,
+            "task_index": entry.task_index,
+            "task_id": entry.task_id,
+            "slug": entry.slug,
+            "repository": entry.repository,
+            "arm": entry.arm,
+            "exit_code": exit_code,
+            "wall_seconds": wall_seconds,
+            "command": command,
+            "prompt_sha256": local["hashes"][str(prompt_path.resolve())],
+        }
+        write_json_new(trial_dir / "metadata.json", metadata)
+        validation, metrics = validate_trial(
+            arm=entry.arm,
+            events_path=trial_dir / "events.jsonl",
+            answer_path=answer_path,
+            repository=repository,
+            gold_path=gold_path,
+            wall_seconds=wall_seconds,
+            exit_code=exit_code,
+        )
+        write_json_new(trial_dir / "validation.json", validation)
+        write_json_new(trial_dir / "metrics.json", metrics)
+    print(run_dir)
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    value = argparse.ArgumentParser(description=__doc__)
+    subparsers = value.add_subparsers(dest="command", required=True)
+    for name in ("plan", "run"):
+        command = subparsers.add_parser(name)
+        command.add_argument("--corpus-root", type=Path, required=True)
+        command.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+        command.add_argument(
+            "--profile-path",
+            type=Path,
+            default=expected_profile_path(),
+        )
+        command.add_argument("--codex", default="codex")
+        command.add_argument("--timeout", type=float, default=300.0)
+        command.add_argument(
+            "--output",
+            type=Path,
+            default=Path("runs/codekg-native-intent-suite"),
+        )
+        command.add_argument(
+            "--execute",
+            action="store_true",
+            help="required for run; acknowledges that Codex calls may incur charges",
+        )
+    return value
+
+
+def main() -> None:
+    try:
+        raise SystemExit(execute(parser().parse_args()))
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"benchmark error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+================================================================================
+FILE: tests/test_benchmark.py
+================================================================================
+from __future__ import annotations
+
+# ruff: noqa: E402, I001
+
+import json
+import sys
+from pathlib import Path
+
+EVALUATION_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(EVALUATION_DIR))
+
+import benchmark_lib  # noqa: E402
+import aggregate_benchmark  # noqa: E402
+import run_benchmark  # noqa: E402
+
+
+PRIMARY_ID = (
+    "requests@f361ead047be:src/requests/sessions.py:"
+    "src.requests.sessions.Session.prepare_request:511"
+)
+CALLER_ID = (
+    "requests@f361ead047be:src/requests/sessions.py:src.requests.sessions.Session.request:557"
+)
+GOLD_PATH = EVALUATION_DIR / "gold" / "001-requests-prepare-request.gold.json"
+
+
+def _tool(tool: str, arguments: dict[str, object], rows: list[dict[str, object]]) -> dict:
+    key = "results" if tool == "search_symbols" else "result"
+    return {
+        "type": "item.completed",
+        "item": {
+            "id": tool,
+            "type": "mcp_tool_call",
+            "server": "codekg",
+            "tool": tool,
+            "arguments": arguments,
+            "result": {
+                "content": [{"type": "text", "text": "ok"}],
+                "structured_content": {key: rows},
+            },
+            "error": None,
+            "status": "completed",
+        },
+    }
+
+
+def _answer() -> dict:
+    return {
+        "task_id": "requests-intent-001",
+        "answer": "Structurally, Session.prepare_request is the primary boundary.",
+        "symbols": [PRIMARY_ID, CALLER_ID],
+        "files": ["src/requests/sessions.py"],
+        "evidence": [
+            {
+                "symbol": PRIMARY_ID,
+                "file": "src/requests/sessions.py",
+                "start_line": 511,
+                "end_line": 555,
+            },
+            {
+                "symbol": CALLER_ID,
+                "file": "src/requests/sessions.py",
+                "start_line": 557,
+                "end_line": 653,
+            },
+        ],
+        "confidence": 0.9,
+    }
+
+
+def _events(answer: dict | None = None) -> list[dict]:
+    answer = answer or _answer()
+    primary = {
+        "key": PRIMARY_ID,
+        "symbol_id": PRIMARY_ID,
+        "qname": "src.requests.sessions.Session.prepare_request",
+        "file": "src/requests/sessions.py",
+        "start_line": 511,
+        "end_line": 555,
+    }
+    caller = {
+        "key": CALLER_ID,
+        "qname": "src.requests.sessions.Session.request",
+        "file": "src/requests/sessions.py",
+        "start_line": 557,
+        "end_line": 653,
+    }
+    return [
+        {"type": "thread.started", "thread_id": "test"},
+        {"type": "turn.started"},
+        _tool(
+            "search_symbols",
+            {"repository": "requests", "scope": "source", "limit": 5, "query": "prepare"},
+            [primary],
+        ),
+        _tool("get_definition", {"identifier": PRIMARY_ID}, [primary]),
+        _tool("find_callers", {"identifier": PRIMARY_ID}, [caller]),
+        _tool("find_callees", {"identifier": PRIMARY_ID}, []),
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "final",
+                "type": "agent_message",
+                "text": json.dumps(answer, separators=(",", ":")),
+            },
+        },
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 100,
+                "cached_input_tokens": 60,
+                "output_tokens": 20,
+                "reasoning_output_tokens": 5,
+            },
+        },
+    ]
+
+
+def test_suite_schedule_is_deterministic_balanced_and_paired() -> None:
+    manifest = benchmark_lib.load_manifest()
+    arguments = {
+        "tasks": manifest["tasks"],
+        "arms": manifest["arms"],
+        "seed": manifest["seed"],
+    }
+    first = benchmark_lib.suite_schedule(**arguments)
+    second = benchmark_lib.suite_schedule(**arguments)
+    assert first == second
+    assert len(first) == 20
+    assert sum(entry.arm == "codekg" for entry in first) == 10
+    assert sum(entry.arm == "native" for entry in first) == 10
+    assert sum(first[index].arm == "codekg" for index in range(0, len(first), 2)) == 5
+    assert {entry.task_index for entry in first} == set(range(1, 11))
+    assert all(
+        sum(entry.task_index == task_index for entry in first) == 2 for task_index in range(1, 11)
+    )
+
+
+def test_codekg_prompt_matches_measured_tool_contract() -> None:
+    manifest = benchmark_lib.load_manifest()
+    expected_tools = "`search_symbols`, `get_definition`, `find_callers`, and `find_callees`"
+    for task in manifest["tasks"]:
+        prompt_path = benchmark_lib.resolve_manifest_file(
+            EVALUATION_DIR / "benchmark-manifest.json",
+            task["prompt_files"]["codekg"],
+        )
+        prompt = prompt_path.read_text(encoding="utf-8")
+        normalized = " ".join(prompt.split())
+        assert "preflight" in prompt.lower()
+        assert expected_tools in normalized
+        assert "in that sequence" in normalized or "in this sequence" in normalized
+        assert "search_symbols" in prompt
+        assert "Do not call `list_repositories`" in prompt
+        assert "Use `list_repositories`" not in prompt
+        assert f"repository `{task['repository']}`" in prompt
+
+
+def test_manifest_has_ten_indexed_tasks_across_multiple_repositories() -> None:
+    manifest = benchmark_lib.load_manifest()
+    assert [task["index"] for task in manifest["tasks"]] == list(range(1, 11))
+    assert {task["repository"] for task in manifest["tasks"]} == {
+        "requests",
+        "click",
+        "engine",
+        "pool",
+        "sql",
+    }
+    for task in manifest["tasks"]:
+        prefix = f"{task['index']:03d}-"
+        for prompt_file in task["prompt_files"].values():
+            assert Path(prompt_file).name.startswith(prefix)
+            assert benchmark_lib.resolve_manifest_file(
+                EVALUATION_DIR / "benchmark-manifest.json", prompt_file
+            ).is_file()
+        assert Path(task["gold_file"]).name.startswith(prefix)
+        assert benchmark_lib.resolve_manifest_file(
+            EVALUATION_DIR / "benchmark-manifest.json", task["gold_file"]
+        ).is_file()
+
+
+def test_schema_validation_rejects_null_and_unsafe_paths() -> None:
+    answer = _answer()
+    answer["files"] = ["/tmp/source.py", "../source.py", r"src\source.py"]
+    answer["evidence"][0]["start_line"] = None
+    errors = benchmark_lib.validate_answer_schema(answer)
+    assert any("relative POSIX path" in error for error in errors)
+    assert any("positive integer" in error for error in errors)
+
+
+def test_schema_validation_rejects_empty_evidence_symbol() -> None:
+    answer = _answer()
+    answer["symbols"][0] = ""
+    answer["evidence"][0]["symbol"] = ""
+    errors = benchmark_lib.validate_answer_schema(answer)
+    assert any("nonempty string" in error for error in errors)
+
+
+def test_model_facing_schema_omits_constraints_enforced_after_generation() -> None:
+    schema = json.loads((EVALUATION_DIR / "codex-answer.schema.json").read_text())
+
+    def mappings(value):
+        if isinstance(value, dict):
+            yield value
+            for nested in value.values():
+                yield from mappings(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                yield from mappings(nested)
+
+    for mapping in mappings(schema):
+        assert "uniqueItems" not in mapping
+        assert "pattern" not in mapping
+
+
+def test_schema_validation_requires_summary_sets_to_match_evidence() -> None:
+    answer = _answer()
+    answer["symbols"] = [PRIMARY_ID]
+    answer["files"] = []
+    errors = benchmark_lib.validate_answer_schema(answer)
+    assert "symbols must equal the symbols represented in evidence" in errors
+    assert "files must equal the files represented in evidence" in errors
+
+
+def test_schema_validation_requires_primary_and_related_evidence() -> None:
+    answer = _answer()
+    answer["symbols"] = []
+    answer["files"] = []
+    answer["evidence"] = []
+
+    errors = benchmark_lib.validate_answer_schema(answer)
+
+    assert any("at least two unique" in error for error in errors)
+    assert any("at least one" in error for error in errors)
+    assert any("primary symbol and a related symbol" in error for error in errors)
+
+
+def test_valid_codekg_trial_and_metrics(tmp_path: Path, monkeypatch) -> None:
+    events_path = tmp_path / "events.jsonl"
+    answer_path = tmp_path / "answer.json"
+    events_path.write_text(
+        "".join(json.dumps(event) + "\n" for event in _events()), encoding="utf-8"
+    )
+    answer_path.write_text(json.dumps(_answer()), encoding="utf-8")
+    monkeypatch.setattr(
+        benchmark_lib,
+        "validate_repository_identity_and_paths",
+        lambda answer, repository, expected_commit, identity: [],
+    )
+    validation, metrics = benchmark_lib.validate_trial(
+        arm="codekg",
+        events_path=events_path,
+        answer_path=answer_path,
+        repository=tmp_path,
+        gold_path=GOLD_PATH,
+        wall_seconds=1.25,
+        exit_code=0,
+    )
+    assert validation["valid"], validation["errors"]
+    assert validation["correctness"]["correct"]
+    assert metrics["target_rank"] == 1
+    assert metrics["searches_before_target"] == 0
+    assert metrics["recall_at_1"]
+    assert metrics["tokens"]["uncached_input"] == 40
+    assert metrics["relationship_location_completeness"] == 1
+
+
+def test_protocol_rejects_disallowed_tool_and_shell() -> None:
+    events = _events()
+    events.insert(
+        2,
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "pwd",
+                "status": "completed",
+                "exit_code": 0,
+            },
+        },
+    )
+    events.insert(3, _tool("list_repositories", {}, []))
+    events.insert(
+        4,
+        {
+            "type": "item.completed",
+            "item": {"type": "web_search", "status": "completed"},
+        },
+    )
+    errors, _ = benchmark_lib.validate_codekg_protocol(events, "requests")
+    assert "CodeKG arm used a shell command" in errors
+    assert "CodeKG arm used web search" in errors
+    assert any("disallowed tools" in error for error in errors)
+
+
+def test_protocol_requires_definition_id_from_search() -> None:
+    events = _events()
+    definition = next(
+        event["item"] for event in events if event.get("item", {}).get("tool") == "get_definition"
+    )
+    definition["arguments"]["identifier"] = "invented"
+    errors, _ = benchmark_lib.validate_codekg_protocol(events, "requests")
+    assert "get_definition identifier was not returned by search_symbols" in errors
+
+
+def test_provenance_rejects_invented_range() -> None:
+    answer = _answer()
+    answer["evidence"][1]["end_line"] = 654
+    errors = benchmark_lib.validate_codekg_provenance(answer, _events(answer))
+    assert any("range was not returned" in error for error in errors)
+
+
+def test_native_requires_numbered_output_covering_whole_definition(tmp_path: Path) -> None:
+    source = tmp_path / "src" / "mod.py"
+    source.parent.mkdir()
+    source.write_text(
+        "class Thing:\n    def method(self):\n        value = 1\n        return value\n",
+        encoding="utf-8",
+    )
+    answer = {
+        "evidence": [
+            {
+                "symbol": "Thing.method",
+                "file": "src/mod.py",
+                "start_line": 2,
+                "end_line": 4,
+            }
+        ]
+    }
+    grep_only = [
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": "/bin/bash -lc 'rg -n method src/mod.py'",
+                "aggregated_output": "src/mod.py:2:    def method(self):\n",
+                "status": "completed",
+                "exit_code": 0,
+            },
+        }
+    ]
+    errors = benchmark_lib.validate_native(answer, grep_only, tmp_path)
+    assert any("numbered full-definition output" in error for error in errors)
+
+    numbered = [
+        *grep_only,
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "command_execution",
+                "command": ("/bin/bash -lc \"nl -ba src/mod.py | sed -n '2,4p'\""),
+                "aggregated_output": (
+                    "     2\t    def method(self):\n"
+                    "     3\t        value = 1\n"
+                    "     4\t        return value\n"
+                ),
+                "status": "completed",
+                "exit_code": 0,
+            },
+        },
+    ]
+    assert benchmark_lib.validate_native(answer, numbered, tmp_path) == []
+
+
+def test_arm_commands_have_shared_base_and_strict_mcp_isolation(tmp_path: Path) -> None:
+    contract = {
+        "model": "gpt-5.4-mini",
+        "model_reasoning_effort": "low",
+        "codekg_url": "http://127.0.0.1:8765/mcp",
+        "codekg_startup_timeout_sec": 15,
+        "codekg_tool_timeout_sec": 30,
+    }
+    common = {
+        "codex": "fake-codex",
+        "profile": "benchmark",
+        "contract": contract,
+        "repository": tmp_path,
+        "schema_path": EVALUATION_DIR / "codex-answer.schema.json",
+    }
+    codekg = run_benchmark.trial_command(
+        arm="codekg", answer_path=tmp_path / "codekg.json", **common
+    )
+    native = run_benchmark.trial_command(
+        arm="native", answer_path=tmp_path / "native.json", **common
+    )
+    for flag in (
+        "--strict-config",
+        "--ignore-user-config",
+        "--ephemeral",
+        "--json",
+        "--ignore-rules",
+        "--output-schema",
+    ):
+        assert flag in codekg and flag in native
+    assert any("enabled_tools=" in value for value in codekg)
+    assert set(benchmark_lib.ALLOWED_CODEKG_TOOLS) == {
+        tool
+        for tool in benchmark_lib.ALLOWED_CODEKG_TOOLS
+        if any(tool in value for value in codekg)
+    }
+    assert "mcp_servers.codekg.enabled=false" in native
+    assert "mcp_servers.codekg.required=false" in native
+    for expected in (
+        'model="gpt-5.4-mini"',
+        'model_reasoning_effort="low"',
+        "features.apps=false",
+        "features.plugins=false",
+        'mcp_servers.codekg.url="http://127.0.0.1:8765/mcp"',
+        "mcp_servers.codekg.startup_timeout_sec=15",
+        "mcp_servers.codekg.tool_timeout_sec=30",
+    ):
+        assert expected in codekg
+        assert expected in native
+    assert not any("default_tools_approval_mode" in value for value in codekg)
+
+
+def test_profile_contract_pins_model_reasoning_and_tools(tmp_path: Path) -> None:
+    manifest = benchmark_lib.load_manifest()
+    profile = tmp_path / "benchmark.config.toml"
+    profile.write_text(
+        'model = "gpt-5.4-mini"\n'
+        'model_reasoning_effort = "low"\n'
+        'web_search = "disabled"\n'
+        "[features]\n"
+        "multi_agent = false\n"
+        "[mcp_servers.codekg]\n"
+        'url = "http://127.0.0.1:8765/mcp"\n'
+        "enabled = true\n"
+        "required = true\n"
+        "startup_timeout_sec = 15\n"
+        "tool_timeout_sec = 30\n"
+        'enabled_tools = ["search_symbols", "get_definition", '
+        '"find_callers", "find_callees"]\n',
+        encoding="utf-8",
+    )
+    contract = run_benchmark.profile_contract(profile, manifest)
+    assert contract["model"] == manifest["model"]
+    assert contract["model_reasoning_effort"] == manifest["model_reasoning_effort"]
+    assert set(contract["codekg_enabled_tools"]) == benchmark_lib.ALLOWED_CODEKG_TOOLS
+    profile.write_text(profile.read_text().replace('"low"', '"high"'), encoding="utf-8")
+    try:
+        run_benchmark.profile_contract(profile, manifest)
+    except RuntimeError as exc:
+        assert "reasoning effort" in str(exc)
+    else:
+        raise AssertionError("mismatched reasoning effort was accepted")
+
+
+def test_profile_path_must_match_profile_loaded_by_codex(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    expected = tmp_path / "codex-home" / "benchmark.config.toml"
+    assert run_benchmark.enforce_profile_path(expected) == expected.resolve()
+    try:
+        run_benchmark.enforce_profile_path(tmp_path / "other.config.toml")
+    except RuntimeError as exc:
+        assert "--profile benchmark" in str(exc)
+    else:
+        raise AssertionError("mismatched --profile-path was accepted")
+
+
+def test_frozen_runner_rejects_alternate_manifest_profile() -> None:
+    manifest = benchmark_lib.load_manifest()
+    manifest["profile"] = "alternate"
+    try:
+        run_benchmark.enforce_manifest_profile(manifest)
+    except RuntimeError as exc:
+        assert "profile='benchmark'" in str(exc)
+    else:
+        raise AssertionError("alternate manifest profile was accepted")
+
+
+def test_frozen_state_detects_input_drift_and_dirty_checkout(tmp_path: Path, monkeypatch) -> None:
+    profile = tmp_path / "benchmark.config.toml"
+    profile.write_text("version = 1\n", encoding="utf-8")
+    expected_hashes = benchmark_lib.snapshot_hashes(
+        EVALUATION_DIR / "benchmark-manifest.json", profile
+    )
+    monkeypatch.setattr(run_benchmark, "repository_states", lambda corpus_root, manifest: {})
+    arguments = {
+        "corpus_root": tmp_path,
+        "manifest_path": EVALUATION_DIR / "benchmark-manifest.json",
+        "profile_path": profile,
+        "expected_hashes": expected_hashes,
+    }
+    run_benchmark.assert_frozen_state(**arguments)
+    profile.write_text("version = 2\n", encoding="utf-8")
+    try:
+        run_benchmark.assert_frozen_state(**arguments)
+    except RuntimeError as exc:
+        assert "inputs drifted" in str(exc)
+    else:
+        raise AssertionError("frozen profile drift was accepted")
+    profile.write_text("version = 1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        run_benchmark,
+        "repository_states",
+        lambda corpus_root, manifest: (_ for _ in ()).throw(
+            RuntimeError("repository checkout was modified")
+        ),
+    )
+    try:
+        run_benchmark.assert_frozen_state(**arguments)
+    except RuntimeError as exc:
+        assert "checkout was modified" in str(exc)
+    else:
+        raise AssertionError("dirty Requests checkout was accepted")
+
+
+def test_launch_works_with_fake_codex_and_preserves_artifacts(tmp_path: Path) -> None:
+    script = tmp_path / "fake_codex.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stdin.read()\n"
+        'print(\'{"type":"turn.completed"}\')\n'
+        "print('fake warning', file=sys.stderr)\n",
+        encoding="utf-8",
+    )
+    code, _ = run_benchmark._launch(
+        command=[sys.executable, str(script)],
+        prompt="prompt",
+        events_path=tmp_path / "trial" / "events.jsonl",
+        stderr_path=tmp_path / "trial" / "stderr.log",
+        timeout=5,
+    )
+    assert code == 0
+    assert '"turn.completed"' in (tmp_path / "trial" / "events.jsonl").read_text()
+    assert "fake warning" in (tmp_path / "trial" / "stderr.log").read_text()
+
+
+def test_launch_rechecks_frozen_state_before_and_after(tmp_path: Path, monkeypatch) -> None:
+    checks = []
+    monkeypatch.setattr(
+        run_benchmark,
+        "assert_frozen_state",
+        lambda **arguments: checks.append(arguments),
+    )
+    monkeypatch.setattr(run_benchmark, "_launch", lambda **arguments: (0, 0.25))
+    frozen = {
+        "repository": tmp_path,
+        "manifest_path": tmp_path / "manifest.json",
+        "profile_path": tmp_path / "benchmark.config.toml",
+        "expected_hashes": {},
+    }
+    result = run_benchmark._launch_with_frozen_state(
+        command=["fake-codex"],
+        prompt="prompt",
+        events_path=tmp_path / "events.jsonl",
+        stderr_path=tmp_path / "stderr.log",
+        timeout=1,
+        frozen_state_arguments=frozen,
+    )
+    assert result == (0, 0.25)
+    assert checks == [frozen, frozen]
+
+
+def test_aggregator_requires_complete_indexed_task_pairs(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        aggregate_benchmark,
+        "summarize_values",
+        lambda values, seed: {"samples": list(values), "median": None},
+    )
+    manifest = benchmark_lib.load_manifest()
+    schedule = benchmark_lib.suite_schedule(
+        tasks=manifest["tasks"],
+        arms=manifest["arms"],
+        seed=manifest["seed"],
+    )
+    for entry in schedule:
+        trial = tmp_path / "tasks" / entry.trial_name / entry.arm
+        trial.mkdir(parents=True)
+        (trial / "metadata.json").write_text(
+            json.dumps(
+                {
+                    "ordinal": entry.ordinal,
+                    "arm": entry.arm,
+                    "task_index": entry.task_index,
+                    "task_id": entry.task_id,
+                    "repository": entry.repository,
+                }
+            ),
+            encoding="utf-8",
+        )
+        metrics = {
+            "valid": True,
+            "correct": True,
+            "success": True,
+            "evidence_compliant": True,
+            "infrastructure_success": True,
+            "wall_seconds": float(entry.task_index),
+            "tokens": {},
+        }
+        (trial / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+        (trial / "validation.json").write_text("{}", encoding="utf-8")
+        (trial / "events.jsonl").write_text(
+            json.dumps(
+                {
+                    "type": "thread.started",
+                    "thread_id": f"{entry.ordinal}-{entry.arm}",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    report = aggregate_benchmark.aggregate(tmp_path, EVALUATION_DIR / "benchmark-manifest.json")
+    assert report["observed_measured_trials"] == 20
+    assert report["intention_to_treat"]["codekg"]["count"] == 10
+    assert report["paired_deltas"]["complete_pairs"] == 10
+    first_metadata = next((tmp_path / "tasks").glob("*/*/metadata.json"))
+    changed = json.loads(first_metadata.read_text())
+    changed["arm"] = "wrong"
+    first_metadata.write_text(json.dumps(changed), encoding="utf-8")
+    try:
+        aggregate_benchmark.aggregate(tmp_path, EVALUATION_DIR / "benchmark-manifest.json")
+    except ValueError as exc:
+        assert "frozen schedule" in str(exc)
+    else:
+        raise AssertionError("out-of-schedule trial metadata was accepted")
+
+
+def test_result_scope_rejects_cross_repository_and_commit() -> None:
+    events = _events()
+    search = next(
+        event["item"] for event in events if event.get("item", {}).get("tool") == "search_symbols"
+    )
+    search["result"]["structured_content"]["repository"] = "other"
+    search["result"]["structured_content"]["commit"] = "000000000000"
+    errors = benchmark_lib.validate_codekg_result_scope(
+        events,
+        repository="requests",
+        commit="f361ead047be5cb873174218582f7d8b9fcd9f49",
+    )
+    assert any("cross-repository" in error for error in errors)
+    assert any("wrong commit" in error for error in errors)
+
+
+def test_trial_requires_one_nonempty_thread_id(tmp_path: Path, monkeypatch) -> None:
+    events = _events()
+    events[0]["thread_id"] = ""
+    (tmp_path / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+    )
+    (tmp_path / "answer.json").write_text(json.dumps(_answer()), encoding="utf-8")
+    monkeypatch.setattr(
+        benchmark_lib,
+        "validate_repository_identity_and_paths",
+        lambda answer, repository, expected_commit, identity: [],
+    )
+    validation, _ = benchmark_lib.validate_trial(
+        arm="codekg",
+        events_path=tmp_path / "events.jsonl",
+        answer_path=tmp_path / "answer.json",
+        repository=tmp_path,
+        gold_path=GOLD_PATH,
+    )
+    assert any("thread.started" in error for error in validation["errors"])
+
+
+
+================================================================================
+FILE: truth/synthetic-phase1.json
+================================================================================
+{
+  "version": 1,
+  "call_sites": [
+    {
+      "owner_qname": "call_forms.factory",
+      "start_line": 6,
+      "start_column": 11,
+      "ordinal": 1,
+      "raw_callee": "object",
+      "status": "unresolved",
+      "target_qname": null,
+      "projection": "none"
+    },
+    {
+      "owner_qname": "call_forms.Child.via_cls",
+      "start_line": 24,
+      "start_column": 8,
+      "ordinal": 2,
+      "raw_callee": "cls.class_action",
+      "status": "cls_direct",
+      "target_qname": "call_forms.Child.class_action",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "call_forms.Child.run",
+      "start_line": 27,
+      "start_column": 8,
+      "ordinal": 3,
+      "raw_callee": "bare_target",
+      "status": "exact_local",
+      "target_qname": "call_forms.bare_target",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "call_forms.Child.run",
+      "start_line": 28,
+      "start_column": 8,
+      "ordinal": 4,
+      "raw_callee": "self.instance",
+      "status": "self_direct",
+      "target_qname": "call_forms.Child.instance",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "call_forms.Child.run",
+      "start_line": 29,
+      "start_column": 8,
+      "ordinal": 5,
+      "raw_callee": "super().save",
+      "status": "super_method",
+      "target_qname": "call_forms.Base.save",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "call_forms.Child.run",
+      "start_line": 29,
+      "start_column": 8,
+      "ordinal": 6,
+      "raw_callee": "super",
+      "status": "unresolved",
+      "target_qname": null,
+      "projection": "none"
+    },
+    {
+      "owner_qname": "call_forms.Child.run",
+      "start_line": 30,
+      "start_column": 8,
+      "ordinal": 7,
+      "raw_callee": "client.send",
+      "status": "dynamic",
+      "target_qname": null,
+      "projection": "none"
+    },
+    {
+      "owner_qname": "call_forms.Child.run",
+      "start_line": 31,
+      "start_column": 8,
+      "ordinal": 8,
+      "raw_callee": "factory().run",
+      "status": "dynamic",
+      "target_qname": null,
+      "projection": "none"
+    },
+    {
+      "owner_qname": "call_forms.Child.run",
+      "start_line": 31,
+      "start_column": 8,
+      "ordinal": 9,
+      "raw_callee": "factory",
+      "status": "exact_local",
+      "target_qname": "call_forms.factory",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "module_init.__module__",
+      "start_line": 5,
+      "start_column": 0,
+      "ordinal": 1,
+      "raw_callee": "bootstrap",
+      "status": "exact_local",
+      "target_qname": "module_init.bootstrap",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "same_line_calls.run",
+      "start_line": 10,
+      "start_column": 4,
+      "ordinal": 1,
+      "raw_callee": "first",
+      "status": "exact_local",
+      "target_qname": "same_line_calls.first",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "same_line_calls.run",
+      "start_line": 10,
+      "start_column": 13,
+      "ordinal": 2,
+      "raw_callee": "second",
+      "status": "exact_local",
+      "target_qname": "same_line_calls.second",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.helper",
+      "start_line": 2,
+      "start_column": 11,
+      "ordinal": 1,
+      "raw_callee": "object",
+      "status": "unresolved",
+      "target_qname": null,
+      "projection": "none"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.__module__",
+      "start_line": 9,
+      "start_column": 1,
+      "ordinal": 2,
+      "raw_callee": "decorate",
+      "status": "exact_local",
+      "target_qname": "scopes_and_definition_time.decorate",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.__module__",
+      "start_line": 9,
+      "start_column": 10,
+      "ordinal": 3,
+      "raw_callee": "helper",
+      "status": "exact_local",
+      "target_qname": "scopes_and_definition_time.helper",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.__module__",
+      "start_line": 10,
+      "start_column": 26,
+      "ordinal": 4,
+      "raw_callee": "helper",
+      "status": "exact_local",
+      "target_qname": "scopes_and_definition_time.helper",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.__module__",
+      "start_line": 10,
+      "start_column": 51,
+      "ordinal": 5,
+      "raw_callee": "helper",
+      "status": "exact_local",
+      "target_qname": "scopes_and_definition_time.helper",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.outer.<locals>.middle.<locals>.Inner.method",
+      "start_line": 14,
+      "start_column": 23,
+      "ordinal": 6,
+      "raw_callee": "helper",
+      "status": "exact_local",
+      "target_qname": "scopes_and_definition_time.helper",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.outer.<locals>.middle.<locals>.deepest",
+      "start_line": 17,
+      "start_column": 19,
+      "ordinal": 7,
+      "raw_callee": "helper",
+      "status": "exact_local",
+      "target_qname": "scopes_and_definition_time.helper",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.outer.<locals>.middle",
+      "start_line": 19,
+      "start_column": 15,
+      "ordinal": 8,
+      "raw_callee": "Inner().method",
+      "status": "dynamic",
+      "target_qname": null,
+      "projection": "none"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.outer.<locals>.middle",
+      "start_line": 19,
+      "start_column": 15,
+      "ordinal": 9,
+      "raw_callee": "Inner",
+      "status": "unresolved",
+      "target_qname": null,
+      "projection": "none"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.outer.<locals>.middle",
+      "start_line": 19,
+      "start_column": 33,
+      "ordinal": 10,
+      "raw_callee": "deepest",
+      "status": "exact_local",
+      "target_qname": "scopes_and_definition_time.outer.<locals>.middle.<locals>.deepest",
+      "projection": "exact"
+    },
+    {
+      "owner_qname": "scopes_and_definition_time.outer",
+      "start_line": 21,
+      "start_column": 11,
+      "ordinal": 11,
+      "raw_callee": "middle",
+      "status": "exact_local",
+      "target_qname": "scopes_and_definition_time.outer.<locals>.middle",
+      "projection": "exact"
+    }
+  ],
+  "has_method_edges": [
+    {
+      "type_qname": "call_forms.Base",
+      "method_qname": "call_forms.Base.save"
+    },
+    {
+      "type_qname": "call_forms.Child",
+      "method_qname": "call_forms.Child.class_action"
+    },
+    {
+      "type_qname": "call_forms.Child",
+      "method_qname": "call_forms.Child.instance"
+    },
+    {
+      "type_qname": "call_forms.Child",
+      "method_qname": "call_forms.Child.run"
+    },
+    {
+      "type_qname": "call_forms.Child",
+      "method_qname": "call_forms.Child.via_cls"
+    },
+    {
+      "type_qname": "scopes_and_definition_time.outer.<locals>.middle.<locals>.Inner",
+      "method_qname": "scopes_and_definition_time.outer.<locals>.middle.<locals>.Inner.method"
+    }
+  ],
+  "internal_inherits": [
+    {
+      "child_qname": "call_forms.Child",
+      "parent_qname": "call_forms.Base"
+    }
+  ],
+  "call_site_summary": {
+    "total": 23,
+    "statuses": {
+      "cls_direct": 1,
+      "dynamic": 3,
+      "exact_local": 13,
+      "self_direct": 1,
+      "super_method": 1,
+      "unresolved": 4
+    },
+    "resolves_to": 16,
+    "calls": 16,
+    "exact_calls": 16,
+    "projection_complete": true
+  },
+  "lexical_queries": [
+    {
+      "query": "still indexed",
+      "target_qname": "valid_neighbor.still_indexed"
+    }
+  ]
+}
+
+
+
+================================================================================
+FILE: validate_benchmark.py
+================================================================================
+#!/usr/bin/env python3
+"""Validate one immutable multi-repository benchmark trial and emit metrics."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from benchmark_lib import (
+    MANIFEST_PATH,
+    load_manifest,
+    read_json,
+    resolve_manifest_file,
+    validate_trial,
+    write_json_new,
+)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("trial", type=Path)
+    parser.add_argument("--arm", choices=("codekg", "native"))
+    parser.add_argument("--task-index", type=int)
+    parser.add_argument("--corpus-root", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+    parser.add_argument(
+        "--write",
+        action="store_true",
+        help="create validation.json and metrics.json in the trial directory",
+    )
+    args = parser.parse_args()
+
+    trial = args.trial.resolve()
+    metadata_path = trial / "metadata.json"
+    metadata = read_json(metadata_path) if metadata_path.is_file() else {}
+    arm = args.arm or metadata.get("arm")
+    if arm not in {"codekg", "native"}:
+        parser.error("--arm is required when metadata.json does not identify the arm")
+    manifest = load_manifest(args.manifest)
+    task_index = args.task_index or metadata.get("task_index")
+    task = next(
+        (item for item in manifest["tasks"] if item["index"] == task_index),
+        None,
+    )
+    if task is None:
+        parser.error("--task-index is required when metadata.json does not identify the task")
+    repository_config = next(
+        item for item in manifest["repositories"] if item["name"] == task["repository"]
+    )
+    repository = (args.corpus_root.resolve() / repository_config["source_path"]).resolve()
+    repository.relative_to(args.corpus_root.resolve())
+    validation, metrics = validate_trial(
+        arm=arm,
+        events_path=trial / "events.jsonl",
+        answer_path=trial / "answer.json",
+        repository=repository,
+        gold_path=resolve_manifest_file(args.manifest, task["gold_file"]),
+        wall_seconds=metadata.get("wall_seconds"),
+        exit_code=metadata.get("exit_code"),
+    )
+    result = {"validation": validation, "metrics": metrics}
+    if args.write:
+        write_json_new(trial / "validation.json", validation)
+        write_json_new(trial / "metrics.json", metrics)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    raise SystemExit(0 if validation["valid"] else 1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"validation error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+
+
+================================================================================
+END OF EVALUATION HARNESS EXPORT - CodeKG
+================================================================================
+Total files processed: 43
+Generated on: su 2.8.2026 12.45.13 +0300

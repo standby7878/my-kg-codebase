@@ -1,0 +1,29 @@
+Task ID: patroni-intent-001
+
+Repository under evaluation: Patroni
+
+Objective:
+Identify the function or method that is responsible for promoting a standby PostgreSQL node to primary.
+
+Instructions:
+
+* Investigate only the repository provided for this task.
+* Do not use web search or external documentation.
+* Do not modify any files.
+* Identify the most directly responsible implementation symbol, not merely a command handler, API endpoint, or configuration option.
+* Trace enough surrounding code to confirm that the symbol actually initiates or performs promotion.
+* Report exact symbol names and repository-relative file paths.
+* Include line ranges when available.
+* Distinguish the primary implementation from relevant callers or helper functions.
+* Do not invent symbols or paths.
+* Return the final answer using the supplied JSON schema.
+
+Expected evidence:
+
+* The principal promotion-related symbol.
+* Its repository-relative source file.
+* A concise explanation of why it is the responsible implementation.
+* Any directly relevant caller or helper needed to justify the conclusion.
+  ::: 
+
+

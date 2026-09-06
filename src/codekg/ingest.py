@@ -4,8 +4,10 @@ import ast
 import hashlib
 import logging
 import os
+import re
 import subprocess
 import time
+import tokenize
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -63,11 +65,52 @@ class _LexicalScope:
     qname: str
 
 
+_SOURCE_LINE_PATTERN = re.compile(r".*?(?:\r\n|\n|\r|$)")
+
+
+class _SourceSegments:
+    """Extract source segments using the parser's UTF-8 byte offsets."""
+
+    def __init__(self, source: str) -> None:
+        lines = tuple(match.group(0) for match in _SOURCE_LINE_PATTERN.finditer(source))
+        self._lines = tuple(line.encode("utf-8") for line in lines)
+        offsets: list[int] = []
+        offset = 0
+        for line in self._lines:
+            offsets.append(offset)
+            offset += len(line)
+        self._line_offsets = tuple(offsets)
+        self._source = b"".join(self._lines)
+
+    def segment(self, node: ast.AST) -> str | None:
+        try:
+            if (
+                node.lineno is None
+                or node.col_offset is None
+                or node.end_lineno is None
+                or node.end_col_offset is None
+            ):
+                return None
+            start_line = node.lineno - 1
+            end_line = node.end_lineno - 1
+            start_column = node.col_offset
+            end_column = node.end_col_offset
+            start = self._line_offsets[start_line] + start_column
+            end = self._line_offsets[end_line] + end_column
+        except (AttributeError, IndexError, TypeError):
+            return None
+        try:
+            return self._source[start:end].decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+
 class _PythonExtractor(ast.NodeVisitor):
     def __init__(self, path: str, module_qname: str, source: str) -> None:
         self.path = path
         self.module_qname = module_qname
         self.source = source
+        self._source_segments = _SourceSegments(source)
         self.imports: list[ImportIR] = []
         self.symbols: list[SymbolIR] = []
         self.inheritance: list[InheritanceIR] = []
@@ -560,7 +603,7 @@ class _PythonExtractor(ast.NodeVisitor):
             self._guard_depth -= 1
 
     def _source_for(self, node: ast.AST) -> str:
-        source = ast.get_source_segment(self.source, node)
+        source = self._source_segments.segment(node)
         if source:
             return source
         try:
@@ -768,11 +811,44 @@ def _scan_file(root: Path, path: Path) -> FileIR:
     started = time.perf_counter()
     rel_path = path.relative_to(root).as_posix()
     language = LANGUAGES_BY_SUFFIX[path.suffix.lower()]
-    text = path.read_text(encoding="utf-8", errors="replace")
-    loc = text.count("\n") + int(bool(text) and not text.endswith("\n"))
     module_qname = _module_qname(rel_path, repository_name=root.name)
     if language != "python":
+        text = path.read_text(encoding="utf-8", errors="replace")
+        loc = text.count("\n") + int(bool(text) and not text.endswith("\n"))
         return FileIR(path=rel_path, language=language, loc=loc, module_qname=module_qname)
+
+    try:
+        with tokenize.open(path) as source_file:
+            text = source_file.read()
+    except (LookupError, SyntaxError, UnicodeError) as error:
+        raw = path.read_bytes()
+        loc = _raw_line_count(raw)
+        diagnostic = _source_read_diagnostic(error)
+        debug_event(
+            logger,
+            "scan_file",
+            path=rel_path,
+            language=language,
+            loc=loc,
+            parse_status="error",
+            diagnostics=1,
+            duration_ms=_duration_ms(started),
+        )
+        return FileIR(
+            path=rel_path,
+            language=language,
+            loc=loc,
+            module_qname=module_qname,
+            module_init=ModuleInitIR(
+                qname=f"{module_qname}.__module__",
+                start_line=1,
+                end_line=max(1, loc),
+            ),
+            parse_status="error",
+            diagnostics=(diagnostic,),
+        )
+
+    loc = text.count("\n") + int(bool(text) and not text.endswith("\n"))
 
     module_init = ModuleInitIR(
         qname=f"{module_qname}.__module__",
@@ -877,6 +953,29 @@ def _scan_file(root: Path, path: Path) -> FileIR:
         duration_ms=_duration_ms(started),
     )
     return file
+
+
+def _source_read_diagnostic(error: LookupError | SyntaxError | UnicodeError) -> ParseDiagnosticIR:
+    if isinstance(error, SyntaxError):
+        message = error.msg
+        line = error.lineno
+        column = error.offset
+    else:
+        message = f"source decoding failed: {error}"
+        line = None
+        column = None
+    return ParseDiagnosticIR(
+        category="syntax_error",
+        severity="error",
+        line=line,
+        column=column,
+        message=message,
+    )
+
+
+def _raw_line_count(source: bytes) -> int:
+    newline_count = source.count(b"\n") + source.count(b"\r") - source.count(b"\r\n")
+    return newline_count + int(bool(source) and not source.endswith((b"\n", b"\r")))
 
 
 def _duration_ms(started: float) -> float:

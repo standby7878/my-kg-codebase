@@ -1,0 +1,20 @@
+{
+  "task_id": "requests-intent-001",
+  "repository": "requests",
+  "category": "intent_symbol_discovery",
+  "primary_symbol": "requests.sessions.Session.prepare_request",
+  "accepted_primary_suffixes": [
+    "Session.prepare_request",
+    "sessions.Session.prepare_request"
+  ],
+  "primary_file": "requests/sessions.py",
+  "relevant_symbols": [
+    "requests.sessions.Session.request",
+    "requests.models.PreparedRequest.prepare"
+  ],
+  "accepted_relevant_suffixes": [
+    "Session.request",
+    "PreparedRequest.prepare"
+  ],
+  "notes": "Line ranges are commit-dependent and must be taken from the indexed or checked-out revision. Accept suffix matches because graph qualified-name conventions may omit the top-level package."
+}

@@ -10,14 +10,13 @@ the loader turns successful resolutions into graph relationships.
 from __future__ import annotations
 
 import ast
-import json
 import re
 import sqlite3
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
-from codekg.ir import CallIR, FileIR, LocalBindingIR, RepositoryIR
+from codekg.ir import CallIR, FileIR, ImportIR, LocalBindingIR, RepositoryIR
 
 _IDENTIFIER = re.compile(r"[A-Za-z_]\w*")
 _DOTTED_IDENTIFIER = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
@@ -191,39 +190,54 @@ class SqliteResolverIndex(ResolverIndex):
         )
 
     def file(self, path: str) -> FileIR | None:
-        from codekg.bulk_spool import _file_from_payload
-
         row = self.connection.execute(
-            "SELECT payload FROM files WHERE path = ?", (path,)
+            "SELECT path, language, loc, module_qname, parse_status "
+            "FROM files WHERE path = ?",
+            (path,),
         ).fetchone()
-        return _file_from_payload(json.loads(row[0])) if row else None
+        if row is None:
+            return None
+        imports = tuple(
+            ImportIR(module, name, alias)
+            for module, name, alias in self.connection.execute(
+                "SELECT module, name, alias FROM imports WHERE path = ? ORDER BY ordinal",
+                (path,),
+            )
+        )
+        return FileIR(
+            path=row[0],
+            language=row[1],
+            loc=row[2],
+            module_qname=row[3],
+            parse_status=row[4],
+            imports=imports,
+        )
 
     def files(self) -> Iterable[FileIR]:
-        from codekg.bulk_spool import _file_from_payload
+        from codekg.bulk_spool import _file_from_normalized
 
-        for (payload,) in self.connection.execute("SELECT payload FROM files ORDER BY ordinal"):
-            yield _file_from_payload(json.loads(payload))
+        for (path,) in self.connection.execute("SELECT path FROM files ORDER BY ordinal"):
+            yield _file_from_normalized(self.connection, str(path))
 
     def base_state(self, type_qname: str) -> BaseState:
         """Resolve only ``type_qname``'s bases without enumerating the registry.
 
-        The query retains the legacy file/ordinal order and reconstructs only
-        the small file contexts needed to expand import aliases.
+        The query retains the legacy file/ordinal order and reads only the
+        compact file/import context needed to expand import aliases.
         """
-        from codekg.bulk_spool import _file_from_payload
-
         bases: list[str] = []
+        if len(self.types(type_qname)) != 1:
+            return BaseState(incomplete=True)
         rows = self.connection.execute(
-            "SELECT inheritance.base_name, inheritance.base_qname, files.payload "
+            "SELECT inheritance.path, inheritance.base_name, inheritance.base_qname "
             "FROM inheritance JOIN files ON files.path = inheritance.path "
             "WHERE inheritance.type_qname = ? "
             "ORDER BY files.ordinal, inheritance.ordinal",
             (type_qname,),
         )
-        for base_name, base_qname, payload in rows:
-            file = _file_from_payload(json.loads(payload))
-            if len(self.types(type_qname)) != 1:
-                return BaseState(incomplete=True)
+        for path, base_name, base_qname in rows:
+            file = self.file(str(path))
+            assert file is not None
             candidates = _inheritance_candidates(
                 str(base_name), str(base_qname) if base_qname is not None else None,
                 _import_bindings(file),

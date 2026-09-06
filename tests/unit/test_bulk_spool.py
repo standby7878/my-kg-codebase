@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -120,3 +121,39 @@ def test_spool_round_trip_preserves_complete_file_ir(tmp_path: Path) -> None:
     assert restored[0].symbols[0].docstring == files[0].symbols[0].docstring
     assert restored[1].module_init is None
     assert restored[1].diagnostics[0].line is None
+
+
+def test_v2_spool_is_normalized_and_has_no_file_payload(tmp_path: Path) -> None:
+    spool = tmp_path / "normalized.sqlite"
+    create_spool(
+        spool,
+        [FileIR(path="module.py", language="python", loc=1, module_qname="module")],
+    )
+
+    connection = sqlite3.connect(spool)
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert {
+            "metadata",
+            "files",
+            "moduleinit",
+            "symbols",
+            "imports",
+            "inheritance",
+            "calls",
+            "localbindings",
+            "diagnostics",
+        } <= tables
+        assert "payload" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(files)")
+        }
+        assert connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == ("2",)
+    finally:
+        connection.close()

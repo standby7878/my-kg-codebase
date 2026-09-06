@@ -1,0 +1,37 @@
+Task ID: requests-intent-001
+
+Repository under evaluation: requests
+
+Objective:
+Identify the method responsible for taking a high-level Request together with session-level state, merging the relevant session defaults, and producing the PreparedRequest that will later be sent.
+
+Mandatory MCP protocol:
+1. Call codekg.list_repositories first.
+2. Verify that repository "requests" is present.
+3. If "requests" is absent, stop immediately. Do not provide a technical answer. Set the answer field to:
+   INFRA_ERROR: repository_not_indexed
+4. Use CodeKG MCP tools as the only repository-investigation mechanism.
+5. Do not use shell commands, grep, ripgrep, find, cat, direct filesystem reads, web search, or prior model knowledge as evidence.
+6. Search only repository "requests" with `scope: "source"`.
+7. Start with exactly one `search_symbols` call with `limit` no greater than 5.
+8. Treat search as candidate discovery only. If it returns a plausible top candidate or a `recommended_symbol_id`, do not issue another broad search. Immediately call `get_definition` with that exact `symbol_id`.
+9. Treat `get_definition` as verification of indexed metadata and line bounds. Then call `find_callers` and `find_callees` with that same exact `symbol_id` to verify both the orchestration boundary and delegated helpers.
+10. A second, reformulated search is allowed only when the first search has no plausible candidate. No more than two search calls are allowed.
+11. Do not claim implementation behavior from names or model knowledge alone. Ground it in successful definition metadata and caller/callee relationships returned by MCP.
+12. Do not report any symbol, file, line range, caller, or helper unless it appeared in a successful MCP result.
+13. Exact repository-relative paths and non-null line ranges are required.
+14. If `get_definition` and at least one relationship query have not succeeded, the run is incomplete and must not return a normal technical answer.
+15. If any required MCP call fails, is cancelled, or times out, stop and set the answer field to:
+    INFRA_ERROR: mcp_call_failed
+
+What to distinguish:
+- The method that builds the PreparedRequest using session-level state.
+- The higher-level method that orchestrates the request.
+- The lower-level PreparedRequest method that performs detailed preparation, if delegation occurs.
+
+Return:
+- The primary implementation symbol.
+- Its repository-relative source file and exact line range.
+- One directly relevant caller or delegated helper, with file and line range.
+- A concise explanation of why the primary symbol is the correct responsibility boundary.
+- The final answer must conform to the supplied JSON schema.
