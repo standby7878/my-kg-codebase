@@ -17,8 +17,9 @@ from codekg.ir import (
     ParseDiagnosticIR,
     SymbolIR,
 )
+from codekg.sql_ir import SqlArtifactIR, SqlObjectRefIR, SqlStatementIR
 
-SPOOL_SCHEMA_VERSION = 2
+SPOOL_SCHEMA_VERSION = 3
 _LEGACY_SPOOL_SCHEMA_VERSION = 1
 _WRITE_BATCH_SIZE = 64
 _SQLITE_CACHE_KIB = -8192
@@ -97,7 +98,7 @@ def build_registry(path: Path, spool_paths: Iterable[Path], *, repo_prefix: str)
                 version = _schema_version(connection, database="spool")
                 if version != SPOOL_SCHEMA_VERSION:
                     raise ValueError(
-                        "registry build requires normalized v2 spools, "
+                        "registry build requires normalized v3 spools, "
                         f"got {version!r} from {source_path}"
                     )
                 file_ordinal += _copy_attached_spool(connection, repo_prefix, file_ordinal)
@@ -112,6 +113,12 @@ def build_registry(path: Path, spool_paths: Iterable[Path], *, repo_prefix: str)
                     connection.execute("DETACH DATABASE spool")
                     attached = False
                 raise
+        # SQL globals are grouped only after every attached spool has been
+        # copied.  The builder operates on normalized SQLite rows and leaves
+        # source occurrences in sqlrefs intact for later projection.
+        from codekg.sql_resolver import build_sql_registry
+
+        build_sql_registry(connection, repo_prefix)
         _create_registry_indexes(connection)
         connection.commit()
     finally:
@@ -128,9 +135,7 @@ def _configure(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA foreign_keys=OFF")
 
 
-def _create_normalized_schema(
-    connection: sqlite3.Connection, *, include_symbol_keys: bool
-) -> None:
+def _create_normalized_schema(connection: sqlite3.Connection, *, include_symbol_keys: bool) -> None:
     symbol_key = ", key TEXT PRIMARY KEY" if include_symbol_keys else ""
     connection.executescript(
         f"""
@@ -212,6 +217,58 @@ def _create_normalized_schema(
             line INTEGER,
             column INTEGER,
             message TEXT NOT NULL
+        );
+        CREATE TABLE sqlartifacts (
+            path TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            origin TEXT NOT NULL,
+            dialect TEXT NOT NULL,
+            text TEXT NOT NULL,
+            text_hash TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            start_column INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            end_column INTEGER NOT NULL,
+            PRIMARY KEY (path, ordinal)
+        );
+        CREATE TABLE sqlstatements (
+            path TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            artifact_ordinal INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            parent_ordinal INTEGER,
+            control_context TEXT,
+            start_line INTEGER NOT NULL,
+            start_column INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            end_column INTEGER NOT NULL,
+            PRIMARY KEY (path, ordinal)
+        );
+        CREATE TABLE sqlrefs (
+            path TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            artifact_ordinal INTEGER NOT NULL,
+            statement_ordinal INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            raw_name TEXT NOT NULL,
+            database_name TEXT,
+            schema_name TEXT,
+            object_name TEXT,
+            object_kind_hint TEXT,
+            signature_hint TEXT,
+            start_line INTEGER NOT NULL,
+            start_column INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            end_column INTEGER NOT NULL,
+            dynamic INTEGER NOT NULL,
+            PRIMARY KEY (path, ordinal)
+        );
+        CREATE TABLE sqlref_search_path (
+            path TEXT NOT NULL,
+            ref_ordinal INTEGER NOT NULL,
+            ordinal INTEGER NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (path, ref_ordinal, ordinal)
         );
         """
     )
@@ -320,11 +377,77 @@ def _insert_file(connection: sqlite3.Connection, file: FileIR, ordinal: int) -> 
             for index, value in enumerate(file.diagnostics)
         ),
     )
+    connection.executemany(
+        "INSERT INTO sqlartifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            (
+                file.path,
+                value.ordinal,
+                value.origin,
+                value.dialect,
+                value.text,
+                value.text_hash,
+                value.start_line,
+                value.start_column,
+                value.end_line,
+                value.end_column,
+            )
+            for value in file.sql_artifacts
+        ),
+    )
+    connection.executemany(
+        "INSERT INTO sqlstatements VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            (
+                file.path,
+                value.ordinal,
+                value.artifact_ordinal,
+                value.kind,
+                value.parent_ordinal,
+                value.control_context,
+                value.start_line,
+                value.start_column,
+                value.end_line,
+                value.end_column,
+            )
+            for value in file.sql_statements
+        ),
+    )
+    connection.executemany(
+        "INSERT INTO sqlrefs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            (
+                file.path,
+                value.ordinal,
+                value.artifact_ordinal,
+                value.statement_ordinal,
+                value.role,
+                value.raw_name,
+                value.database_name,
+                value.schema_name,
+                value.object_name,
+                value.object_kind_hint,
+                value.signature_hint,
+                value.start_line,
+                value.start_column,
+                value.end_line,
+                value.end_column,
+                int(value.dynamic),
+            )
+            for value in file.sql_object_refs
+        ),
+    )
+    connection.executemany(
+        "INSERT INTO sqlref_search_path VALUES (?, ?, ?, ?)",
+        (
+            (file.path, value.ordinal, index, search_path)
+            for value in file.sql_object_refs
+            for index, search_path in enumerate(value.search_path)
+        ),
+    )
 
 
-def _copy_attached_spool(
-    connection: sqlite3.Connection, repo_prefix: str, file_offset: int
-) -> int:
+def _copy_attached_spool(connection: sqlite3.Connection, repo_prefix: str, file_offset: int) -> int:
     copied = int(connection.execute("SELECT count(*) FROM spool.files").fetchone()[0])
     connection.execute(
         "INSERT INTO files (ordinal, path, language, loc, module_qname, parse_status) "
@@ -363,6 +486,23 @@ def _copy_attached_spool(
             "value_qname_hint, annotation, start_line, start_column, guarded",
         ),
         ("diagnostics", "path, ordinal, category, severity, line, column, message"),
+        (
+            "sqlartifacts",
+            "path, ordinal, origin, dialect, text, text_hash, start_line, start_column, "
+            "end_line, end_column",
+        ),
+        (
+            "sqlstatements",
+            "path, ordinal, artifact_ordinal, kind, parent_ordinal, control_context, "
+            "start_line, start_column, end_line, end_column",
+        ),
+        (
+            "sqlrefs",
+            "path, ordinal, artifact_ordinal, statement_ordinal, role, raw_name, "
+            "database_name, schema_name, object_name, object_kind_hint, signature_hint, "
+            "start_line, start_column, end_line, end_column, dynamic",
+        ),
+        ("sqlref_search_path", "path, ref_ordinal, ordinal, value"),
     ):
         connection.execute(f"INSERT INTO {table} ({columns}) SELECT {columns} FROM spool.{table}")
     return copied
@@ -379,6 +519,12 @@ def _create_registry_indexes(connection: sqlite3.Connection) -> None:
         CREATE INDEX calls_path_idx ON calls(path, row_ordinal);
         CREATE INDEX localbindings_path_idx ON localbindings(path, ordinal);
         CREATE INDEX diagnostics_path_idx ON diagnostics(path, ordinal);
+        CREATE INDEX sqlrefs_lookup_idx
+            ON sqlrefs(database_name, schema_name, object_name, object_kind_hint, role);
+        CREATE INDEX sqlstatements_artifact_idx
+            ON sqlstatements(path, artifact_ordinal, ordinal);
+        CREATE INDEX sqlref_search_path_idx
+            ON sqlref_search_path(path, ref_ordinal, ordinal);
         """
     )
 
@@ -532,6 +678,115 @@ def _file_from_normalized(connection: sqlite3.Connection, path: str) -> FileIR:
             (path,),
         )
     )
+    sql_artifacts = tuple(
+        SqlArtifactIR(
+            ordinal,
+            origin,
+            dialect,
+            text,
+            text_hash,
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+        )
+        for (
+            ordinal,
+            origin,
+            dialect,
+            text,
+            text_hash,
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+        ) in connection.execute(
+            "SELECT ordinal, origin, dialect, text, text_hash, start_line, start_column, "
+            "end_line, end_column FROM sqlartifacts WHERE path = ? ORDER BY ordinal",
+            (path,),
+        )
+    )
+    sql_statements = tuple(
+        SqlStatementIR(
+            artifact_ordinal,
+            ordinal,
+            kind,
+            parent_ordinal,
+            control_context,
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+        )
+        for (
+            ordinal,
+            artifact_ordinal,
+            kind,
+            parent_ordinal,
+            control_context,
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+        ) in connection.execute(
+            "SELECT ordinal, artifact_ordinal, kind, parent_ordinal, control_context, "
+            "start_line, start_column, end_line, end_column FROM sqlstatements "
+            "WHERE path = ? ORDER BY ordinal",
+            (path,),
+        )
+    )
+    sql_object_refs = []
+    for (
+        ordinal,
+        artifact_ordinal,
+        statement_ordinal,
+        role,
+        raw_name,
+        database_name,
+        schema_name,
+        object_name,
+        object_kind_hint,
+        signature_hint,
+        start_line,
+        start_column,
+        end_line,
+        end_column,
+        dynamic,
+    ) in connection.execute(
+        "SELECT ordinal, artifact_ordinal, statement_ordinal, role, raw_name, "
+        "database_name, schema_name, object_name, object_kind_hint, signature_hint, "
+        "start_line, start_column, end_line, end_column, dynamic FROM sqlrefs "
+        "WHERE path = ? ORDER BY ordinal",
+        (path,),
+    ):
+        search_path = tuple(
+            value
+            for (value,) in connection.execute(
+                "SELECT value FROM sqlref_search_path WHERE path = ? AND ref_ordinal = ? "
+                "ORDER BY ordinal",
+                (path, ordinal),
+            )
+        )
+        sql_object_refs.append(
+            SqlObjectRefIR(
+                artifact_ordinal,
+                statement_ordinal,
+                ordinal,
+                role,
+                raw_name,
+                database_name,
+                schema_name,
+                object_name,
+                object_kind_hint,
+                signature_hint,
+                start_line,
+                start_column,
+                end_line,
+                end_column,
+                bool(dynamic),
+                search_path,
+            )
+        )
     return FileIR(
         path=row[0],
         language=row[1],
@@ -545,6 +800,9 @@ def _file_from_normalized(connection: sqlite3.Connection, path: str) -> FileIR:
         inheritance=inheritance,
         calls=calls,
         local_bindings=local_bindings,
+        sql_artifacts=sql_artifacts,
+        sql_statements=sql_statements,
+        sql_object_refs=tuple(sql_object_refs),
     )
 
 

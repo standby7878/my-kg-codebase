@@ -18,6 +18,13 @@ BOOTSTRAP_CYPHER = [
         "FOR (n:ParseDiagnostic) REQUIRE n.key IS UNIQUE"
     ),
     "CREATE CONSTRAINT reference_key IF NOT EXISTS FOR (n:Reference) REQUIRE n.key IS UNIQUE",
+    "CREATE CONSTRAINT database_key IF NOT EXISTS FOR (n:Database) REQUIRE n.key IS UNIQUE",
+    "CREATE CONSTRAINT sql_object_key IF NOT EXISTS FOR (n:SqlObject) REQUIRE n.key IS UNIQUE",
+    "CREATE CONSTRAINT sql_artifact_key IF NOT EXISTS FOR (n:SqlArtifact) REQUIRE n.key IS UNIQUE",
+    (
+        "CREATE CONSTRAINT sql_statement_key IF NOT EXISTS "
+        "FOR (n:SqlStatement) REQUIRE n.key IS UNIQUE"
+    ),
     "CREATE INDEX repository_name IF NOT EXISTS FOR (n:Repository) ON (n.repo_name)",
     "CREATE INDEX file_path IF NOT EXISTS FOR (n:File) ON (n.path)",
     "CREATE INDEX symbol_name IF NOT EXISTS FOR (n:Function) ON (n.name)",
@@ -30,6 +37,11 @@ BOOTSTRAP_CYPHER = [
     "CREATE INDEX module_init_qname IF NOT EXISTS FOR (n:ModuleInit) ON (n.qname)",
     "CREATE INDEX call_site_owner_key IF NOT EXISTS FOR (n:CallSite) ON (n.owner_key)",
     "CREATE INDEX call_site_status IF NOT EXISTS FOR (n:CallSite) ON (n.status)",
+    (
+        "CREATE INDEX sql_namespace IF NOT EXISTS FOR (n:SqlObject) "
+        "ON (n.database_name, n.schema_name, n.object_name)"
+    ),
+    "CREATE INDEX reference_status IF NOT EXISTS FOR (n:Reference) ON (n.status)",
     """
     CREATE FULLTEXT INDEX code_symbol_search IF NOT EXISTS
     FOR (n:Function|Method|Type)

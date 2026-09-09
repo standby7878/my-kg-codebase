@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal
 
+from codekg.sql_ir import SqlArtifactIR, SqlObjectRefIR, SqlStatementIR
+
 
 @dataclass(frozen=True)
 class ImportIR:
@@ -73,8 +75,14 @@ class ModuleInitIR:
 
 @dataclass(frozen=True)
 class ParseDiagnosticIR:
-    category: Literal["syntax_error"]
-    severity: Literal["error"]
+    category: Literal[
+        "syntax_error",
+        "sql_parse_error",
+        "sql_unsupported_construct",
+        "sql_dynamic_reference",
+        "source_decode_error",
+    ]
+    severity: Literal["warning", "error"]
     line: int | None
     column: int | None
     message: str
@@ -87,13 +95,16 @@ class FileIR:
     loc: int
     module_qname: str
     module_init: ModuleInitIR | None = None
-    parse_status: Literal["ok", "error"] = "ok"
+    parse_status: Literal["ok", "partial", "error"] = "ok"
     diagnostics: tuple[ParseDiagnosticIR, ...] = ()
     imports: tuple[ImportIR, ...] = ()
     symbols: tuple[SymbolIR, ...] = ()
     inheritance: tuple[InheritanceIR, ...] = ()
     calls: tuple[CallIR, ...] = ()
     local_bindings: tuple[LocalBindingIR, ...] = ()
+    sql_artifacts: tuple[SqlArtifactIR, ...] = ()
+    sql_statements: tuple[SqlStatementIR, ...] = ()
+    sql_object_refs: tuple[SqlObjectRefIR, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -44,6 +44,15 @@ An independent specifications-only repository is not supported: Markdown is
 only used when it lives inside a target code repository. Copy or mount those
 files into the corresponding code checkout before indexing.
 
+### SQL ingestion
+
+SQL ingestion is enabled per repository with `[sql] enabled = true` in
+`codekg.toml`; the normal `index-sources` bulk or transactional commands need
+no additional flags. See [SQL ingestion](docs/sql-ingestion.md) for selection,
+PostgreSQL dialect, and supported/unsupported constructs. SQL source files are
+parsed statically; Python strings, live catalog state, dynamic SQL names, and
+complete procedural control-flow dependencies are not inferred.
+
 ## Start the project
 
 From the project root, build the application image once:
@@ -103,6 +112,11 @@ configured corpus to CSV, creates a fresh Neo4j store with `neo4j-admin`,
 builds the matching zvec-backed lexical description index, validates their
 exact callable keys, then briefly restarts Neo4j and MCP on the new generation.
 The previous generation remains available if staging or validation fails.
+Callable search documents are finalized into the published bulk manifest during
+export. Search construction and validation consume that immutable stage and do
+not rescan the mounted repositories. Per-callable Markdown enrichment is capped
+at 256,000 characters so a frequently mentioned symbol cannot make staging use
+repository-scale memory.
 
 Use transactional writes only for a targeted update or operational debugging:
 

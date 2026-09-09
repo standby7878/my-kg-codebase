@@ -9,15 +9,25 @@ only from an exact ``CallSite`` resolution in the current snapshot.
 from __future__ import annotations
 
 import logging
+import tempfile
 import time
 from collections import Counter, defaultdict
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 from codekg.ir import CallIR, FileIR, RepositoryIR
 from codekg.logging_config import debug_event
 from codekg.neo4j_client import Neo4jClient, get_client
 from codekg.resolver import CallResolution, SymbolRef, resolve_call_sites
+from codekg.sql_graph import (
+    SQL_NODE_COLUMNS,
+    iter_all_sql_global_nodes,
+    iter_sql_file_nodes,
+    iter_sql_file_relationships,
+    iter_sql_global_relationships,
+)
+from codekg.sql_resolver import SqliteSqlResolverIndex
 
 DEFAULT_BATCH_SIZE = 1_000
 logger = logging.getLogger(__name__)
@@ -397,6 +407,9 @@ def load_repository(
         operation="load construction owner projections",
     )
 
+    sql_counts, sql_batches = _load_sql_graph(repo, db, batch_size=batch_size)
+    batch_count += sql_batches
+
     status_counts = dict(sorted(Counter(str(row["status"]) for row in callsite_rows).items()))
     response = {
         "nodes": (
@@ -406,6 +419,7 @@ def load_repository(
             + len(module_init_rows)
             + len(type_rows)
             + len(callable_rows)
+            + sql_counts["nodes"]
         ),
         "module_inits": len(module_init_rows),
         "imports": len(import_rows),
@@ -416,6 +430,8 @@ def load_repository(
         "files_with_parse_errors": sum(file.parse_status == "error" for file in repo.files),
         "parse_diagnostics": sum(len(file.diagnostics) for file in repo.files),
         "batches": batch_count,
+        "sql_nodes": sql_counts["nodes"],
+        "sql_relationships": sql_counts["relationships"],
     }
     debug_event(
         logger,
@@ -430,6 +446,185 @@ def load_repository(
         duration_ms=round((time.perf_counter() - started) * 1000, 2),
     )
     return response
+
+
+def _load_sql_graph(
+    repo: RepositoryIR, db: Neo4jClient, *, batch_size: int
+) -> tuple[dict[str, int], int]:
+    """Load SQL facts through the same normalized registry used by bulk paths."""
+    repo_prefix = f"{repo.repo_name}@{repo.commit}"
+    db.execute_write(
+        """
+        MATCH (n)
+        WHERE n.key STARTS WITH $prefix
+          AND (n:Database OR n:SqlObject OR n:SqlArtifact OR n:SqlStatement OR n:Reference)
+        DETACH DELETE n
+        """,
+        {"prefix": f"{repo_prefix}:"},
+        operation="clear current snapshot SQL graph",
+    )
+    batches = 1
+    if not any(
+        file.sql_artifacts or file.sql_statements or file.sql_object_refs for file in repo.files
+    ):
+        return {"nodes": 0, "relationships": 0}, batches
+
+    from codekg.bulk_spool import build_registry, create_spool, iter_spool_files
+
+    with tempfile.TemporaryDirectory(prefix="codekg-sql-loader-") as directory:
+        root = Path(directory)
+        spool = root / "source.sqlite"
+        registry = root / "registry.sqlite"
+        create_spool(spool, repo.files)
+        build_registry(registry, [spool], repo_prefix=repo_prefix)
+        index = SqliteSqlResolverIndex(registry)
+        try:
+            node_count = 0
+            pending_nodes: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+            def enqueue_node(label: str, row: dict[str, Any]) -> None:
+                nonlocal batches
+                pending_nodes[label].append(row)
+                if len(pending_nodes[label]) >= batch_size:
+                    batches += _write_sql_nodes(db, label, pending_nodes.pop(label), batch_size)
+
+            for label, row in iter_all_sql_global_nodes(index):
+                enqueue_node(label, row)
+                node_count += 1
+            for file in iter_spool_files(spool):
+                for label, row in iter_sql_file_nodes(repo_prefix, file, index):
+                    enqueue_node(label, row)
+                    node_count += 1
+            for label, rows in pending_nodes.items():
+                batches += _write_sql_nodes(db, label, rows, batch_size)
+
+            relationship_count = 0
+            pending: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+
+            def enqueue(edge: tuple[str, str, str, dict[str, Any], str]) -> None:
+                nonlocal batches, relationship_count
+                kind, start, end, properties, identity = edge
+                key = _sql_relationship_labels(kind, identity)
+                pending[key].append(
+                    {"identity": identity, "start": start, "end": end, **properties}
+                )
+                relationship_count += 1
+                if len(pending[key]) >= batch_size:
+                    batches += _flush_sql_relationship(db, key, pending.pop(key))
+
+            for edge in iter_sql_global_relationships(
+                repo_prefix, repo.repo_name, index, all_global=True
+            ):
+                enqueue(edge)
+            for file in iter_spool_files(spool):
+                for edge in iter_sql_file_relationships(repo_prefix, file, index):
+                    enqueue(edge)
+            for key, rows in pending.items():
+                batches += _flush_sql_relationship(db, key, rows)
+            return {
+                "nodes": node_count,
+                "relationships": relationship_count,
+            }, batches
+        finally:
+            index.close()
+
+
+def _write_sql_nodes(
+    db: Neo4jClient, label: str, rows: Iterable[dict[str, Any]], batch_size: int
+) -> int:
+    fields = SQL_NODE_COLUMNS[label][1:]
+    assignments = ",\n            ".join(f"n.{name} = row.{name}" for name, _ in fields)
+    return _write_batched(
+        db,
+        f"""
+        UNWIND $rows AS row
+        MERGE (n:{label} {{key: row.key}})
+        SET {assignments}
+        """,
+        list(rows),
+        batch_size,
+        operation=f"load SQL {label} nodes",
+    )
+
+
+def _sql_relationship_labels(kind: str, identity: str) -> tuple[str, str, str]:
+    if kind == "HAS_DATABASE":
+        return kind, "Repository", "Database"
+    if kind == "HAS_OBJECT":
+        return kind, "Database", "SqlObject"
+    if kind == "HAS_REFERENCE":
+        return kind, "SqlStatement", "Reference"
+    if kind == "REFERS_TO":
+        return kind, "Reference", "SqlObject"
+    if kind in {"DEFINES", "READS_FROM", "WRITES_TO", "INVOKES_SQL", "ALTERS", "DROPS"}:
+        return kind, "SqlStatement", "SqlObject"
+    if kind == "CONTAINS_SQL":
+        if identity.endswith(":contains"):
+            return kind, "File", "SqlArtifact"
+        if identity.endswith(":artifact"):
+            return kind, "SqlArtifact", "SqlStatement"
+        return kind, "SqlStatement", "SqlStatement"
+    raise ValueError(f"unsupported SQL relationship kind: {kind}")
+
+
+def _flush_sql_relationship(
+    db: Neo4jClient, key: tuple[str, str, str], rows: list[dict[str, Any]]
+) -> int:
+    kind, start_label, end_label = key
+    return _write_batched(
+        db,
+        _SQL_RELATIONSHIP_QUERIES[kind, start_label, end_label],
+        rows,
+        len(rows),
+        operation=f"load SQL {kind} relationships",
+    )
+
+
+_SQL_RELATIONSHIP_QUERIES: dict[tuple[str, str, str], str] = {}
+for _kind in (
+    "HAS_DATABASE",
+    "HAS_OBJECT",
+    "CONTAINS_SQL",
+    "HAS_REFERENCE",
+    "REFERS_TO",
+    "DEFINES",
+    "READS_FROM",
+    "WRITES_TO",
+    "INVOKES_SQL",
+    "ALTERS",
+    "DROPS",
+):
+    _props = {
+        "REFERS_TO": "rel.status = row.status",
+        "DEFINES": "rel.role = row.role, rel.line = row.line, rel.column = row.column",
+        "READS_FROM": "rel.role = row.role, rel.line = row.line, rel.column = row.column",
+        "WRITES_TO": "rel.role = row.role, rel.line = row.line, rel.column = row.column",
+        "INVOKES_SQL": "rel.role = row.role, rel.line = row.line, rel.column = row.column",
+        "ALTERS": "rel.role = row.role, rel.line = row.line, rel.column = row.column",
+        "DROPS": "rel.role = row.role, rel.line = row.line, rel.column = row.column",
+    }.get(_kind, "")
+    _SQL_RELATIONSHIP_QUERIES[_kind, "Repository", "Database"] = f"""
+        UNWIND $rows AS row
+        MATCH (a:Repository {{key: row.start}})
+        MATCH (b:Database {{key: row.end}})
+        MERGE (a)-[rel:{_kind} {{key: row.identity}}]->(b)
+    """
+    for _start, _end in (
+        ("Database", "SqlObject"),
+        ("File", "SqlArtifact"),
+        ("SqlArtifact", "SqlStatement"),
+        ("SqlStatement", "SqlStatement"),
+        ("SqlStatement", "Reference"),
+        ("Reference", "SqlObject"),
+        ("SqlStatement", "SqlObject"),
+    ):
+        _SQL_RELATIONSHIP_QUERIES[_kind, _start, _end] = f"""
+            UNWIND $rows AS row
+            MATCH (a:{_start} {{key: row.start}})
+            MATCH (b:{_end} {{key: row.end}})
+            MERGE (a)-[rel:{_kind} {{key: row.identity}}]->(b)
+            {f"SET {_props}" if _props else ""}
+        """
 
 
 def delete_repository_by_name(repo_name: str, client: Neo4jClient | None = None) -> int:

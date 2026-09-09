@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from itertools import chain
 from typing import Any
 
 from codekg.ir import RepositoryIR, SymbolIR
@@ -104,7 +105,7 @@ def iter_callable_rows(
 
 def build_symbol_text(
     symbol: SymbolIR | Mapping[str, object],
-    markdown_descriptions: tuple[str, ...] | list[str] = (),
+    markdown_descriptions: Iterable[str] = (),
 ) -> str:
     """Create lexical text without reading source files after extraction."""
 
@@ -112,18 +113,8 @@ def build_symbol_text(
     qname = _value(symbol, "qname")
     signature = _value(symbol, "signature")
     docstring = _value(symbol, "docstring")
-    return "\n".join(
-        part
-        for part in [
-            name,
-            normalize_name(name or qname),
-            qname,
-            signature,
-            docstring,
-            *markdown_descriptions,
-        ]
-        if part
-    ).strip()
+    intrinsic = (name, normalize_name(name or qname), qname, signature, docstring)
+    return "\n".join(part for part in chain(intrinsic, markdown_descriptions) if part).strip()
 
 
 def normalize_name(value: str) -> str:

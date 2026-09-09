@@ -13,6 +13,7 @@ authors = [{ name = "CodeKG Maintainers" }]
 dependencies = [
   "fastmcp>=2,<3",
   "neo4j>=5.26,<6",
+  "pglast>=7,<8",
   "pydantic>=2",
   "rich",
   "typer",

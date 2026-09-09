@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import resource
 import time
-from itertools import chain
 from pathlib import Path
 from typing import Annotated
 
@@ -194,33 +193,30 @@ def bulk_import(
 
 
 @app.command("bulk-zvec")
-def bulk_zvec(paths: Annotated[list[Path], typer.Argument(min=1)]) -> None:
-    """Build the derived zvec-backed lexical description index (FTS only)."""
+def bulk_zvec(manifests: Annotated[list[Path], typer.Argument(min=1)]) -> None:
+    """Build lexical descriptions from immutable bulk-export stages."""
 
-    from codekg.ingest import scan_repository
-    from codekg.search_index import iter_callable_docs_from_repository
+    from codekg.bulk_search import iter_search_stage_docs, validate_search_manifests
     from codekg.zvec_store import open_write, optimize_and_flush, upsert_symbol_docs
 
-    debug_event(logger, "cli_command_started", command="bulk-zvec", repositories=len(paths))
+    debug_event(logger, "cli_command_started", command="bulk-zvec", manifests=len(manifests))
     started = time.perf_counter()
-    repositories = [scan_repository(path) for path in paths]
-    scanned_at = time.perf_counter()
+    stages = validate_search_manifests(manifests)
+    validated_at = time.perf_counter()
     collection = open_write()
     document_count = upsert_symbol_docs(
         collection,
-        chain.from_iterable(
-            iter_callable_docs_from_repository(repository) for repository in repositories
-        ),
+        (doc for stage in stages for doc in iter_search_stage_docs(stage)),
     )
     optimize_and_flush(collection)
     finished = time.perf_counter()
     console.print(
         {
-            "repositories": len(paths),
+            "manifests": len(manifests),
             "documents": document_count,
             "metrics": {
-                "scan_seconds": round(scanned_at - started, 3),
-                "zvec_seconds": round(finished - scanned_at, 3),
+                "stage_validation_seconds": round(validated_at - started, 3),
+                "zvec_seconds": round(finished - validated_at, 3),
                 "elapsed_seconds": round(finished - started, 3),
                 "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
             },
@@ -230,33 +226,21 @@ def bulk_zvec(paths: Annotated[list[Path], typer.Argument(min=1)]) -> None:
 
 
 @app.command("validate-bulk-index")
-def validate_bulk_index(paths: Annotated[list[Path], typer.Argument(min=1)]) -> None:
+def validate_bulk_index(manifests: Annotated[list[Path], typer.Argument(min=1)]) -> None:
     """Validate staged lexical-description records against live graph callables."""
 
-    from codekg.ingest import scan_repository
-    from codekg.search_index import (
-        callable_docs_from_repository,
-        iter_callable_rows,
-        validate_search_index_consistency,
-    )
+    from codekg.bulk_search import validate_search_manifests, validate_staged_search
+    from codekg.neo4j_client import get_client
     from codekg.zvec_store import open_write
 
     debug_event(
-        logger, "cli_command_started", command="validate-bulk-index", repositories=len(paths)
+        logger, "cli_command_started", command="validate-bulk-index", manifests=len(manifests)
     )
-    repositories = [scan_repository(path) for path in paths]
-    descriptions = [
-        doc for repository in repositories for doc in callable_docs_from_repository(repository)
-    ]
-    live_graph_keys = {
-        str(row["key"])
-        for repository in repositories
-        for row in iter_callable_rows(repo=repository.repo_name)
-    }
-    result = validate_search_index_consistency(
-        descriptions,
-        live_graph_keys=live_graph_keys,
+    stages = validate_search_manifests(manifests)
+    result = validate_staged_search(
+        stages,
         collection=open_write(),
+        client=get_client(),
     )
     console.print(result)
     debug_event(

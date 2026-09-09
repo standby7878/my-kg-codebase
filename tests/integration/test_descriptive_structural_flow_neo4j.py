@@ -327,10 +327,17 @@ def test_compact_discovery_is_repository_scoped_and_returns_typed_missing_repo(
                 "start_line",
                 "end_line",
                 "score",
+                "signature",
                 "matched_terms",
                 "match_type",
                 "scope",
             }
+            calibrate = next(
+                row
+                for row in response["results"]
+                if row["qualified_name"] == "api.calibrate_target"
+            )
+            assert calibrate["signature"] == "def calibrate_target()"
 
             missing = discover_symbols(
                 "calibrate target",

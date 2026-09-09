@@ -9,7 +9,7 @@ from collections.abc import Iterator
 from itertools import chain
 from pathlib import Path
 
-from codekg.ingest import _iter_source_files, iter_markdown_files
+from codekg.ingest import _iter_source_files, _sql_config_identity, iter_markdown_files
 
 _READ_CHUNK_SIZE = 1024 * 1024
 
@@ -36,6 +36,7 @@ def content_hash(root: Path) -> str:
             connection.commit()
 
             digest = hashlib.sha256()
+            digest.update(_sql_config_identity(root))
             for (relative_path,) in connection.execute(
                 "SELECT path FROM paths ORDER BY path COLLATE PATH_ORDER"
             ):

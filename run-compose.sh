@@ -203,8 +203,8 @@ bulk_index_sources() {
     echo "CODEKG_PHASE_START zvec $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     CODEKG_BULK_STAGING_VOLUME="$staging_volume" \
         CODEKG_ZVEC_DATA_VOLUME="$zvec_volume" \
-        dc run --rm --no-deps "${mounts[@]}" bulk-exporter \
-        codekg bulk-zvec "${repository_paths[@]}"
+        dc run --rm --no-deps bulk-exporter \
+        codekg bulk-zvec /data/bulk/manifest.json
     echo "CODEKG_PHASE_END zvec $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "CODEKG_PHASE_START import $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     CODEKG_BULK_STAGING_VOLUME="$staging_volume" \
@@ -236,8 +236,8 @@ bulk_index_sources() {
     echo "CODEKG_PHASE_END publish $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "CODEKG_PHASE_START validation $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if ! CODEKG_BULK_STAGING_VOLUME="$staging_volume" \
-        dc run --rm --no-deps "${mounts[@]}" bulk-exporter \
-        codekg validate-bulk-index "${repository_paths[@]}"; then
+        dc run --rm --no-deps bulk-exporter \
+        codekg validate-bulk-index /data/bulk/manifest.json; then
         dc stop neo4j
         restore_runtime_generation "$backup_runtime"
         dc up -d neo4j schema_bootstrap mcp

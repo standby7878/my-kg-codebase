@@ -89,19 +89,26 @@ def test_index_sources_defaults_to_staged_bulk_publish(tmp_path: Path) -> None:
     invocations = docker_invocations(log)
     assert any("bulk-exporter" in invocation for invocation in invocations)
     assert any("bulk-importer" in invocation for invocation in invocations)
+    zvec = next(invocation for invocation in invocations if "bulk-zvec" in invocation)
+    validation = next(
+        invocation for invocation in invocations if "validate-bulk-index" in invocation
+    )
+    assert zvec[-2:] == ["bulk-zvec", "/data/bulk/manifest.json"]
+    assert validation[-2:] == ["validate-bulk-index", "/data/bulk/manifest.json"]
+    assert not any(":/repos/" in argument for argument in (*zvec, *validation))
     assert (tmp_path / "runtime.env").is_file()
     for phase in ("export", "zvec", "import", "publish", "validation", "activation"):
         assert f"CODEKG_PHASE_START {phase}" in result.stdout
         assert f"CODEKG_PHASE_END {phase}" in result.stdout
-    assert result.stdout.index("CODEKG_PHASE_START publish") < result.stdout.index(
-        "CODEKG_PHASE_END publish"
-    ) < result.stdout.index(
-        "CODEKG_PHASE_START validation"
+    assert (
+        result.stdout.index("CODEKG_PHASE_START publish")
+        < result.stdout.index("CODEKG_PHASE_END publish")
+        < result.stdout.index("CODEKG_PHASE_START validation")
     )
-    assert result.stdout.index("CODEKG_PHASE_END validation") < result.stdout.index(
-        "CODEKG_PHASE_START activation"
-    ) < result.stdout.index(
-        "CODEKG_PHASE_END activation"
+    assert (
+        result.stdout.index("CODEKG_PHASE_END validation")
+        < result.stdout.index("CODEKG_PHASE_START activation")
+        < result.stdout.index("CODEKG_PHASE_END activation")
     )
     assert invocations[-1][-3:] == ["up", "-d", "mcp"]
 

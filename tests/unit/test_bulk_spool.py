@@ -46,9 +46,7 @@ def test_spool_round_trip_preserves_complete_file_ir(tmp_path: Path) -> None:
                     return_annotation="str",
                 ),
             ),
-            inheritance=(
-                InheritanceIR("pkg.module.Worker", "BaseWorker", "pkg.base.BaseWorker"),
-            ),
+            inheritance=(InheritanceIR("pkg.module.Worker", "BaseWorker", "pkg.base.BaseWorker"),),
             calls=(
                 CallIR(
                     owner_qname="pkg.module.__module__",
@@ -123,7 +121,7 @@ def test_spool_round_trip_preserves_complete_file_ir(tmp_path: Path) -> None:
     assert restored[1].diagnostics[0].line is None
 
 
-def test_v2_spool_is_normalized_and_has_no_file_payload(tmp_path: Path) -> None:
+def test_v3_spool_is_normalized_and_has_no_file_payload(tmp_path: Path) -> None:
     spool = tmp_path / "normalized.sqlite"
     create_spool(
         spool,
@@ -134,9 +132,7 @@ def test_v2_spool_is_normalized_and_has_no_file_payload(tmp_path: Path) -> None:
     try:
         tables = {
             row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         assert {
             "metadata",
@@ -149,11 +145,9 @@ def test_v2_spool_is_normalized_and_has_no_file_payload(tmp_path: Path) -> None:
             "localbindings",
             "diagnostics",
         } <= tables
-        assert "payload" not in {
-            row[1] for row in connection.execute("PRAGMA table_info(files)")
-        }
+        assert "payload" not in {row[1] for row in connection.execute("PRAGMA table_info(files)")}
         assert connection.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
-        ).fetchone() == ("2",)
+        ).fetchone() == ("3",)
     finally:
         connection.close()

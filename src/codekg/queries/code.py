@@ -522,7 +522,9 @@ def _rank_discovery_rows(query: str, rows: list[dict[str, object]]) -> list[dict
         owner_matches = (set(terms) & set(roles["owner"])) - name_matches
         module_matches = (set(terms) & set(roles["module"])) - name_matches
         package_matches = (set(terms) & set(roles["package"])) - name_matches
-        score += _weighted_matches(owner_matches, specific=_OWNER_WEIGHT, generic=_OWNER_GENERIC_WEIGHT)
+        score += _weighted_matches(
+            owner_matches, specific=_OWNER_WEIGHT, generic=_OWNER_GENERIC_WEIGHT
+        )
         score += _weighted_matches(
             module_matches, specific=_MODULE_WEIGHT, generic=_MODULE_GENERIC_WEIGHT
         )

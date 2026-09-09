@@ -332,6 +332,7 @@ async def test_http_mcp_transport_supports_protocol_client_session(
                 "start_line",
                 "end_line",
                 "score",
+                "signature",
                 "matched_terms",
                 "match_type",
             }
@@ -339,6 +340,7 @@ async def test_http_mcp_transport_supports_protocol_client_session(
                 f"{REPOSITORY}@{COMMIT}:src/requests/candidates.py:"
                 "src.requests.candidates.candidate_0:1"
             )
+            assert first_structured["results"][0]["signature"] == "def candidate()"
             cursor = first_structured["next_cursor"]
             assert isinstance(cursor, str)
             assert not cursor.startswith("cur_")

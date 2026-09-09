@@ -26,6 +26,13 @@ from codekg.bulk_spool import iter_spool_files
 from codekg.ir import FileIR, RepositoryIR
 from codekg.loader import _callsite_key, _candidate_qnames, _import_aliases, _key, _symbol_key
 from codekg.resolver import ResolverIndex, SqliteResolverIndex, SymbolRef, _Resolver
+from codekg.sql_graph import (
+    iter_sql_file_nodes,
+    iter_sql_file_relationships,
+    iter_sql_global_nodes,
+    iter_sql_global_relationships,
+)
+from codekg.sql_resolver import SqliteSqlResolverIndex
 
 
 class ProjectionValidator:
@@ -174,9 +181,10 @@ class ProjectionValidator:
 class ShardWriter:
     """Headerless CSV files for one deterministic projection partition."""
 
-    def __init__(self, root: Path, partition: int) -> None:
+    def __init__(self, root: Path, partition: int, *, wide_defines: bool = False) -> None:
         self.root = Path(root)
         self.partition = partition
+        self.wide_defines = wide_defines
         self._handles: dict[tuple[bool, str], Any] = {}
         self._writers: dict[tuple[bool, str], csv.writer] = {}
         self.paths: dict[tuple[bool, str], Path] = {}
@@ -192,6 +200,10 @@ class ShardWriter:
             self._writers[key] = csv.writer(handle, lineterminator="\n")
             self.paths[key] = path
         columns = _NODE_COLUMNS[kind] if node else _REL_COLUMNS[kind]
+        if not node and kind == "DEFINES" and not self.wide_defines:
+            from codekg.bulk_export import _PYTHON_DEFINES_COLUMNS
+
+            columns = _PYTHON_DEFINES_COLUMNS
         values_out = [_csv_value(values.get(name)) for name, _ in columns]
         if node:
             values_out.append(kind)
@@ -289,7 +301,12 @@ def project_partition(
     validator = validator or ProjectionValidator(output_dir / ".projection-validation.sqlite")
     index = _ModuleInitIndex(backend, repo)
     resolver = _Resolver(index)
-    writer = ShardWriter(output_dir, partition)
+    sql_index = _sql_index_from_backend(backend)
+    wide_defines = bool(
+        sql_index is not None
+        and sql_index.connection.execute("SELECT 1 FROM sqlobject_definitions LIMIT 1").fetchone()
+    )
+    writer = ShardWriter(output_dir, partition, wide_defines=wide_defines)
     counts: dict[str, int] = {}
     try:
         if partition == 0 and not validator.has_node(repo.repo_name):
@@ -304,7 +321,7 @@ def project_partition(
             _increment(counts, "nodes_Repository")
         for file in _iter_project_files(spool_paths, backend):
             index.set_current(file)
-            _project_file(repo, file, resolver, writer, validator, counts)
+            _project_file(repo, file, resolver, writer, validator, counts, sql_index=sql_index)
         writer.close()
         validator.connection.commit()
     except Exception:
@@ -448,6 +465,8 @@ def _project_file(
     writer: ShardWriter,
     validator: ProjectionValidator,
     counts: dict[str, int],
+    *,
+    sql_index: SqliteSqlResolverIndex | None = None,
 ) -> None:
     def node(label: str, row: Mapping[str, Any], *, global_node: bool = False) -> None:
         key = str(row["key"])
@@ -466,7 +485,13 @@ def _project_file(
     ) -> None:
         if validator.relationship(kind, identity, start, end, properties):
             row = {
-                "key": relationship_key if relationship_key is not None else identity,
+                "key": (
+                    None
+                    if kind == "DEFINES" and not properties
+                    else relationship_key
+                    if relationship_key is not None
+                    else identity
+                ),
                 "_identity": identity,
                 "start": start,
                 "end": end,
@@ -730,6 +755,31 @@ def _project_file(
                 relationship_key=callsite_key,
             )
 
+    if sql_index is not None and (
+        file.sql_artifacts or file.sql_statements or file.sql_object_refs
+    ):
+        repo_prefix = f"{repo.repo_name}@{repo.commit}"
+
+        def sql_node(label: str, row: Mapping[str, Any], *, global_node: bool = False) -> None:
+            node(label, row, global_node=global_node)
+
+        # Global SQL identities are owner-sharded, so each is emitted once by
+        # the partition containing its source owner.  Their relationships use
+        # the same owner rule and may target nodes in another partition; the
+        # merged validator checks those endpoints after all partitions finish.
+        for label, row in iter_sql_global_nodes(sql_index, owner_path=file.path):
+            sql_node(label, row, global_node=True)
+        for kind, start, end, properties, identity in iter_sql_global_relationships(
+            repo_prefix, repo.repo_name, sql_index, owner_path=file.path
+        ):
+            relationship(kind, start, end, properties, identity)
+        for label, row in iter_sql_file_nodes(repo_prefix, file, sql_index):
+            sql_node(label, row)
+        for kind, start, end, properties, identity in iter_sql_file_relationships(
+            repo_prefix, file, sql_index
+        ):
+            relationship(kind, start, end, properties, identity)
+
 
 def _increment(counts: dict[str, int], key: str) -> None:
     counts[key] = counts.get(key, 0) + 1
@@ -757,6 +807,10 @@ def _publish_projection(
             f"nodes_{kind}.header.csv" if node else f"relationships_{kind}.header.csv"
         )
         columns = _NODE_COLUMNS[kind] if node else _REL_COLUMNS[kind]
+        if not node and kind == "DEFINES" and counts.get("nodes_SqlObject", 0) == 0:
+            from codekg.bulk_export import _PYTHON_DEFINES_COLUMNS
+
+            columns = _PYTHON_DEFINES_COLUMNS
         with header.open("w", encoding="utf-8", newline="") as handle:
             csv.writer(handle, lineterminator="\n").writerow(
                 [value for _, value in columns] + ([":LABEL"] if node else [])
@@ -802,4 +856,18 @@ def _csv_value(value: Any) -> str:
         return ""
     if isinstance(value, (list, tuple)):
         return ";".join(str(item) for item in value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
     return str(value)
+
+
+def _sql_index_from_backend(backend: ResolverIndex) -> SqliteSqlResolverIndex | None:
+    connection = getattr(backend, "connection", None)
+    if not isinstance(connection, sqlite3.Connection):
+        return None
+    has_sql = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlobjects'"
+    ).fetchone()
+    if has_sql is None:
+        return None
+    return SqliteSqlResolverIndex.from_backend(backend)

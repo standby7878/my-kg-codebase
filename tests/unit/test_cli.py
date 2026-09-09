@@ -148,20 +148,22 @@ def test_bulk_import_passes_options_and_prints_result(monkeypatch, tmp_path: Pat
     assert "returncode=0" in result.stdout
 
 
-def test_bulk_zvec_scans_and_indexes_descriptions_without_graph_calls(monkeypatch) -> None:
-    scanned: list[Path] = []
-    docs_for: list[object] = []
+def test_bulk_zvec_streams_validated_search_stages_without_scanning(monkeypatch) -> None:
+    manifests = [Path("first.json"), Path("second.json")]
+    stages = [Path("first.sqlite"), Path("second.sqlite")]
+    validated: list[list[Path]] = []
+    docs_for: list[Path] = []
     upserts: list[tuple[object, list[object]]] = []
     optimized: list[object] = []
     collection = object()
 
-    def fake_scan_repository(path: Path) -> object:
-        scanned.append(path)
-        return f"repository:{path.name}"
+    def fake_validate(values: list[Path]) -> tuple[Path, ...]:
+        validated.append(values)
+        return tuple(stages)
 
-    def fake_iter_callable_docs(repository: object):
-        docs_for.append(repository)
-        yield f"doc:{repository}"
+    def fake_iter_stage_docs(stage: Path):
+        docs_for.append(stage)
+        yield f"doc:{stage.stem}"
 
     def fake_open_write() -> object:
         return collection
@@ -174,23 +176,20 @@ def test_bulk_zvec_scans_and_indexes_descriptions_without_graph_calls(monkeypatc
     def fake_optimize_and_flush(target: object) -> None:
         optimized.append(target)
 
-    monkeypatch.setattr("codekg.ingest.scan_repository", fake_scan_repository)
-    monkeypatch.setattr(
-        "codekg.search_index.iter_callable_docs_from_repository",
-        fake_iter_callable_docs,
-    )
+    monkeypatch.setattr("codekg.bulk_search.validate_search_manifests", fake_validate)
+    monkeypatch.setattr("codekg.bulk_search.iter_search_stage_docs", fake_iter_stage_docs)
     monkeypatch.setattr("codekg.zvec_store.open_write", fake_open_write)
     monkeypatch.setattr("codekg.zvec_store.upsert_symbol_docs", fake_upsert_symbol_docs)
     monkeypatch.setattr("codekg.zvec_store.optimize_and_flush", fake_optimize_and_flush)
 
-    result = CliRunner().invoke(app, ["bulk-zvec", "first", "second"])
+    result = CliRunner().invoke(app, ["bulk-zvec", *map(str, manifests)])
 
     assert result.exit_code == 0
-    assert scanned == [Path("first"), Path("second")]
-    assert docs_for == ["repository:first", "repository:second"]
-    assert upserts == [(collection, ["doc:repository:first", "doc:repository:second"])]
+    assert validated == [manifests]
+    assert docs_for == stages
+    assert upserts == [(collection, ["doc:first", "doc:second"])]
     assert optimized == [collection]
-    assert "repositories" in result.stdout
+    assert "manifests" in result.stdout
     assert "documents" in result.stdout
 
 
@@ -201,51 +200,36 @@ def test_bulk_zvec_scans_and_indexes_descriptions_without_graph_calls(monkeypatc
         ({"ok": False, "missing_in_zvec": ["key-1"]}, 1),
     ],
 )
-def test_validate_bulk_index_checks_live_keys_and_exit_status(
+def test_validate_bulk_index_uses_stage_and_exit_status(
     monkeypatch,
     tmp_path: Path,
     consistency: dict[str, object],
     expected_exit_code: int,
 ) -> None:
-    repository = SimpleNamespace(repo_name="sample")
     collection = object()
-    scanned: list[Path] = []
-    graph_repos: list[str] = []
-    validation: list[tuple[list[object], set[str], object]] = []
+    client = object()
+    manifest = tmp_path / "manifest.json"
+    stage = tmp_path / "search.sqlite"
+    validation: list[tuple[tuple[Path, ...], object, object]] = []
 
-    def fake_scan_repository(path: Path) -> object:
-        scanned.append(path)
-        return repository
-
-    def fake_callable_docs(repository_value: object) -> list[object]:
-        return ["doc-1"]
-
-    def fake_iter_callable_rows(*, repo: str) -> list[dict[str, str]]:
-        graph_repos.append(repo)
-        return [{"key": "key-1"}]
+    def fake_validate_manifests(values: list[Path]) -> tuple[Path, ...]:
+        assert values == [manifest]
+        return (stage,)
 
     def fake_open_write() -> object:
         return collection
 
-    def fake_validate(
-        docs: list[object], *, live_graph_keys: set[str], collection: object
-    ) -> dict[str, object]:
-        validation.append((docs, live_graph_keys, collection))
+    def fake_validate(stages, *, collection: object, client: object) -> dict[str, object]:
+        validation.append((stages, collection, client))
         return consistency
 
-    monkeypatch.setattr("codekg.ingest.scan_repository", fake_scan_repository)
-    monkeypatch.setattr(
-        "codekg.search_index.callable_docs_from_repository",
-        fake_callable_docs,
-    )
-    monkeypatch.setattr("codekg.search_index.iter_callable_rows", fake_iter_callable_rows)
-    monkeypatch.setattr("codekg.search_index.validate_search_index_consistency", fake_validate)
+    monkeypatch.setattr("codekg.bulk_search.validate_search_manifests", fake_validate_manifests)
+    monkeypatch.setattr("codekg.bulk_search.validate_staged_search", fake_validate)
+    monkeypatch.setattr("codekg.neo4j_client.get_client", lambda: client)
     monkeypatch.setattr("codekg.zvec_store.open_write", fake_open_write)
 
-    result = CliRunner().invoke(app, ["validate-bulk-index", str(tmp_path / "repo")])
+    result = CliRunner().invoke(app, ["validate-bulk-index", str(manifest)])
 
     assert result.exit_code == expected_exit_code
-    assert scanned == [tmp_path / "repo"]
-    assert graph_repos == ["sample"]
-    assert validation == [(["doc-1"], {"key-1"}, collection)]
+    assert validation == [((stage,), collection, client)]
     assert str(consistency["ok"]) in result.stdout

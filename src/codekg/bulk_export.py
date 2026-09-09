@@ -12,6 +12,7 @@ import time
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,14 @@ from codekg.loader import (
     _symbol_key,
 )
 from codekg.logging_config import debug_event
+from codekg.sql_graph import (
+    SQL_NODE_COLUMNS,
+    SQL_REL_COLUMNS,
+    iter_all_sql_global_nodes,
+    iter_sql_file_nodes,
+    iter_sql_file_relationships,
+    iter_sql_global_relationships,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +104,14 @@ def export_repository_path(root: Path, output_dir: Path, *, workers: int = 1) ->
         from codekg.bulk_projection import project_repository
 
         repo = RepositoryIR(repo_name=root.name, commit=commit, root_path=str(root))
+        from codekg.bulk_search import create_search_stage_from_registry
+
+        search_documents = create_search_stage_from_registry(
+            generation / "search.sqlite",
+            generation / ".building" / "resolver.sqlite",
+            root,
+            repo,
+        )
         projection_spools = (
             Path(row[0]) for row in catalog.execute("SELECT path FROM spools ORDER BY ordinal")
         )
@@ -117,6 +134,11 @@ def export_repository_path(root: Path, output_dir: Path, *, workers: int = 1) ->
                 "commit": repo.commit,
                 "root_path": repo.root_path,
             },
+            "search_stage": {
+                "version": 1,
+                "file": "search.sqlite",
+                "documents": search_documents,
+            },
         }
     )
     result.manifest_path.write_text(
@@ -133,6 +155,7 @@ def export_repository_path(root: Path, output_dir: Path, *, workers: int = 1) ->
                 entry["files"] = [str(generation_name / value) for value in entry["files"]]
             else:
                 entry["file"] = str(generation_name / entry["file"])
+    published["search_stage"]["file"] = str(generation_name / published["search_stage"]["file"])
     top_manifest = output_dir / "manifest.json"
     temporary = output_dir / ".manifest.json.tmp"
     temporary.write_text(
@@ -173,6 +196,7 @@ class BulkExport:
     counts: Mapping[str, int]
     node_groups: Mapping[str, tuple[Path, ...]] = field(default_factory=dict)
     relationship_groups: Mapping[str, tuple[Path, ...]] = field(default_factory=dict)
+    search_stage: Path | None = None
 
 
 _NODE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
@@ -295,6 +319,15 @@ _REL_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ),
     }.items()
 }
+_PYTHON_DEFINES_COLUMNS = _REL_COLUMNS["DEFINES"]
+_REL_COLUMNS["DEFINES"] = SQL_REL_COLUMNS["DEFINES"]
+_NODE_COLUMNS.update(SQL_NODE_COLUMNS)
+# SQL and Python share the DEFINES relationship kind.  The CSV writer selects
+# the narrow legacy shape for Python-only exports and the augmented shape when
+# SQL definitions are present.
+for _kind, _columns in SQL_REL_COLUMNS.items():
+    if _kind != "DEFINES":
+        _REL_COLUMNS[_kind] = _columns
 
 
 def export_repositories(repositories: Iterable[RepositoryIR], output_dir: Path) -> BulkExport:
@@ -327,6 +360,11 @@ def export_repositories(repositories: Iterable[RepositoryIR], output_dir: Path) 
     )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    from codekg.bulk_search import create_search_stage_from_repositories
+
+    search_documents = create_search_stage_from_repositories(
+        output_dir / "search.sqlite", repository_snapshots
+    )
     node_files = {label: output_dir / f"nodes_{label}.csv" for label in sorted(graph["nodes"])}
     relationship_files = {
         kind: output_dir / f"relationships_{kind}.csv" for kind in sorted(graph["relationships"])
@@ -336,7 +374,13 @@ def export_repositories(repositories: Iterable[RepositoryIR], output_dir: Path) 
         _write_csv(node_files[label], _NODE_COLUMNS[label], rows, label)
     for kind, rows in graph["relationships"].items():
         debug_event(logger, "bulk_export_relationship_file", kind=kind, rows=len(rows))
-        _write_csv(relationship_files[kind], _REL_COLUMNS[kind], rows, kind)
+        _write_csv(
+            relationship_files[kind],
+            _REL_COLUMNS[kind],
+            rows,
+            kind,
+            wide_defines=bool(graph["nodes"].get("SqlObject")),
+        )
     manifest = {
         "version": 1,
         "output_dir": str(output_dir),
@@ -349,6 +393,11 @@ def export_repositories(repositories: Iterable[RepositoryIR], output_dir: Path) 
             for kind, path in relationship_files.items()
         },
         "counts": graph["counts"],
+        "search_stage": {
+            "version": 1,
+            "file": "search.sqlite",
+            "documents": search_documents,
+        },
     }
     manifest_path = output_dir / "manifest.json"
     fd, temporary = tempfile.mkstemp(prefix=".manifest.", suffix=".json", dir=output_dir)
@@ -368,6 +417,7 @@ def export_repositories(repositories: Iterable[RepositoryIR], output_dir: Path) 
         graph["counts"],
         {label: (path,) for label, path in node_files.items()},
         {kind: (path,) for kind, path in relationship_files.items()},
+        output_dir / "search.sqlite",
     )
     debug_event(
         logger,
@@ -396,6 +446,12 @@ def load_bulk_export(manifest_path: Path) -> BulkExport:
     }
     node_files = {label: paths[0] for label, paths in node_groups.items()}
     relationship_files = {kind: paths[0] for kind, paths in relationship_groups.items()}
+    search_entry = data.get("search_stage")
+    search_stage = (
+        output_dir / str(search_entry["file"])
+        if isinstance(search_entry, dict) and isinstance(search_entry.get("file"), str)
+        else None
+    )
     result = BulkExport(
         manifest_path,
         output_dir,
@@ -404,6 +460,7 @@ def load_bulk_export(manifest_path: Path) -> BulkExport:
         data["counts"],
         node_groups,
         relationship_groups,
+        search_stage,
     )
     debug_event(
         logger,
@@ -447,7 +504,13 @@ def _build_graph(repositories: tuple[RepositoryIR, ...]) -> dict[str, Any]:
         rel_seen[(kind, key)] = semantic
         relationships[kind].append(
             {
-                "key": relationship_key if relationship_key is not None else key,
+                "key": (
+                    None
+                    if kind == "DEFINES" and not props
+                    else relationship_key
+                    if relationship_key is not None
+                    else key
+                ),
                 "_identity": key,
                 "start": start,
                 "end": end,
@@ -623,6 +686,24 @@ def _build_graph(repositories: tuple[RepositoryIR, ...]) -> dict[str, Any]:
                 f"{row['callsite_key']}:owner-constructs",
                 relationship_key=str(row["callsite_key"]),
             )
+        if any(
+            file.sql_artifacts or file.sql_statements or file.sql_object_refs for file in repo.files
+        ):
+            with _sql_index_for_files(repo) as sql_index:
+                repo_prefix = f"{repo.repo_name}@{repo.commit}"
+                for label, row in iter_all_sql_global_nodes(sql_index):
+                    node(label, row)
+                for kind, start, end, props, identity in iter_sql_global_relationships(
+                    repo_prefix, repo.repo_name, sql_index, all_global=True
+                ):
+                    rel(kind, start, end, props, identity)
+                for file in repo.files:
+                    for label, row in iter_sql_file_nodes(repo_prefix, file, sql_index):
+                        node(label, row)
+                    for kind, start, end, props, identity in iter_sql_file_relationships(
+                        repo_prefix, file, sql_index
+                    ):
+                        rel(kind, start, end, props, identity)
     for rows in nodes.values():
         rows.sort(key=lambda row: str(row["key"]))
     for rows in relationships.values():
@@ -637,10 +718,17 @@ def _build_graph(repositories: tuple[RepositoryIR, ...]) -> dict[str, Any]:
 
 
 def _write_csv(
-    path: Path, columns: tuple[tuple[str, str], ...], rows: list[dict[str, Any]], kind: str
+    path: Path,
+    columns: tuple[tuple[str, str], ...],
+    rows: list[dict[str, Any]],
+    kind: str,
+    *,
+    wide_defines: bool = False,
 ) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, lineterminator="\n")
+        if kind == "DEFINES" and not wide_defines:
+            columns = _PYTHON_DEFINES_COLUMNS
         headers = [header for _, header in columns]
         if kind in _NODE_COLUMNS:
             headers.append(":LABEL")
@@ -657,4 +745,25 @@ def _csv_value(value: Any) -> str:
         return ""
     if isinstance(value, (list, tuple)):
         return ";".join(str(item) for item in value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
     return str(value)
+
+
+@contextmanager
+def _sql_index_for_files(repo: RepositoryIR):
+    """Build a bounded SQL registry for a legacy in-memory repository graph."""
+    from codekg.bulk_spool import build_registry, create_spool
+    from codekg.sql_resolver import SqliteSqlResolverIndex
+
+    with tempfile.TemporaryDirectory(prefix="codekg-sql-") as directory:
+        root = Path(directory)
+        spool = root / "source.sqlite"
+        registry = root / "registry.sqlite"
+        create_spool(spool, repo.files)
+        build_registry(registry, [spool], repo_prefix=f"{repo.repo_name}@{repo.commit}")
+        index = SqliteSqlResolverIndex(registry)
+        try:
+            yield index
+        finally:
+            index.close()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import logging
 import os
 import re
@@ -9,7 +10,7 @@ import subprocess
 import time
 import tokenize
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from codekg.docs import resolve_markdown_descriptions
@@ -32,12 +33,14 @@ from codekg.search_index import (
     iter_callable_rows,
     validate_search_index_consistency,
 )
+from codekg.sql_config import load_sql_config
 from codekg.zvec_store import delete_repo, open_write, optimize_and_flush, upsert_symbol_docs
 
 logger = logging.getLogger(__name__)
 
 LANGUAGES_BY_SUFFIX = {
     ".py": "python",
+    ".sql": "sql",
 }
 SKIP_DIRS = {
     ".git",
@@ -781,7 +784,11 @@ def scan_repository(path: Path) -> RepositoryIR:
 
 
 def _iter_source_files(root: Path) -> Iterable[Path]:
-    yield from _iter_files(root, LANGUAGES_BY_SUFFIX)
+    config = load_sql_config(root)
+    suffixes = LANGUAGES_BY_SUFFIX if config.enabled else {".py"}
+    for path in _iter_files(root, suffixes):
+        if path.suffix.lower() == ".py" or config.matches(path.relative_to(root).as_posix()):
+            yield path
 
 
 def iter_markdown_files(root: Path) -> Iterable[Path]:
@@ -811,6 +818,21 @@ def _scan_file(root: Path, path: Path) -> FileIR:
     started = time.perf_counter()
     rel_path = path.relative_to(root).as_posix()
     language = LANGUAGES_BY_SUFFIX[path.suffix.lower()]
+    if language == "sql":
+        from codekg.sql_parser import parse_sql
+
+        file = parse_sql(path.read_bytes(), context=rel_path, config=load_sql_config(root))
+        debug_event(
+            logger,
+            "scan_file",
+            path=rel_path,
+            language=file.language,
+            loc=file.loc,
+            parse_status=file.parse_status,
+            diagnostics=len(file.diagnostics),
+            duration_ms=_duration_ms(started),
+        )
+        return file
     module_qname = _module_qname(rel_path, repository_name=root.name)
     if language != "python":
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -1288,7 +1310,20 @@ def _looks_like_commit(value: str) -> bool:
 
 def _content_hash(root: Path) -> str:
     digest = hashlib.sha256()
+    digest.update(_sql_config_identity(root))
     for path in sorted([*_iter_source_files(root), *iter_markdown_files(root)]):
         digest.update(path.relative_to(root).as_posix().encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()[:12]
+
+
+def _sql_config_identity(root: Path) -> bytes:
+    """Include validated SQL semantics without changing disabled legacy hashes."""
+    config = load_sql_config(root)
+    if not config.enabled:
+        return b""
+    return (
+        b"codekg-sql-config\0"
+        + json.dumps(asdict(config), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        + b"\0"
+    )
