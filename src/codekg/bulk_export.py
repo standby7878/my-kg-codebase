@@ -46,11 +46,21 @@ logger = logging.getLogger(__name__)
 def _extract_spool(root_value: str, paths: tuple[str, ...], spool_value: str) -> str:
     """Worker entry point: parse a bounded batch and publish one spool."""
     from codekg.bulk_spool import create_spool
-    from codekg.ingest import _scan_file
+    from codekg.ingest import try_scan_file
 
     root = Path(root_value)
     spool = Path(spool_value)
-    create_spool(spool, (_scan_file(root, Path(path)) for path in paths))
+
+    def scanned_files():
+        for path in paths:
+            resolved = Path(path)
+            if not resolved.is_absolute():
+                resolved = root / resolved
+            file = try_scan_file(root, resolved)
+            if file is not None:
+                yield file
+
+    create_spool(spool, scanned_files())
     return str(spool)
 
 
@@ -175,7 +185,13 @@ def _source_batches(root: Path) -> Iterable[tuple[Path, ...]]:
     batch: list[Path] = []
     bytes_used = 0
     for path in _iter_source_files(root):
-        size = path.stat().st_size
+        try:
+            size = path.stat().st_size
+        except OSError as error:
+            from codekg.ingest import _log_scan_skip
+
+            _log_scan_skip("scan_skip_file", path.relative_to(root).as_posix(), error)
+            continue
         if batch and (len(batch) >= 128 or bytes_used + size > 32 * 1024 * 1024):
             yield tuple(batch)
             batch, bytes_used = [], 0

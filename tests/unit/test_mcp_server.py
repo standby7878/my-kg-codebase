@@ -12,29 +12,42 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.mark.asyncio
-async def test_mcp_registers_exactly_ten_tools() -> None:
+async def test_mcp_registers_fourteen_tools() -> None:
     tools = await mcp.get_tools()
 
-    assert len(tools) == 10
+    assert len(tools) == 14
     assert sorted(tools) == [
         "find_callees",
         "find_callers",
         "find_dead_code",
         "find_importers",
+        "find_sql_usages",
         "get_class_hierarchy",
         "get_complexity",
         "get_definition",
+        "get_sql_in_file",
+        "get_sql_object",
         "list_repositories",
+        "search_sql_objects",
         "search_symbols",
         "trace_call_path",
     ]
     assert all(tool.description for tool in tools.values())
     assert "line bounds" in tools["get_definition"].description.lower()
-    assert "verify bounded incoming" in tools["find_callers"].description.lower()
-    assert "verify bounded outgoing" in tools["find_callees"].description.lower()
+    assert "static callers" in tools["find_callers"].description.lower()
+    assert "static callees" in tools["find_callees"].description.lower()
     assert "unreferenced candidates" in tools["find_dead_code"].description.lower()
-    wrapped_list_tools = set(tools) - {"search_symbols"}
+    assert "commit-pinned" in mcp.instructions.lower()
+    wrapped_list_tools = set(tools) - {
+        "search_symbols",
+        "search_sql_objects",
+        "get_sql_object",
+        "get_sql_in_file",
+    }
     assert tools["search_symbols"].output_schema is None
+    assert tools["search_sql_objects"].output_schema is None
+    assert tools["get_sql_object"].output_schema is None
+    assert tools["get_sql_in_file"].output_schema is None
     assert all(
         tools[name].output_schema == server._WRAPPED_LIST_OUTPUT_SCHEMA
         for name in wrapped_list_tools
@@ -140,12 +153,12 @@ async def test_search_symbols_returns_concise_text_and_canonical_structured_resu
         "recommended_next_tool": "get_definition",
     }
     text = result.content[0].text
-    assert (
-        text == "Found 1 symbol candidate(s) in repository=requests. "
-        "More results are available. See structured result."
+    assert text.startswith(
+        "Found 1 symbol candidate(s) in repository=requests. More results are available."
     )
+    assert "requests.sessions.Session.prepare_request" in text
+    assert "requests/sessions.py:450" in text
     assert len(text.encode()) < len(json.dumps(response, separators=(",", ":")).encode())
-    assert "Session.prepare_request" not in text
     assert result.structured_content["next_cursor"] == "opaque-next-page"
     assert "diagnostics" not in result.structured_content
     assert "scope" not in result.structured_content["results"][0]
@@ -239,12 +252,13 @@ async def test_list_repositories_uses_structured_rows_and_hides_storage_root(
         ]
     }
     text = result.content[0].text
-    assert text == "Found 1 indexed repository."
+    assert text.startswith("Found 1 indexed repository.")
+    assert "requests @ f361ead047be (37 files)" in text
     assert "/repos/requests" not in text
     assert text != json.dumps(result.structured_content)
     assert server._wrapped_list_result("list_repositories", [{}, {}, {}, {}, {}]).content[
         0
-    ].text == ("Found 5 indexed repositories.")
+    ].text.startswith("Found 5 indexed repositories.")
 
 
 @pytest.mark.asyncio
@@ -277,9 +291,12 @@ async def test_definition_normalizes_only_file_and_preserves_stable_row_fields(
     result = await (await mcp.get_tools())["get_definition"].run({"identifier": row["key"]})
     normalized = result.structured_content["result"][0]
 
-    assert normalized == {**row, "file": "src/requests/sessions.py"}
-    assert result.content[0].text == "Found 1 definition record."
-    assert json.dumps(normalized) not in result.content[0].text
+    assert normalized == {**row, "file": "src/requests/sessions.py", "symbol_id": row["key"]}
+    text = result.content[0].text
+    assert text.startswith("Found 1 definition record.")
+    assert "src.requests.sessions.Session.prepare_request" in text
+    assert "src/requests/sessions.py:511" in text
+    assert json.dumps(normalized) not in text
 
 
 @pytest.mark.asyncio
@@ -312,8 +329,9 @@ async def test_relationship_rows_use_symbol_identity_to_normalize_paths_and_fail
     )
 
     assert result.structured_content == {
-        "result": [{**caller, "file": "caller.py"}],
+        "result": [{**caller, "file": "caller.py", "symbol_id": caller["key"]}],
     }
+    assert "caller (caller.py:1)" in result.content[0].text
     monkeypatch.setattr(
         server,
         "query_list_repositories",
@@ -458,6 +476,50 @@ def test_path_normalization_rejects_traversal_in_relative_and_absolute_paths(
         )
     with pytest.raises(ValueError, match="traversal"):
         server._normalize_public_rows([{"repo": "requests", "file": path}])
+
+
+@pytest.mark.asyncio
+async def test_find_callers_empty_result_includes_callback_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "query_find_callers", lambda *_args, **_kwargs: [])
+
+    result = await (await mcp.get_tools())["find_callers"].run(
+        {
+            "identifier": "demo@abc:pkg.py:demo.PGService.callback:9",
+            "repository": "demo",
+        }
+    )
+
+    text = result.content[0].text
+    assert text.startswith("Found 0 callers for demo@abc:pkg.py:demo.PGService.callback:9.")
+    assert "callback" in text.lower()
+    assert "list_repositories" in text
+
+
+def test_wrapped_list_result_includes_bounded_previews() -> None:
+    rows = [
+        {
+            "key": "demo@abc:a.py:demo.fn_one:1",
+            "qname": "demo.fn_one",
+            "file": "a.py",
+            "start_line": 1,
+            "resolution": "heuristic",
+        },
+        {
+            "key": "demo@abc:b.py:demo.fn_two:2",
+            "qname": "demo.fn_two",
+            "file": "b.py",
+            "start_line": 2,
+        },
+    ]
+
+    result = server._wrapped_list_result("find_callers", rows, subject="demo.fn")
+
+    assert result.structured_content["result"][0]["symbol_id"] == rows[0]["key"]
+    text = result.content[0].text
+    assert "demo.fn_one (a.py:1) [heuristic]" in text
+    assert "demo.fn_two (b.py:2)" in text
 
 
 def test_path_normalization_rejects_ambiguous_snapshot_roots(

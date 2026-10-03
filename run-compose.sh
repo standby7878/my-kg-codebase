@@ -77,23 +77,39 @@ dc() {
     docker compose "${arguments[@]}" "$@"
 }
 
-repos_root_from_config() {
-    if [[ -v CODEKG_REPOS_ROOT ]]; then
-        printf '%s' "$CODEKG_REPOS_ROOT"
+env_file_value() {
+    local key="$1" default="${2:-}"
+    local var_name="$3"
+
+    if [[ -n "$var_name" && -v "$var_name" ]]; then
+        printf '%s' "${!var_name}"
         return
     fi
 
     while IFS= read -r line; do
         case "$line" in
-            CODEKG_REPOS_ROOT=*)
-                printf '%s' "${line#CODEKG_REPOS_ROOT=}"
+            "${key}"=*)
+                printf '%s' "${line#${key}=}"
                 return
                 ;;
         esac
     done < "$ENV_FILE"
 
-    echo "CODEKG_REPOS_ROOT is not set in the environment or ${ENV_FILE}" >&2
+    if [[ -n "$default" ]]; then
+        printf '%s' "$default"
+        return
+    fi
+
+    echo "${key} is not set in the environment or ${ENV_FILE}" >&2
     return 1
+}
+
+repos_root_from_config() {
+    env_file_value CODEKG_REPOS_ROOT "" CODEKG_REPOS_ROOT
+}
+
+bulk_workers_from_config() {
+    env_file_value CODEKG_BULK_WORKERS 1 CODEKG_BULK_WORKERS
 }
 
 resolve_repositories() {
@@ -178,9 +194,10 @@ restore_runtime_generation() {
 
 bulk_index_sources() {
     local generation graph_volume zvec_volume logs_volume staging_volume backup_runtime
-    local resolved basename
+    local resolved basename bulk_workers
     local -a mounts=() repository_paths=()
 
+    bulk_workers="$(bulk_workers_from_config)"
     generation="$(date -u +%Y%m%dT%H%M%SZ)-$$"
     graph_volume="codekg-dev-local_neo4j_data_${generation}"
     zvec_volume="codekg-dev-local_zvec_data_${generation}"
@@ -194,11 +211,11 @@ bulk_index_sources() {
         repository_paths+=("/repos/$basename")
     done
 
-    echo "CODEKG_PHASE_START export $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "CODEKG_PHASE_START export $(date -u +%Y-%m-%dT%H:%M:%SZ) workers=${bulk_workers}"
     CODEKG_BULK_STAGING_VOLUME="$staging_volume" \
         CODEKG_ZVEC_DATA_VOLUME="$zvec_volume" \
         dc run --rm --no-deps "${mounts[@]}" bulk-exporter \
-        codekg bulk-export /data/bulk "${repository_paths[@]}"
+        codekg bulk-export /data/bulk "${repository_paths[@]}" --workers "$bulk_workers"
     echo "CODEKG_PHASE_END export $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "CODEKG_PHASE_START zvec $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     CODEKG_BULK_STAGING_VOLUME="$staging_volume" \

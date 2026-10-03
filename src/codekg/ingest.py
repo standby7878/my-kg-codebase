@@ -745,7 +745,7 @@ def scan_repository(path: Path) -> RepositoryIR:
     debug_event(logger, "scan_started")
     repo_name = root.name
     commit = _git_commit(root) or _content_hash(root)
-    files = tuple(_scan_file(root, file_path) for file_path in _iter_source_files(root))
+    files = tuple(_collect_scanned_files(root))
     callable_qnames = {
         symbol.qname
         for file in files
@@ -795,6 +795,22 @@ def iter_markdown_files(root: Path) -> Iterable[Path]:
     yield from _iter_files(root, {".md"})
 
 
+def try_scan_file(root: Path, path: Path) -> FileIR | None:
+    """Parse one source file, returning None when the path is not readable."""
+    try:
+        return _scan_file(root, path)
+    except OSError as error:
+        _log_scan_skip("scan_skip_file", path.relative_to(root).as_posix(), error)
+        return None
+
+
+def _collect_scanned_files(root: Path) -> Iterable[FileIR]:
+    for file_path in _iter_source_files(root):
+        file = try_scan_file(root, file_path)
+        if file is not None:
+            yield file
+
+
 def _iter_files(root: Path, suffixes: Iterable[str]) -> Iterable[Path]:
     """Yield matching repository files in deterministic order without a full walk."""
     allowed_suffixes = frozenset(suffixes)
@@ -804,14 +820,30 @@ def _iter_files(root: Path, suffixes: Iterable[str]) -> Iterable[Path]:
         if not is_directory:
             yield path
             continue
-        with os.scandir(path) as entries:
+        try:
+            directory_entries = os.scandir(path)
+        except OSError as error:
+            _log_scan_skip("scan_skip_directory", path.relative_to(root).as_posix(), error)
+            continue
+        with directory_entries as entries:
             for entry in sorted(entries, key=lambda item: item.name, reverse=True):
                 entry_path = Path(entry.path)
-                if entry.is_dir(follow_symlinks=False):
-                    if entry.name not in SKIP_DIRS:
-                        stack.append((True, entry_path))
-                elif entry.is_file() and entry_path.suffix.lower() in allowed_suffixes:
-                    stack.append((False, entry_path))
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name not in SKIP_DIRS:
+                            stack.append((True, entry_path))
+                    elif entry.is_file() and entry_path.suffix.lower() in allowed_suffixes:
+                        stack.append((False, entry_path))
+                except OSError as error:
+                    _log_scan_skip(
+                        "scan_skip_entry",
+                        entry_path.relative_to(root).as_posix(),
+                        error,
+                    )
+
+
+def _log_scan_skip(event: str, path: str, error: OSError) -> None:
+    debug_event(logger, event, path=path, error=str(error))
 
 
 def _scan_file(root: Path, path: Path) -> FileIR:
@@ -1312,8 +1344,12 @@ def _content_hash(root: Path) -> str:
     digest = hashlib.sha256()
     digest.update(_sql_config_identity(root))
     for path in sorted([*_iter_source_files(root), *iter_markdown_files(root)]):
-        digest.update(path.relative_to(root).as_posix().encode())
-        digest.update(path.read_bytes())
+        rel_path = path.relative_to(root).as_posix()
+        try:
+            digest.update(rel_path.encode())
+            digest.update(path.read_bytes())
+        except OSError as error:
+            _log_scan_skip("content_hash_skip_file", rel_path, error)
     return digest.hexdigest()[:12]
 
 

@@ -530,3 +530,22 @@ def test_replace_index_removes_previous_zvec_keys_before_graph_load(
     checked_collection = open_write(zvec_path)
     assert fetch_symbol_docs(checked_collection, {old_key}) == {}
     assert fetch_symbol_docs(checked_collection, {new_key})[new_key]["key"] == new_key
+
+
+def test_scan_repository_skips_inaccessible_directories_and_files(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "visible.py").write_text("def visible():\n    return 1\n", encoding="utf-8")
+
+    blocked_dir = repo / "aiven" / "deploy" / "repo_gpg"
+    blocked_dir.parent.mkdir(parents=True)
+    blocked_dir.mkdir()
+    blocked_dir.chmod(0o000)
+
+    blocked_file = repo / "secret.py"
+    blocked_file.write_text("def secret():\n    return 2\n", encoding="utf-8")
+    blocked_file.chmod(0o000)
+
+    scanned = scan_repository(repo)
+
+    assert {file.path for file in scanned.files} == {"visible.py"}

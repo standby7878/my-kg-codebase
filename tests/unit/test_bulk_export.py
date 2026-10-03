@@ -329,3 +329,25 @@ def test_manifest_reload_exposes_same_export(tmp_path: Path) -> None:
     loaded = load_bulk_export(exported.manifest_path)
 
     assert loaded == exported
+
+
+def test_extract_spool_skips_unreadable_files(tmp_path: Path) -> None:
+    from codekg.bulk_export import _extract_spool
+    from codekg.bulk_spool import iter_spool_files
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "ok.py").write_text("def ok():\n    return 1\n", encoding="utf-8")
+    blocked = root / "aiven/db/attrs/funcattrs.py"
+    blocked.parent.mkdir(parents=True)
+    blocked.write_text("def blocked():\n    return 2\n", encoding="utf-8")
+    blocked.chmod(0o000)
+
+    spool = tmp_path / "extract.sqlite"
+    _extract_spool(
+        str(root),
+        (str(root / "ok.py"), str(blocked)),
+        str(spool),
+    )
+
+    assert [file.path for file in iter_spool_files(spool)] == ["ok.py"]

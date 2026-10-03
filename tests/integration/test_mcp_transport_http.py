@@ -36,7 +36,10 @@ WRAPPED_LIST_TOOLS = {
     "get_class_hierarchy",
     "find_dead_code",
     "get_complexity",
+    "find_sql_usages",
 }
+STRUCTURED_DISCOVERY_TOOLS = {"search_symbols", "search_sql_objects"}
+STRUCTURED_DETAIL_TOOLS = {"get_sql_object", "get_sql_in_file"}
 REPOSITORY = "requests"
 COMMIT = "f361ead047be"
 CALLER_ID = (
@@ -272,12 +275,17 @@ async def test_http_mcp_transport_supports_protocol_client_session(
 
         tools = await asyncio.wait_for(list_tools_when_ready(), timeout=65)
         assert tools
-        assert {tool.name for tool in tools} == WRAPPED_LIST_TOOLS | {"search_symbols"}
+        assert (
+            {tool.name for tool in tools}
+            == WRAPPED_LIST_TOOLS | STRUCTURED_DISCOVERY_TOOLS | STRUCTURED_DETAIL_TOOLS
+        )
         for tool in tools:
             if tool.name in WRAPPED_LIST_TOOLS:
                 assert tool.outputSchema == WRAPPED_LIST_OUTPUT_SCHEMA
-            else:
+            elif tool.name in STRUCTURED_DISCOVERY_TOOLS | STRUCTURED_DETAIL_TOOLS:
                 assert tool.outputSchema is None
+            else:
+                raise AssertionError(f"unexpected tool {tool.name}")
 
         search_tool = next(tool for tool in tools if tool.name == "search_symbols")
         assert search_tool.inputSchema["properties"]["scope"]["enum"] == [
@@ -305,7 +313,8 @@ async def test_http_mcp_transport_supports_protocol_client_session(
             assert repository_row["repo_name"] == REPOSITORY
             assert repository_row["commit"] == COMMIT
             assert repository_row["root_path"] == "."
-            assert repositories.content[0].text == "Found 1 indexed repository."
+            assert repositories.content[0].text.startswith("Found 1 indexed repository.")
+            assert REPOSITORY in repositories.content[0].text
 
             first_page = await client.call_tool_mcp(
                 "search_symbols",
@@ -356,10 +365,11 @@ async def test_http_mcp_transport_supports_protocol_client_session(
                 "s": "source",
                 "o": 2,
             }
-            assert first_page.content[0].text == (
+            assert first_page.content[0].text.startswith(
                 "Found 2 symbol candidate(s) in repository=requests. "
-                "More results are available. See structured result."
+                "More results are available."
             )
+            assert "src.requests.candidates.candidate_0" in first_page.content[0].text
 
             second_page = await client.call_tool_mcp(
                 "search_symbols",

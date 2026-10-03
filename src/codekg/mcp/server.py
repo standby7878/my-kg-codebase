@@ -39,10 +39,29 @@ from codekg.queries.code import (
     trace_call_path as query_trace_call_path,
 )
 from codekg.queries.repositories import list_repositories as query_list_repositories
+from codekg.queries.sql import find_sql_usages as query_find_sql_usages
+from codekg.queries.sql import get_sql_in_file as query_get_sql_in_file
+from codekg.queries.sql import get_sql_object as query_get_sql_object
+from codekg.queries.sql import search_sql_objects as query_search_sql_objects
 
 SymbolKind = Literal["function", "method", "type"]
 HierarchyDirection = Literal["ancestors", "descendants"]
 SearchMode = Literal["graph", "lexical", "hybrid"]
+SqlObjectKind = Literal[
+    "table",
+    "view",
+    "materialized_view",
+    "sequence",
+    "index",
+    "statistics",
+    "function",
+    "procedure",
+    "schema",
+    "extension",
+    "type",
+]
+SqlUsageRole = Literal["read", "write", "call", "alter", "drop", "define", "all"]
+SqlReferenceResolution = Literal["exact", "ambiguous", "unresolved", "dynamic", "all"]
 
 
 class SearchScope(StrEnum):
@@ -68,22 +87,42 @@ _WRAPPED_LIST_OUTPUT_SCHEMA = {
     "x-fastmcp-wrap-result": True,
 }
 
+_MCP_INSTRUCTIONS = """\
+Read-only queries over commit-pinned CodeKG snapshots. Results describe the indexed commit,
+not necessarily the working tree or HEAD — verify with list_repositories.
+
+Python workflow:
+1. list_repositories — pick repository and indexed commit.
+2. search_symbols — discover candidates when the exact symbol is unknown.
+3. get_definition / find_callers / find_callees / trace_call_path — pass symbol_id from step 2.
+
+Callable/type identifiers (in order of preference):
+- symbol_id: repo@commit:path/to/file.py:module.Class.method:812
+- full qualified_name (requires repository; fails on ambiguity)
+- unique dotted suffix, e.g. PGService._allocate_haproxy_frontend_ports (requires repository)
+- NOT supported: bare method names like _allocate_haproxy_frontend_ports
+
+Module identifiers (find_importers): exact module key or full module qualified name only.
+
+SQL workflow: search_sql_objects → get_sql_object → find_sql_usages.
+SQL scope: PostgreSQL .sql files selected by enabled [sql] configuration in codekg.toml.
+Embedded Python strings and live database catalog state are not indexed.
+
+Static call edges may be heuristic; resolution=heuristic is approximate. Zero callers/callees
+or no trace path does not exclude callbacks, dynamic dispatch, or runtime wiring.
+"""
+
 mcp = FastMCP(
     "codekg",
-    instructions=(
-        "Read-only tools for querying the offline CodeKG Neo4j graph. "
-        "Use list_repositories first when the repository name is unknown. "
-        "Use exact keys returned by earlier tools. Qualified-name selectors require repository, "
-        "and ambiguous qualified names return their candidate exact keys."
-    ),
+    instructions=_MCP_INSTRUCTIONS,
 )
 
 
 @mcp.tool(
     description=(
-        "List repositories currently indexed in the graph, including commit, root path, "
-        "and file count. Use this before repository-scoped queries when the repo name "
-        "is unknown."
+        "List indexed repository snapshots with repository name, commit, normalized root, "
+        "and file count. Use first to select the repository and verify the indexed commit "
+        "before any repository-scoped query."
     ),
     output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
@@ -94,12 +133,12 @@ def list_repositories() -> ToolResult:
 
 @mcp.tool(
     description=(
-        "Discover compact, repository-scoped code-symbol candidates. Call "
+        "Discover compact code-symbol candidates in one indexed snapshot. Call "
         "list_repositories first when the repository is unknown. With multiple indexed "
         "repositories, repository is required; searches never fall back to other "
         "repositories. mode='hybrid' combines exact graph-name matching with lexical "
-        "ranking. This is candidate discovery only: after a plausible candidate, call "
-        "get_definition with its returned symbol_id instead of issuing another broad search."
+        "ranking. Select a plausible result, then call get_definition with its returned "
+        "symbol_id; paginate with cursor only when needed."
     )
 )
 def search_symbols(
@@ -115,8 +154,13 @@ def search_symbols(
             )
         ),
     ] = None,
-    kind: Annotated[SymbolKind | None, Field(description="Optional symbol kind filter.")] = None,
-    commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
+    kind: Annotated[
+        SymbolKind | None,
+        Field(description="Optional filter: function, method, or type."),
+    ] = None,
+    commit: Annotated[
+        str | None, Field(description="Exact indexed commit from list_repositories.")
+    ] = None,
     mode: Annotated[
         SearchMode,
         Field(description="hybrid, graph, or lexical discovery ranking mode."),
@@ -135,7 +179,12 @@ def search_symbols(
     ] = 5,
     cursor: Annotated[
         str | None,
-        Field(description="Opaque cursor from a previous search with the same scope and query."),
+        Field(
+            description=(
+                "Opaque next_cursor; reuse only with the same repository, commit, query, "
+                "mode, kind, and scope."
+            )
+        ),
     ] = None,
 ) -> ToolResult:
     """Return canonical structured discovery data plus a deliberately small text summary."""
@@ -234,8 +283,16 @@ def _add_discovery_guidance(response: dict[str, object], scope: SearchScope) -> 
     response.setdefault("recommended_next_tool", "get_definition")
 
 
+_PREVIEW_LIMIT = 5
+
+_EMPTY_CALL_EDGE_HINT = (
+    "No static call edges found. The symbol may only be referenced dynamically "
+    "(e.g. passed as a callback). Verify the indexed commit with list_repositories."
+)
+
+
 def _search_summary(response: dict[str, Any]) -> str:
-    """Human-compatible text that cannot duplicate the structured result payload."""
+    """Human-compatible text with compact previews for agents that read only content."""
     status = str(response.get("status", "ok"))
     repository = response.get("repository")
     if status != "ok":
@@ -245,10 +302,13 @@ def _search_summary(response: dict[str, Any]) -> str:
     results = response.get("results", [])
     count = len(results) if isinstance(results, list) else 0
     more = " More results are available." if response.get("next_cursor") else ""
-    return (
-        f"Found {count} symbol candidate(s) in repository={repository!s}.{more} "
-        "See structured result."
-    )
+    header = f"Found {count} symbol candidate(s) in repository={repository!s}.{more}"
+    if not isinstance(results, list) or not results:
+        return header
+    previews = _preview_lines(results, tool_name="search_symbols")
+    if previews:
+        return f"{header}\n" + "\n".join(previews)
+    return header
 
 
 _SUMMARY_NOUNS = {
@@ -260,18 +320,33 @@ _SUMMARY_NOUNS = {
     "get_class_hierarchy": "related type",
     "find_dead_code": "unreferenced candidate",
     "get_complexity": "complexity record",
+    "find_sql_usages": "SQL usage",
 }
 
 
-def _wrapped_list_result(tool_name: str, rows: list[dict[str, object]]) -> ToolResult:
-    """Keep MCP list output structured while avoiding JSON duplication in text."""
-    count = len(rows)
+def _wrapped_list_result(
+    tool_name: str,
+    rows: list[dict[str, object]],
+    *,
+    subject: str | None = None,
+    empty_hint: str | None = None,
+) -> ToolResult:
+    """Keep MCP list output structured while including compact previews in text."""
+    public_rows = _with_symbol_ids(rows)
+    count = len(public_rows)
     if tool_name == "list_repositories":
-        text = f"Found {count} indexed {'repository' if count == 1 else 'repositories'}."
+        header = f"Found {count} indexed {'repository' if count == 1 else 'repositories'}."
     else:
         noun = _SUMMARY_NOUNS[tool_name]
-        text = f"Found {count} {noun}{'' if count == 1 else 's'}."
-    structured_content = {"result": rows}
+        subject_suffix = f" for {subject}" if subject else ""
+        header = f"Found {count} {noun}{'' if count == 1 else 's'}{subject_suffix}."
+    previews = _preview_lines(public_rows, tool_name=tool_name)
+    text = header
+    if previews:
+        text = f"{header}\n" + "\n".join(previews)
+    elif count == 0 and empty_hint:
+        text = f"{header} {empty_hint}"
+    structured_content = {"result": public_rows}
     logger.info(
         "codekg_%s %s",
         tool_name,
@@ -287,6 +362,87 @@ def _wrapped_list_result(tool_name: str, rows: list[dict[str, object]]) -> ToolR
         ),
     )
     return ToolResult(content=text, structured_content=structured_content)
+
+
+def _with_symbol_ids(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    enriched: list[dict[str, object]] = []
+    for row in rows:
+        public_row = dict(row)
+        key = public_row.get("key")
+        if isinstance(key, str) and key and "symbol_id" not in public_row:
+            public_row["symbol_id"] = key
+        enriched.append(public_row)
+    return enriched
+
+
+def _preview_lines(rows: list[dict[str, object]], *, tool_name: str) -> list[str]:
+    if not rows:
+        return []
+    preview_rows = rows[:_PREVIEW_LIMIT]
+    lines = [
+        _format_row_preview(index, row, tool_name=tool_name)
+        for index, row in enumerate(preview_rows, start=1)
+    ]
+    remaining = len(rows) - len(preview_rows)
+    if remaining > 0:
+        lines.append(f"  … and {remaining} more (see structured result).")
+    return lines
+
+
+def _format_row_preview(index: int, row: dict[str, object], *, tool_name: str) -> str:
+    if tool_name == "list_repositories":
+        repo_name = row.get("repo_name")
+        commit = row.get("commit")
+        files = row.get("files")
+        label = repo_name if isinstance(repo_name, str) else "?"
+        if isinstance(commit, str) and commit:
+            label = f"{label} @ {commit}"
+        if isinstance(files, int):
+            return f"  {index}. {label} ({files} files)"
+        return f"  {index}. {label}"
+    if tool_name == "trace_call_path":
+        path = row.get("path")
+        if isinstance(path, list):
+            segments: list[str] = []
+            for node in path:
+                if not isinstance(node, dict):
+                    continue
+                label = node.get("qname") or node.get("key")
+                if isinstance(label, str) and label:
+                    segments.append(label)
+            if segments:
+                depth = row.get("depth")
+                depth_suffix = f" (depth {depth})" if isinstance(depth, int) else ""
+                return f"  {index}. {' -> '.join(segments)}{depth_suffix}"
+    label = _format_symbol_label(row)
+    location = _format_row_location(row)
+    resolution = row.get("resolution")
+    resolution_suffix = ""
+    if isinstance(resolution, str) and resolution and resolution != "exact":
+        resolution_suffix = f" [{resolution}]"
+    if location:
+        return f"  {index}. {label} ({location}){resolution_suffix}"
+    return f"  {index}. {label}{resolution_suffix}"
+
+
+def _format_symbol_label(row: dict[str, object]) -> str:
+    for field in ("qname", "qualified_name", "name", "symbol_id", "key", "module"):
+        value = row.get(field)
+        if isinstance(value, str) and value:
+            return value
+    return "?"
+
+
+def _format_row_location(row: dict[str, object]) -> str | None:
+    file_path = row.get("file")
+    if not isinstance(file_path, str) or not file_path:
+        return None
+    line_number = row.get("start_line")
+    if not isinstance(line_number, int):
+        line_number = row.get("line")
+    if isinstance(line_number, int):
+        return f"{file_path}:{line_number}"
+    return file_path
 
 
 def _normalize_public_rows(
@@ -337,7 +493,7 @@ def _normalize_public_rows(
         except ValueError as exc:
             raise ValueError("Cannot safely normalize an indexed absolute file path.") from exc
         row["file"] = _validate_relative_public_path(relative_path)
-    return normalized
+    return _with_symbol_ids(normalized)
 
 
 def _resolve_indexed_root(
@@ -388,16 +544,25 @@ def _symbol_identity_hints(
 
 @mcp.tool(
     description=(
-        "Verify exact indexed definition metadata and line bounds for one selected symbol. "
-        "Pass the symbol_id returned by search_symbols; a qualified-name fallback requires "
-        "repository and fails on ambiguity."
+        "Return indexed metadata and line bounds for one function, method, or type. "
+        "Prefer symbol_id from search_symbols; otherwise use a full qualified name or "
+        "repository-scoped unique dotted suffix. Bare member names are unsupported."
     ),
     output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def get_definition(
-    identifier: Annotated[str, Field(description="Symbol key or qualified name.")],
+    identifier: Annotated[
+        str,
+        Field(
+            description=(
+                "symbol_id from a prior tool, full qualified name, or repository-scoped "
+                "unique dotted suffix."
+            )
+        ),
+    ],
     repository: Annotated[
-        str | None, Field(description="Required for qualified-name lookup.")
+        str | None,
+        Field(description="Required for qualified-name or suffix lookup."),
     ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
 ) -> ToolResult:
@@ -409,73 +574,115 @@ def get_definition(
 
 @mcp.tool(
     description=(
-        "Verify bounded incoming relationships for a selected function or method. Pass its "
-        "exact symbol_id when available. Depth 1 reads authoritative CallSite resolutions; "
-        "deeper traversal uses the dedicated EXACT_CALLS projection."
+        "Find bounded static callers of a selected function or method. Prefer symbol_id. "
+        "At depth 1, inspect indexed call-site resolutions and treat resolution='heuristic' "
+        "as approximate; deeper traversal uses exact-only projected edges. Zero results do "
+        "not exclude callback or dynamic references."
     ),
     output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def find_callers(
-    identifier: Annotated[str, Field(description="Function or method key, or qualified name.")],
+    identifier: Annotated[
+        str,
+        Field(
+            description=(
+                "symbol_id from a prior tool, full qualified name, or repository-scoped "
+                "unique dotted suffix."
+            )
+        ),
+    ],
     repository: Annotated[
-        str | None, Field(description="Required for qualified-name lookup.")
+        str | None,
+        Field(description="Required for qualified-name or suffix lookup."),
     ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS traversal depth.")] = 1,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
 ) -> ToolResult:
     repository_hint, commit_hint = _symbol_identity_hints(identifier, repository, commit)
+    rows = _normalize_public_rows(
+        query_find_callers(identifier, repo=repository, commit=commit, depth=depth, limit=limit),
+        repository_hint=repository_hint,
+        commit_hint=commit_hint,
+    )
     return _wrapped_list_result(
         "find_callers",
-        _normalize_public_rows(
-            query_find_callers(identifier, repo=repository, commit=commit, depth=depth, limit=limit),
-            repository_hint=repository_hint,
-            commit_hint=commit_hint,
-        ),
+        rows,
+        subject=identifier,
+        empty_hint=_EMPTY_CALL_EDGE_HINT if not rows else None,
     )
 
 
 @mcp.tool(
     description=(
-        "Verify bounded outgoing relationships for a selected function or method. Pass its "
-        "exact symbol_id when available. Depth 1 reads authoritative CallSite resolutions; "
-        "deeper traversal uses the dedicated EXACT_CALLS projection."
+        "Find bounded static callees of a selected function or method. Prefer symbol_id. "
+        "At depth 1, inspect indexed call-site resolutions and treat resolution='heuristic' "
+        "as approximate; deeper traversal uses exact-only projected edges. Zero results do "
+        "not exclude dynamic dispatch."
     ),
     output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def find_callees(
-    identifier: Annotated[str, Field(description="Function or method key, or qualified name.")],
+    identifier: Annotated[
+        str,
+        Field(
+            description=(
+                "symbol_id from a prior tool, full qualified name, or repository-scoped "
+                "unique dotted suffix."
+            )
+        ),
+    ],
     repository: Annotated[
-        str | None, Field(description="Required for qualified-name lookup.")
+        str | None,
+        Field(description="Required for qualified-name or suffix lookup."),
     ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS traversal depth.")] = 1,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
 ) -> ToolResult:
     repository_hint, commit_hint = _symbol_identity_hints(identifier, repository, commit)
+    rows = _normalize_public_rows(
+        query_find_callees(identifier, repo=repository, commit=commit, depth=depth, limit=limit),
+        repository_hint=repository_hint,
+        commit_hint=commit_hint,
+    )
     return _wrapped_list_result(
         "find_callees",
-        _normalize_public_rows(
-            query_find_callees(identifier, repo=repository, commit=commit, depth=depth, limit=limit),
-            repository_hint=repository_hint,
-            commit_hint=commit_hint,
-        ),
+        rows,
+        subject=identifier,
+        empty_hint=_EMPTY_CALL_EDGE_HINT if not rows else None,
     )
 
 
 @mcp.tool(
     description=(
-        "Find a bounded call path between two functions or methods. Prefer exact keys; "
-        "qualified-name endpoints require repository. The returned path contains exact key/qname "
-        "pairs and uses only EXACT_CALLS projections."
+        "Find a shortest bounded exact static-call path between two functions or methods "
+        "in the same repository snapshot. Prefer symbol_id; qualified names or unique "
+        "dotted suffixes require repository. No result means only that no indexed exact "
+        "path exists within max_depth; runtime callback or dynamic paths may still exist."
     ),
     output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def trace_call_path(
-    from_identifier: Annotated[str, Field(description="Source function or method key/qname.")],
-    to_identifier: Annotated[str, Field(description="Target function or method key/qname.")],
+    from_identifier: Annotated[
+        str,
+        Field(
+            description=(
+                "Source symbol_id, full qualified name, or repository-scoped unique suffix."
+            )
+        ),
+    ],
+    to_identifier: Annotated[
+        str,
+        Field(
+            description=(
+                "Target symbol_id, full qualified name, or repository-scoped unique suffix."
+            )
+        ),
+    ],
     repository: Annotated[
-        str | None, Field(description="Required for qualified-name endpoints.")
+        str | None,
+        Field(description="Required for qualified-name or suffix endpoints."),
     ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     max_depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS path depth.")] = 8,
@@ -498,15 +705,20 @@ def trace_call_path(
 
 @mcp.tool(
     description=(
-        "List files that import the selected module. Module keys are exact; module qualified "
-        "names require repo. Results are capped and grouped by repository and file path."
+        "List files with indexed Python import edges to a module. Use an exact module key "
+        "or full module qualified name; module suffixes and bare final segments are not "
+        "resolved. Results are capped and grouped by repository and file path."
     ),
     output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def find_importers(
-    module_identifier: Annotated[str, Field(description="Imported module key or qualified name.")],
+    module_identifier: Annotated[
+        str,
+        Field(description="Exact module key or full module qualified name (no suffix matching)."),
+    ],
     repository: Annotated[
-        str | None, Field(description="Required for qualified-name lookup.")
+        str | None,
+        Field(description="Required for module qualified-name lookup."),
     ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 100,
@@ -521,16 +733,25 @@ def find_importers(
 
 @mcp.tool(
     description=(
-        "Return ancestors or descendants of a selected type through inheritance and interface "
-        "relationships. Exact keys are preferred; qualified names require repository. Direction "
-        "must be explicit and results are bounded."
+        "Return bounded ancestors or descendants through indexed inheritance and implementation "
+        "edges. Prefer the type's symbol_id; full qualified names and unique dotted suffixes "
+        "require repository. Direction defaults to ancestors."
     ),
     output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def get_class_hierarchy(
-    identifier: Annotated[str, Field(description="Type key or qualified name.")],
+    identifier: Annotated[
+        str,
+        Field(
+            description=(
+                "symbol_id from a prior tool, full qualified name, or repository-scoped "
+                "unique dotted suffix."
+            )
+        ),
+    ],
     repository: Annotated[
-        str | None, Field(description="Required for qualified-name lookup.")
+        str | None,
+        Field(description="Required for qualified-name or suffix lookup."),
     ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     direction: Annotated[
@@ -557,9 +778,9 @@ def get_class_hierarchy(
 
 @mcp.tool(
     description=(
-        "List callable symbols in a repository with no inbound authoritative CallSite "
-        "resolution. Results include incoming_resolved_calls and are unreferenced candidates, "
-        "not confirmed dead code."
+        "List functions and methods with zero inbound indexed resolved call sites, including "
+        "exact and heuristic resolutions. Results are unreferenced candidates—not confirmed "
+        "dead code—and may include callbacks, framework hooks, decorators, or entry points."
     ),
     output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
@@ -580,24 +801,279 @@ def find_dead_code(
 
 @mcp.tool(
     description=(
-        "Return cyclomatic complexity for one symbol, or the most complex symbols in a "
-        "repository when a top-N request is provided. An identifier is exact-key-first; "
-        "qualified-name lookup requires repository."
+        "Discover SQL objects parsed from PostgreSQL .sql files selected by enabled [sql] "
+        "include/exclude configuration in codekg.toml. Call list_repositories first when "
+        "the repository is unknown. Embedded Python strings and live database state are not "
+        "indexed; dynamic names may remain unresolved. Call get_sql_object with the "
+        "returned object_key."
+    )
+)
+def search_sql_objects(
+    query: Annotated[
+        str, Field(description="Substring to match against schema-qualified SQL object names.")
+    ],
+    repository: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Indexed repository name. Required when more than one repository is indexed."
+            )
+        ),
+    ] = None,
+    database: Annotated[
+        str | None, Field(description="Optional logical database name filter.")
+    ] = None,
+    schema: Annotated[str | None, Field(description="Optional SQL schema filter.")] = None,
+    kind: Annotated[SqlObjectKind | None, Field(description="Optional SQL object kind filter.")] = (
+        None
+    ),
+    commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
+    limit: Annotated[
+        int, Field(ge=1, le=20, description="Maximum compact SQL object candidates to return.")
+    ] = 5,
+) -> ToolResult:
+    response = dict(
+        query_search_sql_objects(
+            query,
+            repository=repository,
+            database=database,
+            schema=schema,
+            kind=kind,
+            commit=commit,
+            limit=limit,
+        )
+    )
+    results = response.get("results")
+    if isinstance(results, list) and all(isinstance(row, dict) for row in results):
+        response["results"] = _normalize_public_rows(
+            results,
+            repository_hint=response.get("repository")
+            if isinstance(response.get("repository"), str)
+            else None,
+            commit_hint=response.get("commit") if isinstance(response.get("commit"), str) else None,
+        )
+    text = _sql_search_summary(response)
+    return ToolResult(content=text, structured_content=response)
+
+
+@mcp.tool(
+    description=(
+        "Return one indexed SQL object and its definition sites. Prefer object_key from "
+        "search_sql_objects; otherwise use schema.object_name with repository, and provide "
+        "database when needed to disambiguate."
+    )
+)
+def get_sql_object(
+    identifier: Annotated[str, Field(description="SQL object_key or schema.object_name.")],
+    repository: Annotated[
+        str | None, Field(description="Required for schema.object_name lookup.")
+    ] = None,
+    database: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Logical database filter; required when schema.object_name is ambiguous."
+            )
+        ),
+    ] = None,
+    commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
+) -> ToolResult:
+    response = dict(
+        query_get_sql_object(
+            identifier,
+            repository=repository,
+            database=database,
+            commit=commit,
+        )
+    )
+    definitions = response.get("definitions")
+    if isinstance(definitions, list) and all(isinstance(row, dict) for row in definitions):
+        response["definitions"] = _normalize_public_rows(
+            definitions,
+            repository_hint=response.get("repository")
+            if isinstance(response.get("repository"), str)
+            else None,
+            commit_hint=response.get("commit") if isinstance(response.get("commit"), str) else None,
+        )
+    object_row = response.get("object")
+    if isinstance(object_row, dict) and isinstance(object_row.get("owner_path"), str):
+        owner_path = object_row["owner_path"]
+        object_row["owner_path"] = _validate_relative_public_path(owner_path.replace("\\", "/"))
+    text = _sql_object_summary(response)
+    return ToolResult(content=text, structured_content=response)
+
+
+@mcp.tool(
+    description=(
+        "Find bounded static usages of one SQL object. Default resolution='exact' returns "
+        "statically resolved edges, not runtime proof. Ambiguous, unresolved, and dynamic "
+        "modes return candidate references associated with the object. Prefer object_key."
+    ),
+    output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
+)
+def find_sql_usages(
+    identifier: Annotated[str, Field(description="SQL object_key or schema.object_name.")],
+    repository: Annotated[
+        str | None, Field(description="Required for schema.object_name lookup.")
+    ] = None,
+    database: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Logical database filter; required when schema.object_name is ambiguous."
+            )
+        ),
+    ] = None,
+    commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
+    role: Annotated[
+        SqlUsageRole,
+        Field(
+            description=(
+                "Filter by read, write, call, alter, drop, or define; all disables role filtering."
+            )
+        ),
+    ] = "all",
+    resolution: Annotated[
+        SqlReferenceResolution,
+        Field(
+            description=(
+                "exact returns authoritative derived edges only; ambiguous/unresolved/dynamic "
+                "include candidate Reference nodes; all returns both."
+            )
+        ),
+    ] = "exact",
+    limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
+) -> ToolResult:
+    rows = query_find_sql_usages(
+        identifier,
+        repository=repository,
+        database=database,
+        commit=commit,
+        role=role,
+        resolution=resolution,
+        limit=limit,
+    )
+    repository_hint = rows[0].get("repo") if rows else repository
+    commit_hint = rows[0].get("commit") if rows else commit
+    return _wrapped_list_result(
+        "find_sql_usages",
+        _normalize_public_rows(
+            rows,
+            repository_hint=repository_hint if isinstance(repository_hint, str) else None,
+            commit_hint=commit_hint if isinstance(commit_hint, str) else None,
+        ),
+    )
+
+
+@mcp.tool(
+    description=(
+        "Return parsed SQL artifacts, statements, and references for one indexed "
+        "repository-relative .sql file in a selected snapshot. Set include_text=true only "
+        "when source text is needed. limit bounds each returned collection."
+    )
+)
+def get_sql_in_file(
+    file: Annotated[str, Field(description="Repository-relative path to an indexed .sql file.")],
+    repository: Annotated[str, Field(description="Indexed repository name.")],
+    commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
+    include_text: Annotated[
+        bool, Field(description="Include SqlArtifact.text in the response.")
+    ] = False,
+    limit: Annotated[
+        int,
+        Field(ge=1, le=500, description="Maximum rows per returned collection (artifacts, etc.)."),
+    ] = 100,
+) -> ToolResult:
+    response = dict(
+        query_get_sql_in_file(
+            file,
+            repository=repository,
+            commit=commit,
+            include_text=include_text,
+            limit=limit,
+        )
+    )
+    text = _sql_file_summary(response)
+    return ToolResult(content=text, structured_content=response)
+
+
+def _sql_search_summary(response: dict[str, object]) -> str:
+    status = str(response.get("status", "ok"))
+    repository = response.get("repository")
+    if status != "ok":
+        return (
+            f"SQL object discovery status={status}; repository={repository!s}. "
+            "See structured result."
+        )
+    results = response.get("results", [])
+    count = len(results) if isinstance(results, list) else 0
+    return (
+        f"Found {count} SQL object candidate(s) in repository={repository!s}. "
+        "See structured result."
+    )
+
+
+def _sql_object_summary(response: dict[str, object]) -> str:
+    status = str(response.get("status", "ok"))
+    if status != "ok":
+        return f"SQL object lookup status={status}. See structured result."
+    object_row = response.get("object")
+    name = None
+    if isinstance(object_row, dict):
+        schema_name = object_row.get("schema_name")
+        object_name = object_row.get("object_name")
+        if isinstance(schema_name, str) and isinstance(object_name, str):
+            name = f"{schema_name}.{object_name}"
+    definitions = response.get("definitions", [])
+    definition_count = len(definitions) if isinstance(definitions, list) else 0
+    return (
+        f"Resolved SQL object {name!s} with {definition_count} definition site(s). "
+        "See structured result."
+    )
+
+
+def _sql_file_summary(response: dict[str, object]) -> str:
+    status = str(response.get("status", "ok"))
+    file_path = response.get("file")
+    if status != "ok":
+        return f"SQL file lookup status={status}; file={file_path!s}. See structured result."
+    statements = response.get("statements", [])
+    references = response.get("references", [])
+    statement_count = len(statements) if isinstance(statements, list) else 0
+    reference_count = len(references) if isinstance(references, list) else 0
+    return (
+        f"Indexed SQL structure for file={file_path!s}: "
+        f"{statement_count} statement(s), {reference_count} reference(s). "
+        "See structured result."
+    )
+
+
+@mcp.tool(
+    description=(
+        "With identifier, return cyclomatic complexity for one callable; prefer symbol_id, "
+        "while qualified names or unique dotted suffixes require repository. Without "
+        "identifier, return the top top_n callables, optionally filtered by repository and "
+        "commit; omitting repository ranks across all indexed repositories."
     ),
     output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
 def get_complexity(
     identifier: Annotated[
         str | None,
-        Field(description="Optional symbol key or qualified name for a single symbol."),
+        Field(
+            description=(
+                "Optional symbol_id, full qualified name, or repository-scoped unique suffix."
+            )
+        ),
     ] = None,
     repository: Annotated[
-        str | None, Field(description="Optional repository name filter.")
+        str | None,
+        Field(description="Repository filter; required for qualified-name or suffix lookup."),
     ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     top_n: Annotated[
         int | None,
-        Field(ge=1, le=500, description="Return the top N most complex callables."),
+        Field(ge=1, le=500, description="Top-N ranking when identifier is omitted."),
     ] = 25,
 ) -> ToolResult:
     return _wrapped_list_result(

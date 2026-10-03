@@ -40,10 +40,11 @@ class FakeClient:
 class SelectorClient(FakeClient):
     """Small query double that makes selector resolution explicit."""
 
-    def __init__(self, exact_rows=None, qname_rows=None) -> None:
+    def __init__(self, exact_rows=None, qname_rows=None, suffix_rows=None) -> None:
         super().__init__()
         self.exact_rows = exact_rows or []
         self.qname_rows = qname_rows or []
+        self.suffix_rows = suffix_rows or []
 
     def execute_read(self, query, params=None, *, max_rows=1000):  # type: ignore[no-untyped-def]
         self.calls.append((query, params or {}, max_rows))
@@ -53,6 +54,8 @@ class SelectorClient(FakeClient):
             return self.exact_rows
         if "codekg: qname-symbol-selector" in query:
             return self.qname_rows
+        if "codekg: qname-suffix-symbol-selector" in query:
+            return self.suffix_rows
         return [{"ok": True}]
 
 
@@ -971,6 +974,31 @@ def test_qname_selector_reports_candidate_keys_for_ambiguity() -> None:
 
     assert "repo@abc:a.py:pkg.fn:1" in str(exc_info.value)
     assert "repo@abc:b.py:pkg.fn:4" in str(exc_info.value)
+
+
+def test_qname_suffix_selector_resolves_unique_class_method_suffix() -> None:
+    symbol = _symbol("repo@abc:service.py:aiven.logic.pg.PGService.allocate:9")
+    symbol["qname"] = "aiven.logic.services.pg.service.PGService.allocate"
+    client = SelectorClient(suffix_rows=[symbol])
+
+    row = get_definition("PGService.allocate", repo="repo", client=client)  # type: ignore[arg-type]
+
+    assert row[0]["key"] == "repo@abc:service.py:aiven.logic.pg.PGService.allocate:9"
+    assert any("qname-suffix-symbol-selector" in call[0] for call in client.calls)
+
+
+def test_qname_suffix_selector_reports_candidate_keys_for_ambiguity() -> None:
+    first = _symbol("repo@abc:a.py:a.pkg.Child.fn:1")
+    first["qname"] = "a.pkg.Child.fn"
+    second = _symbol("repo@abc:b.py:b.pkg.Child.fn:2")
+    second["qname"] = "b.pkg.Child.fn"
+    client = SelectorClient(suffix_rows=[first, second])
+
+    with pytest.raises(SymbolResolutionError, match="suffix .* is ambiguous") as exc_info:
+        get_definition("Child.fn", repo="repo", client=client)  # type: ignore[arg-type]
+
+    assert "repo@abc:a.py:a.pkg.Child.fn:1" in str(exc_info.value)
+    assert "repo@abc:b.py:b.pkg.Child.fn:2" in str(exc_info.value)
 
 
 def test_call_queries_use_authoritative_callsites_at_depth_one_and_projection_afterwards() -> None:

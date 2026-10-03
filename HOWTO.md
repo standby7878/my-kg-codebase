@@ -5,7 +5,7 @@ number of source repositories. Set `CODEKG_REPOS_ROOT` to a semicolon-separated
 list of individual code-repository paths.
 
 The current implementation supports schema bootstrap, source mounting, indexing,
-repository listing, and a read-only FastMCP server with ten KG query tools.
+repository listing, and a read-only FastMCP server with fourteen KG query tools.
 CodeGraphContext is vendored under `third_party/CodeGraphContext` for local
 study. The current extractor is Python-only and uses the standard library `ast`
 module.
@@ -188,139 +188,160 @@ PY
 The MCP server is read-only. Indexing, deleting, and watching repositories stay
 operator-only CLI actions, not MCP tools.
 
+## Symbol identifier formats
+
+MCP tools accept symbols in three forms (in order of preference):
+
+| Form | Example | Notes |
+|---|---|---|
+| `symbol_id` (exact key) | `aiven-core@abc123:aiven/logic/pkg.py:aiven.logic.pkg.fn:42` | Preferred; copy from `search_symbols` or any prior tool result |
+| Full `qualified_name` | `aiven.logic.services.pg.service.PGService._allocate_haproxy_frontend_ports` | Requires `repository`; fails when ambiguous |
+| Qualified-name suffix | `PGService._allocate_haproxy_frontend_ports` | Requires `repository`; unique suffix match only |
+| **Not supported** | `_allocate_haproxy_frontend_ports` | Use `search_symbols` first |
+
+SQL objects use `object_key` from `search_sql_objects`, or `schema.object_name` with
+`repository` when unique.
+
+### Worked example: Python call chain
+
+```text
+1. search_symbols(query="build_pg_component_infos", repository="aiven-core")
+2. get_definition(identifier=<symbol_id from step 1>)
+3. find_callers(identifier=<symbol_id>, repository="aiven-core")
+```
+
+### Worked example: SQL object
+
+```text
+1. search_sql_objects(query="services", repository="aiven-core", schema="public", kind="table")
+2. get_sql_object(identifier=<object_key from step 1>)
+3. find_sql_usages(identifier=<object_key>, repository="aiven-core")
+```
+
+When `find_callers` or `find_callees` returns zero rows, the symbol was resolved but
+no static call edge exists in the graph. It may only be referenced dynamically (for
+example, passed as a callback). Check `list_repositories` to confirm the indexed
+commit matches the checkout you expect.
+
+## Neo4j debug queries (operators)
+
+Agents should use the MCP tools. For human debugging, Neo4j Browser is available at
+`http://127.0.0.1:7474` (user `neo4j`, password `change-me-123`).
+
+Verify a symbol exists by qualified-name suffix:
+
+```cypher
+MATCH (r:Repository {repo_name: $repo})-[:CONTAINS]->(f:File)-[:CONTAINS]->(s)
+WHERE s.qname ENDS WITH $suffix
+RETURN s.key AS symbol_id, s.qname, f.path AS file, s.start_line
+ORDER BY size(s.qname), f.path, s.start_line
+LIMIT 10;
+```
+
+Find static callers via CallSite resolution:
+
+```cypher
+MATCH (callee {key: $symbol_id})<-[:RESOLVES_TO]-(site:CallSite)<-[:HAS_CALLSITE]-(caller)
+MATCH (caller_file:File)-[:CONTAINS]->(caller)
+WHERE caller:Function OR caller:Method
+RETURN caller.qname, caller_file.path AS file, site.line, site.strategy AS resolution
+ORDER BY caller.qname
+LIMIT 50;
+```
+
+List indexed repositories:
+
+```cypher
+MATCH (r:Repository)
+RETURN r.repo_name, r.commit, r.root_path
+ORDER BY r.repo_name;
+```
+
 ## MCP Tool Prompts
 
 In MCP, a tool's name, description, argument schema, and result schema are the
-main prompt surface the agent sees. Keep descriptions short, imperative, and
-bounded. The descriptions below are the intended prompts for the ten read-only
-tools.
-
-### `search_symbols`
-
-Prompt:
-
-```text
-Search indexed code symbols by name or qualified name substring. Use this first
-when you do not know the exact symbol key. Optionally filter by repository and
-symbol kind. Results are capped by the limit argument.
-```
-
-Use when the agent needs to locate functions, methods, classes, structs, or
-interfaces before asking for details.
-
-### `get_definition`
-
-Prompt:
-
-```text
-Return the definition metadata for one indexed symbol, including repository,
-file path, line span, qualified name, signature, and symbol kind. Use an exact
-symbol key or qualified name from search results.
-```
-
-Use when the agent already has a symbol candidate and needs source location or
-signature context.
-
-### `find_callers`
-
-Prompt:
-
-```text
-Find symbols that call the given function or method. Traversal depth is bounded
-and results are capped. Treat edges with resolution='heuristic' as approximate.
-```
-
-Use for impact analysis: "who depends on this?" The prompt must remind the agent
-that call edges can be approximate.
-
-### `find_callees`
-
-Prompt:
-
-```text
-Find symbols called by the given function or method. Traversal depth is bounded
-and results are capped. Treat edges with resolution='heuristic' as approximate.
-```
-
-Use for understanding a function's downstream behavior.
-
-### `trace_call_path`
-
-Prompt:
-
-```text
-Find a bounded call path between two functions or methods. Use exact qualified
-names or keys. Returns no path when the graph cannot prove a connection within
-max_depth.
-```
-
-Use for "how can A reach B?" questions. The result should be treated as graph
-evidence, not proof that no runtime path exists.
-
-### `find_importers`
-
-Prompt:
-
-```text
-List files that import the requested module qualified name. Results are capped
-and grouped by repository and file path.
-```
-
-Use for module-level dependency questions, especially in Python packages.
-
-### `get_class_hierarchy`
-
-Prompt:
-
-```text
-Return ancestors or descendants of a type through inheritance and interface
-relationships. Direction must be explicit. Results are bounded.
-```
-
-Use for class/type hierarchy exploration once inheritance extraction exists.
-
-### `find_dead_code`
-
-Prompt:
-
-```text
-List callable symbols in a repository with no inbound call edges. Excludes known
-entry points when entry-point metadata is available. Results are candidates, not
-confirmed dead code.
-```
-
-Use for cleanup candidates. The prompt must discourage deleting code solely from
-this result.
-
-### `get_complexity`
-
-Prompt:
-
-```text
-Return cyclomatic complexity for one symbol, or the most complex symbols in a
-repository when a top-N request is provided.
-```
-
-Use for maintainability triage and test-focus decisions.
+main prompt surface the agent sees. The descriptions below mirror the fourteen
+read-only tools registered in `src/codekg/mcp/server.py`.
 
 ### `list_repositories`
 
-Prompt:
+List indexed repository snapshots (name, commit, normalized root, file count).
+Use first to select the repository and verify the indexed commit.
 
-```text
-List repositories currently indexed in the graph, including commit, root path,
-and file count. Use this before repository-scoped queries when the repo name is
-unknown.
-```
+### `search_symbols`
 
-Use as the discovery tool at the start of a session.
+Discover compact code-symbol candidates in one indexed snapshot. Select a
+plausible result, then call `get_definition` with its returned `symbol_id`.
+Paginate with `cursor` only when needed.
+
+### `get_definition`
+
+Return indexed metadata and line bounds for one function, method, or type.
+Prefer `symbol_id` from `search_symbols`; full qualified names and unique
+dotted suffixes require `repository`. Bare member names are unsupported.
+
+### `find_callers`
+
+Find bounded static callers. Prefer `symbol_id`. Treat `resolution='heuristic'`
+as approximate. Zero results do not exclude callback or dynamic references.
+
+### `find_callees`
+
+Find bounded static callees. Prefer `symbol_id`. Treat `resolution='heuristic'`
+as approximate. Zero results do not exclude dynamic dispatch.
+
+### `trace_call_path`
+
+Find a shortest bounded exact static-call path in the same repository snapshot.
+No result within `max_depth` does not exclude runtime callback or dynamic paths.
+
+### `find_importers`
+
+List files with indexed Python import edges to a module. Use an exact module key
+or full module qualified name; suffix matching is not supported.
+
+### `get_class_hierarchy`
+
+Return bounded ancestors or descendants through indexed inheritance edges.
+Prefer the type's `symbol_id`. Direction defaults to `ancestors`.
+
+### `find_dead_code`
+
+List callables with zero inbound indexed resolved call sites (exact and
+heuristic). Results are unreferenced candidates—not confirmed dead code.
+
+### `get_complexity`
+
+With `identifier`, return complexity for one callable. Without `identifier`,
+return the top `top_n` callables (optionally filtered by `repository`).
+
+### `search_sql_objects`
+
+Discover SQL objects from PostgreSQL `.sql` files selected by enabled `[sql]`
+configuration in `codekg.toml`. Embedded Python strings are not indexed.
+
+### `get_sql_object`
+
+Return one SQL object and its definition sites. Prefer `object_key` from
+`search_sql_objects`.
+
+### `find_sql_usages`
+
+Find bounded static SQL usages. Default `resolution='exact'` is not runtime
+proof; ambiguous/unresolved/dynamic modes return candidate references.
+
+### `get_sql_in_file`
+
+Return parsed SQL artifacts, statements, and references for one indexed `.sql`
+file. `limit` bounds each returned collection.
 
 ## MCP Prompting Rules
 
 - Keep all MCP tools read-only.
-- Include `repo`, `limit`, `depth`, or `max_depth` arguments wherever a query
-  can grow.
-- Prefer exact keys returned by previous tools over free-form names.
+- Include `repository`, `limit`, `depth`, or `max_depth` arguments wherever a
+  query can grow.
+- Prefer `symbol_id` / `object_key` from prior tool results over free-form names.
+- Results describe the indexed commit snapshot, not necessarily HEAD.
 - Surface confidence fields such as `resolution` in results.
 - Tell the agent when a result is approximate or a candidate.
 - Do not expose filesystem paths outside mounted repository paths.

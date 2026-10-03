@@ -61,6 +61,7 @@ services:
       NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-change-me-123}
       NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
+      CODEKG_LOG_LEVEL: ${CODEKG_LOG_LEVEL:-WARNING}
     networks:
       - backend
     read_only: true
@@ -86,6 +87,7 @@ services:
       NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-change-me-123}
       NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
+      CODEKG_LOG_LEVEL: ${CODEKG_LOG_LEVEL:-WARNING}
     networks:
       - backend
     read_only: true
@@ -109,6 +111,7 @@ services:
       NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-change-me-123}
       NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
+      CODEKG_LOG_LEVEL: ${CODEKG_LOG_LEVEL:-WARNING}
     networks:
       - backend
     read_only: true
@@ -132,6 +135,7 @@ services:
       NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:-change-me-123}
       NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
+      CODEKG_LOG_LEVEL: ${CODEKG_LOG_LEVEL:-WARNING}
       MCP_TRANSPORT: ${MCP_TRANSPORT:-http}
       MCP_HOST: ${MCP_HOST:-0.0.0.0}
       MCP_PORT: ${MCP_PORT:-8765}

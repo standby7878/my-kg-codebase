@@ -1183,18 +1183,58 @@ def _resolve_symbol(
         {"identifier": identifier, "repo": repo, "commit": commit},
         max_rows=501,
     )
-    if not candidates:
-        raise SymbolResolutionError(
-            f"No indexed {', '.join(label.lower() for label in labels)} has qname "
-            f"{identifier!r} in repository {repo!r}."
-        )
+    if len(candidates) == 1:
+        return candidates[0]
     if len(candidates) > 1:
         keys = ", ".join(str(candidate.get("key")) for candidate in candidates)
         raise SymbolResolutionError(
             f"Qualified name {identifier!r} is ambiguous in repository {repo!r}; "
             f"use one of these exact keys: {keys}."
         )
-    return candidates[0]
+    if "." not in identifier:
+        raise SymbolResolutionError(
+            f"No indexed {', '.join(label.lower() for label in labels)} has qname "
+            f"{identifier!r} in repository {repo!r}. "
+            "Try search_symbols or provide a longer qualified-name suffix."
+        )
+    suffix_candidates = db.execute_read(
+        f"""
+        // codekg: qname-suffix-symbol-selector
+        MATCH (r:Repository)-[:CONTAINS]->(f:File)-[:CONTAINS]->(s)
+        WHERE {label_where}
+          AND s.qname ENDS WITH $identifier
+          AND r.repo_name = $repo
+          AND ($commit IS NULL OR r.commit = $commit)
+        RETURN s.key AS key,
+               labels(s) AS labels,
+               s.name AS name,
+               s.qname AS qname,
+               s.signature AS signature,
+               s.start_line AS start_line,
+               s.end_line AS end_line,
+               s.cyclomatic AS cyclomatic,
+               f.path AS file,
+               r.repo_name AS repo,
+               r.commit AS commit
+        ORDER BY size(s.qname), f.path, s.start_line, s.key
+        LIMIT 501
+        """,
+        {"identifier": identifier, "repo": repo, "commit": commit},
+        max_rows=501,
+    )
+    if not suffix_candidates:
+        raise SymbolResolutionError(
+            f"No indexed {', '.join(label.lower() for label in labels)} matches qname "
+            f"or suffix {identifier!r} in repository {repo!r}. "
+            "Try search_symbols or use symbol_id from a prior result."
+        )
+    if len(suffix_candidates) > 1:
+        keys = ", ".join(str(candidate.get("key")) for candidate in suffix_candidates)
+        raise SymbolResolutionError(
+            f"Qualified name suffix {identifier!r} is ambiguous in repository {repo!r}; "
+            f"use one of these exact keys: {keys}."
+        )
+    return suffix_candidates[0]
 
 
 def _labels_where(labels: tuple[str, ...]) -> str:

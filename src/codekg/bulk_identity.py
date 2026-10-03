@@ -9,7 +9,12 @@ from collections.abc import Iterator
 from itertools import chain
 from pathlib import Path
 
-from codekg.ingest import _iter_source_files, _sql_config_identity, iter_markdown_files
+from codekg.ingest import (
+    _iter_source_files,
+    _log_scan_skip,
+    _sql_config_identity,
+    iter_markdown_files,
+)
 
 _READ_CHUNK_SIZE = 1024 * 1024
 
@@ -40,10 +45,14 @@ def content_hash(root: Path) -> str:
             for (relative_path,) in connection.execute(
                 "SELECT path FROM paths ORDER BY path COLLATE PATH_ORDER"
             ):
-                digest.update(relative_path.encode())
-                with (root / relative_path).open("rb") as file:
-                    for chunk in iter(lambda: file.read(_READ_CHUNK_SIZE), b""):
-                        digest.update(chunk)
+                file_path = root / relative_path
+                try:
+                    digest.update(relative_path.encode())
+                    with file_path.open("rb") as file:
+                        for chunk in iter(lambda: file.read(_READ_CHUNK_SIZE), b""):
+                            digest.update(chunk)
+                except OSError as error:
+                    _log_scan_skip("content_hash_skip_file", relative_path, error)
             return digest.hexdigest()[:12]
         finally:
             connection.close()

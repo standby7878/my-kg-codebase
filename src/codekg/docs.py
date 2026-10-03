@@ -69,7 +69,10 @@ def extract_mentions(text: str) -> tuple[str, ...]:
 
 
 def _chunk_markdown_file(path: Path) -> Iterator[DocChunk]:
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
     headings: list[tuple[int, int, str]] = []
     for index, _line in enumerate(lines):
         heading = _markdown_heading(lines, index)
