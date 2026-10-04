@@ -1,0 +1,48 @@
+# Local, explicit upgrade investigation contexts. Input checkouts are read-only.
+# Add application aliases with the matching extension dependency aliases below.
+
+[[snapshots]]
+alias = "pg18"
+logical_repo = "postgres"
+version = "18"
+role = "postgres"
+path = ".codekg-worktrees/postgres18"
+
+[[snapshots]]
+alias = "pg19"
+logical_repo = "postgres"
+version = "19beta4"
+role = "postgres"
+path = ".codekg-worktrees/postgres19beta4"
+
+[[snapshots]]
+alias = "cron18"
+logical_repo = "pg_cron"
+version = "working-source"
+role = "extension"
+path = "../pg_cron"
+dependencies = ["pg18"]
+
+[[snapshots]]
+alias = "cron19"
+logical_repo = "pg_cron"
+version = "working-source"
+role = "extension"
+path = "../pg_cron"
+dependencies = ["pg19"]
+
+[[snapshots]]
+alias = "postgis18"
+logical_repo = "postgis"
+version = "working-source"
+role = "extension"
+path = "../postgis"
+dependencies = ["pg18"]
+
+[[snapshots]]
+alias = "postgis19"
+logical_repo = "postgis"
+version = "working-source"
+role = "extension"
+path = "../postgis"
+dependencies = ["pg19"]

@@ -23,6 +23,7 @@ from codekg.bulk_export import (
     BulkExport,
 )
 from codekg.bulk_spool import iter_spool_files
+from codekg.csv_limits import serialized_csv_field_size_bytes, validate_csv_field_size
 from codekg.ir import FileIR, RepositoryIR
 from codekg.loader import _callsite_key, _candidate_qnames, _import_aliases, _key, _symbol_key
 from codekg.resolver import ResolverIndex, SqliteResolverIndex, SymbolRef, _Resolver
@@ -188,6 +189,7 @@ class ShardWriter:
         self._handles: dict[tuple[bool, str], Any] = {}
         self._writers: dict[tuple[bool, str], csv.writer] = {}
         self.paths: dict[tuple[bool, str], Path] = {}
+        self.max_csv_field_size_bytes = 0
 
     def row(self, kind: str, values: Mapping[str, Any], *, node: bool) -> Path:
         key = (node, kind)
@@ -207,6 +209,11 @@ class ShardWriter:
         values_out = [_csv_value(values.get(name)) for name, _ in columns]
         if node:
             values_out.append(kind)
+        self.max_csv_field_size_bytes = max(
+            self.max_csv_field_size_bytes,
+            *(serialized_csv_field_size_bytes(value) for value in values_out),
+        )
+        validate_csv_field_size(self.max_csv_field_size_bytes)
         self._writers[key].writerow(values_out)
         return path
 
@@ -271,6 +278,9 @@ class _ModuleInitIndex(ResolverIndex):
     def base_state(self, type_qname: str):
         return self.backend.base_state(type_qname)
 
+    def module_owner(self, language: str, module_qname: str) -> str | None:
+        return self.backend.module_owner(language, module_qname)
+
 
 def project_partition(
     repo: RepositoryIR,
@@ -332,7 +342,12 @@ def project_partition(
             backend.close()  # type: ignore[union-attr]
         if owns_validator:
             validator.close()
-    return {"partition": partition, "files": dict(writer.paths), "counts": counts}
+    return {
+        "partition": partition,
+        "files": dict(writer.paths),
+        "counts": counts,
+        "max_csv_field_size_bytes": writer.max_csv_field_size_bytes,
+    }
 
 
 def project_repository(
@@ -396,11 +411,13 @@ def project_repository(
         ]
         ProjectionValidator.merge(output_dir / ".projection-validation.sqlite", validation_paths)
         counts: dict[str, int] = {}
+        max_csv_field_size = 0
         paths: dict[tuple[bool, str, int], Path] = {}
         for partition in range(partition_count):
             result = results[partition]
             for key, value in result["counts"].items():
                 counts[key] = counts.get(key, 0) + value
+            max_csv_field_size = max(max_csv_field_size, result["max_csv_field_size_bytes"])
             paths.update(
                 {(node, kind, partition): path for (node, kind), path in result["files"].items()}
             )
@@ -409,7 +426,15 @@ def project_repository(
     finally:
         with suppress(sqlite3.ProgrammingError):
             catalog.close()
-    return _publish_projection(repo, output_dir, counts, paths, workers, partitions=partition_count)
+    return _publish_projection(
+        repo,
+        output_dir,
+        counts,
+        paths,
+        workers,
+        partitions=partition_count,
+        max_csv_field_size_bytes=max_csv_field_size,
+    )
 
 
 def _project_catalog_partition(
@@ -523,13 +548,14 @@ def _project_file(
         "qname": file.module_qname,
         "language": file.language,
     }
-    node("Module", module_row)
+    if resolver.index.module_owner(file.language, file.module_qname) == file.path:
+        node("Module", module_row)
     relationship(
         "DEFINES",
         str(file_row["key"]),
         str(module_row["key"]),
         {},
-        f"{module_row['key']}:defines",
+        f"{file_row['key']}:{module_row['key']}:defines",
     )
 
     for ordinal, diagnostic in enumerate(file.diagnostics, start=1):
@@ -795,6 +821,7 @@ def _publish_projection(
     workers: int,
     *,
     partitions: int,
+    max_csv_field_size_bytes: int = 0,
 ) -> BulkExport:
     headers_dir = output_dir / "headers"
     headers_dir.mkdir(parents=True, exist_ok=True)
@@ -843,12 +870,20 @@ def _publish_projection(
         "nodes": dict(sorted(nodes.items())),
         "relationships": dict(sorted(relationships.items())),
         "counts": dict(counts),
+        "max_csv_field_size_bytes": validate_csv_field_size(max_csv_field_size_bytes),
     }
     manifest_path = output_dir / "manifest.json"
     temporary = manifest_path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     temporary.replace(manifest_path)
-    return BulkExport(manifest_path, output_dir, node_files, relationship_files, dict(counts))
+    return BulkExport(
+        manifest_path,
+        output_dir,
+        node_files,
+        relationship_files,
+        dict(counts),
+        max_csv_field_size_bytes=max_csv_field_size_bytes,
+    )
 
 
 def _csv_value(value: Any) -> str:

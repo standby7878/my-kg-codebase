@@ -5,6 +5,26 @@ from __future__ import annotations
 from codekg.neo4j_client import Neo4jClient, get_client
 
 BOOTSTRAP_CYPHER = [
+    "CREATE CONSTRAINT corpus_snapshot_key IF NOT EXISTS "
+    "FOR (n:CorpusSnapshot) REQUIRE n.key IS UNIQUE",
+    "CREATE CONSTRAINT native_symbol_key IF NOT EXISTS "
+    "FOR (n:NativeSymbol) REQUIRE n.key IS UNIQUE",
+    "CREATE CONSTRAINT routine_key IF NOT EXISTS FOR (n:Routine) REQUIRE n.key IS UNIQUE",
+    "CREATE CONSTRAINT source_evidence_key IF NOT EXISTS "
+    "FOR (n:SourceEvidence) REQUIRE n.key IS UNIQUE",
+    "CREATE CONSTRAINT corpus_diagnostic_key IF NOT EXISTS "
+    "FOR (n:CorpusDiagnostic) REQUIRE n.key IS UNIQUE",
+    "CREATE INDEX corpus_snapshot_alias IF NOT EXISTS FOR (n:CorpusSnapshot) ON (n.alias)",
+    "CREATE INDEX native_snapshot_alias IF NOT EXISTS FOR (n:NativeSymbol) ON (n.snapshot_alias)",
+    "CREATE INDEX routine_snapshot_alias IF NOT EXISTS FOR (n:Routine) ON (n.snapshot_alias)",
+    "CREATE INDEX corpus_diagnostic_coverage IF NOT EXISTS "
+    "FOR (n:CorpusDiagnostic) ON (n.snapshot_alias, n.category)",
+    "CREATE INDEX native_lookup IF NOT EXISTS FOR (n:NativeSymbol) ON (n.snapshot_alias, n.name)",
+    "CREATE INDEX routine_lookup IF NOT EXISTS FOR (n:Routine) ON (n.snapshot_alias, n.name)",
+    "CREATE INDEX native_identity IF NOT EXISTS "
+    "FOR (n:NativeSymbol) ON (n.snapshot_alias, n.logical_id)",
+    "CREATE INDEX routine_identity IF NOT EXISTS "
+    "FOR (n:Routine) ON (n.snapshot_alias, n.logical_id)",
     "CREATE CONSTRAINT repository_key IF NOT EXISTS FOR (n:Repository) REQUIRE n.key IS UNIQUE",
     "CREATE CONSTRAINT file_key IF NOT EXISTS FOR (n:File) REQUIRE n.key IS UNIQUE",
     "CREATE CONSTRAINT function_key IF NOT EXISTS FOR (n:Function) REQUIRE n.key IS UNIQUE",

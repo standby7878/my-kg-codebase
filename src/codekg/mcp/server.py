@@ -38,6 +38,21 @@ from codekg.queries.code import (
 from codekg.queries.code import (
     trace_call_path as query_trace_call_path,
 )
+from codekg.queries.corpus import (
+    compare_corpus_snapshots as query_compare_corpus_snapshots,
+)
+from codekg.queries.corpus import (
+    get_dependency_evidence as query_get_dependency_evidence,
+)
+from codekg.queries.corpus import (
+    list_corpus_snapshots as query_list_corpus_snapshots,
+)
+from codekg.queries.corpus import (
+    search_corpus_symbols as query_search_corpus_symbols,
+)
+from codekg.queries.corpus import (
+    trace_corpus_path as query_trace_corpus_path,
+)
 from codekg.queries.repositories import list_repositories as query_list_repositories
 from codekg.queries.sql import find_sql_usages as query_find_sql_usages
 from codekg.queries.sql import get_sql_in_file as query_get_sql_in_file
@@ -106,7 +121,17 @@ Module identifiers (find_importers): exact module key or full module qualified n
 
 SQL workflow: search_sql_objects → get_sql_object → find_sql_usages.
 SQL scope: PostgreSQL .sql files selected by enabled [sql] configuration in codekg.toml.
-Embedded Python strings and live database catalog state are not indexed.
+The corpus workflow additionally indexes selected .sql.in templates, pg_proc.dat,
+C/header syntax, literal Python DB SQL and Markdown/runbook evidence.
+Live database catalog state is not indexed.
+
+PostgreSQL corpus workflow: list_corpus_snapshots -> search_corpus_symbols ->
+get_dependency_evidence / trace_corpus_path / compare_corpus_snapshots.
+Snapshots are explicit aliases with dependency contexts and source fingerprints.
+Build-free C links are source evidence, not compiler-verified ABI/runtime facts.
+Candidate/conditional links are excluded from asserted paths. Documentation links
+are DOCUMENTS_ROUTINE, not execution. Diffs aid upgrade/security investigations;
+they are not vulnerability verdicts. Other PL bodies have explicit limited coverage.
 
 Static call edges may be heuristic; resolution=heuristic is approximate. Zero callers/callees
 or no trace path does not exclude callbacks, dynamic dispatch, or runtime wiring.
@@ -284,6 +309,8 @@ def _add_discovery_guidance(response: dict[str, object], scope: SearchScope) -> 
 
 
 _PREVIEW_LIMIT = 5
+_SUMMARY_TEXT_BUDGET_BYTES = 1200
+_SUMMARY_HEADER_BUDGET_BYTES = 300
 
 _EMPTY_CALL_EDGE_HINT = (
     "No static call edges found. The symbol may only be referenced dynamically "
@@ -305,10 +332,7 @@ def _search_summary(response: dict[str, Any]) -> str:
     header = f"Found {count} symbol candidate(s) in repository={repository!s}.{more}"
     if not isinstance(results, list) or not results:
         return header
-    previews = _preview_lines(results, tool_name="search_symbols")
-    if previews:
-        return f"{header}\n" + "\n".join(previews)
-    return header
+    return _bounded_summary(header, results, tool_name="search_symbols")
 
 
 _SUMMARY_NOUNS = {
@@ -321,6 +345,11 @@ _SUMMARY_NOUNS = {
     "find_dead_code": "unreferenced candidate",
     "get_complexity": "complexity record",
     "find_sql_usages": "SQL usage",
+    "list_corpus_snapshots": "corpus snapshot",
+    "search_corpus_symbols": "corpus symbol",
+    "get_dependency_evidence": "dependency evidence record",
+    "trace_corpus_path": "corpus path",
+    "compare_corpus_snapshots": "source change",
 }
 
 
@@ -334,18 +363,24 @@ def _wrapped_list_result(
     """Keep MCP list output structured while including compact previews in text."""
     public_rows = _with_symbol_ids(rows)
     count = len(public_rows)
-    if tool_name == "list_repositories":
+    if public_rows and tool_name == "list_repositories":
+        header = f"{count} {'repository' if count == 1 else 'repositories'}"
+    elif public_rows and tool_name in {"get_definition", "find_callers", "find_callees"}:
+        noun = _SUMMARY_NOUNS[tool_name].split(maxsplit=1)[0]
+        subject_suffix = f" ({_safe_identity_label(subject)})" if count > 1 and subject else ""
+        header = f"{count} {noun}{'' if count == 1 else 's'}{subject_suffix}"
+    elif tool_name == "list_repositories":
         header = f"Found {count} indexed {'repository' if count == 1 else 'repositories'}."
     else:
         noun = _SUMMARY_NOUNS[tool_name]
-        subject_suffix = f" for {subject}" if subject else ""
+        subject_suffix = f" for {_safe_identity_label(subject)}" if subject else ""
         header = f"Found {count} {noun}{'' if count == 1 else 's'}{subject_suffix}."
-    previews = _preview_lines(public_rows, tool_name=tool_name)
-    text = header
-    if previews:
-        text = f"{header}\n" + "\n".join(previews)
-    elif count == 0 and empty_hint:
-        text = f"{header} {empty_hint}"
+    text = _bounded_summary(
+        header,
+        public_rows,
+        tool_name=tool_name,
+        empty_hint=empty_hint if count == 0 else None,
+    )
     structured_content = {"result": public_rows}
     logger.info(
         "codekg_%s %s",
@@ -375,31 +410,99 @@ def _with_symbol_ids(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     return enriched
 
 
-def _preview_lines(rows: list[dict[str, object]], *, tool_name: str) -> list[str]:
+def _bounded_summary(
+    header: str,
+    rows: list[dict[str, object]],
+    *,
+    tool_name: str,
+    empty_hint: str | None = None,
+) -> str:
+    header = _truncate_utf8(header, _SUMMARY_HEADER_BUDGET_BYTES)
+    remaining = _SUMMARY_TEXT_BUDGET_BYTES - len(header.encode("utf-8"))
+    if not rows and empty_hint:
+        hint = _truncate_utf8(" " + empty_hint, max(0, remaining))
+        return header + hint
+    previews = _preview_lines(rows, tool_name=tool_name, byte_budget=remaining - 1)
+    return header if not previews else header + "\n" + "\n".join(previews)
+
+
+def _truncate_utf8(value: str, byte_budget: int) -> str:
+    if byte_budget <= 0:
+        return ""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= byte_budget:
+        return value
+    suffix = "…"
+    suffix_bytes = suffix.encode("utf-8")
+    if byte_budget < len(suffix_bytes):
+        return encoded[:byte_budget].decode("utf-8", errors="ignore")
+    prefix = encoded[: byte_budget - len(suffix_bytes)].decode("utf-8", errors="ignore")
+    return prefix + suffix
+
+
+def _preview_lines(rows: list[dict[str, object]], *, tool_name: str, byte_budget: int) -> list[str]:
     if not rows:
         return []
     preview_rows = rows[:_PREVIEW_LIMIT]
-    lines = [
-        _format_row_preview(index, row, tool_name=tool_name)
-        for index, row in enumerate(preview_rows, start=1)
-    ]
     remaining = len(rows) - len(preview_rows)
-    if remaining > 0:
-        lines.append(f"  … and {remaining} more (see structured result).")
+    lines: list[str] = []
+    used = 0
+    for index, row in enumerate(preview_rows, start=1):
+        line = _format_row_preview(index, row, tool_name=tool_name, numbered=len(rows) > 1)
+        separator_bytes = 1 if lines else 0
+        available = byte_budget - used - separator_bytes
+        if available <= 0:
+            break
+        line = _truncate_utf8(line, available)
+        lines.append(line)
+        used += separator_bytes + len(line.encode("utf-8"))
+    if remaining > 0 and len(lines) == len(preview_rows):
+        note = f"  … and {remaining} more (see structured result)."
+        separator_bytes = 1 if lines else 0
+        available = byte_budget - used - separator_bytes
+        if available > 0:
+            lines.append(_truncate_utf8(note, available))
     return lines
 
 
-def _format_row_preview(index: int, row: dict[str, object], *, tool_name: str) -> str:
+def _safe_identity_label(value: str) -> str:
+    """Render source identities as a human name without leaking full backend IDs."""
+    repository, at, rest = value.partition("@")
+    fields = rest.split(":")
+    if at and repository and len(fields) >= 4 and fields[0] and fields[2]:
+        commit = fields[0][:8]
+        return f"{fields[2]} ({repository}@{commit})"
+    if at and len(fields) >= 3:
+        return "selected symbol"
+    return _truncate_utf8(value, 120)
+
+
+def _format_row_preview(
+    index: int, row: dict[str, object], *, tool_name: str, numbered: bool = True
+) -> str:
+    prefix = f"  {index}. " if numbered else ""
+    if tool_name == "list_corpus_snapshots":
+        return f"{prefix}{row.get('alias', '?')} ({row.get('version', '?')})"
+    if tool_name == "compare_corpus_snapshots":
+        return f"{prefix}{row.get('identity', '?')} [{row.get('change', '?')}]"
+    if tool_name == "trace_corpus_path" and isinstance(row.get("nodes"), list):
+        labels = [
+            f"{node.get('name') or node.get('qname') or 'indexed node'}"
+            + (f" ({node['path']})" if isinstance(node.get("path"), str) else "")
+            for node in row["nodes"]
+            if isinstance(node, dict)
+        ]
+        return f"{prefix}{' -> '.join(labels)}"
     if tool_name == "list_repositories":
         repo_name = row.get("repo_name")
         commit = row.get("commit")
         files = row.get("files")
         label = repo_name if isinstance(repo_name, str) else "?"
         if isinstance(commit, str) and commit:
-            label = f"{label} @ {commit}"
+            label = f"{label}@{commit[:8]}"
         if isinstance(files, int):
-            return f"  {index}. {label} ({files} files)"
-        return f"  {index}. {label}"
+            return f"{prefix}{label} {files} files"
+        return f"{prefix}{label}"
     if tool_name == "trace_call_path":
         path = row.get("path")
         if isinstance(path, list):
@@ -407,34 +510,45 @@ def _format_row_preview(index: int, row: dict[str, object], *, tool_name: str) -
             for node in path:
                 if not isinstance(node, dict):
                     continue
-                label = node.get("qname") or node.get("key")
+                label = node.get("qname") or node.get("name")
                 if isinstance(label, str) and label:
                     segments.append(label)
             if segments:
                 depth = row.get("depth")
                 depth_suffix = f" (depth {depth})" if isinstance(depth, int) else ""
-                return f"  {index}. {' -> '.join(segments)}{depth_suffix}"
+                return f"{prefix}{' -> '.join(segments)}{depth_suffix}"
     label = _format_symbol_label(row)
-    location = _format_row_location(row)
-    resolution = row.get("resolution")
+    location = _format_row_location(
+        row,
+        include_relative_path=tool_name
+        in {
+            "search_corpus_symbols",
+            "get_dependency_evidence",
+        },
+    )
+    resolution = row.get("resolution") or row.get("status")
     resolution_suffix = ""
     if isinstance(resolution, str) and resolution and resolution != "exact":
         resolution_suffix = f" [{resolution}]"
     if location:
-        return f"  {index}. {label} ({location}){resolution_suffix}"
-    return f"  {index}. {label}{resolution_suffix}"
+        return f"{prefix}{label} {location}{resolution_suffix}"
+    return f"{prefix}{label}{resolution_suffix}"
 
 
 def _format_symbol_label(row: dict[str, object]) -> str:
-    for field in ("qname", "qualified_name", "name", "symbol_id", "key", "module"):
+    for field in ("qname", "qualified_name", "name", "module"):
         value = row.get(field)
         if isinstance(value, str) and value:
             return value
     return "?"
 
 
-def _format_row_location(row: dict[str, object]) -> str | None:
+def _format_row_location(
+    row: dict[str, object], *, include_relative_path: bool = False
+) -> str | None:
     file_path = row.get("file")
+    if include_relative_path and not file_path:
+        file_path = row.get("evidence_path") or row.get("path")
     if not isinstance(file_path, str) or not file_path:
         return None
     line_number = row.get("start_line")
@@ -871,9 +985,7 @@ def get_sql_object(
     database: Annotated[
         str | None,
         Field(
-            description=(
-                "Logical database filter; required when schema.object_name is ambiguous."
-            )
+            description=("Logical database filter; required when schema.object_name is ambiguous.")
         ),
     ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
@@ -919,9 +1031,7 @@ def find_sql_usages(
     database: Annotated[
         str | None,
         Field(
-            description=(
-                "Logical database filter; required when schema.object_name is ambiguous."
-            )
+            description=("Logical database filter; required when schema.object_name is ambiguous.")
         ),
     ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
@@ -1083,6 +1193,101 @@ def get_complexity(
             repository_hint=repository,
             commit_hint=commit,
         ),
+    )
+
+
+@mcp.tool(
+    description="List indexed PostgreSQL corpus snapshot aliases, pins and source fingerprints.",
+    output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
+)
+def list_corpus_snapshots(
+    limit: Annotated[int, Field(ge=1, le=100)] = 100,
+    offset: Annotated[int, Field(ge=0, le=10_000)] = 0,
+) -> ToolResult:
+    return _wrapped_list_result(
+        "list_corpus_snapshots", query_list_corpus_snapshots(limit=limit, offset=offset)
+    )
+
+
+@mcp.tool(
+    description=(
+        "Search C/native symbols and SQL routine declarations in one corpus snapshot alias. "
+        "Returns exact graph keys, signatures, source locations and coverage."
+    ),
+    output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
+)
+def search_corpus_symbols(
+    query: str,
+    snapshot_alias: str,
+    kind: Literal["native", "routine", "all"] = "all",
+    limit: Annotated[int, Field(ge=1, le=100)] = 20,
+    offset: Annotated[int, Field(ge=0, le=10_000)] = 0,
+) -> ToolResult:
+    return _wrapped_list_result(
+        "search_corpus_symbols",
+        query_search_corpus_symbols(
+            query, snapshot_alias=snapshot_alias, kind=kind, limit=limit, offset=offset
+        ),
+    )
+
+
+@mcp.tool(
+    description=(
+        "Inspect direct cross-language dependency evidence for an exact corpus graph key. "
+        "Candidate links stay explicitly uncertain; documentation is not execution."
+    ),
+    output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
+)
+def get_dependency_evidence(
+    key: str,
+    direction: Literal["outgoing", "incoming"] = "incoming",
+    limit: Annotated[int, Field(ge=1, le=100)] = 50,
+    offset: Annotated[int, Field(ge=0, le=10_000)] = 0,
+) -> ToolResult:
+    return _wrapped_list_result(
+        "get_dependency_evidence",
+        query_get_dependency_evidence(key, direction=direction, limit=limit, offset=offset),
+    )
+
+
+@mcp.tool(
+    description=(
+        "Trace a bounded shortest source-evidence path from literal SQL/runbook/routine/native "
+        "key to a native API key. Candidate and conditional links are excluded; DOCUMENTS "
+        "links remain distinguishable. Not an execution or ABI compatibility proof."
+    ),
+    output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
+)
+def trace_corpus_path(
+    from_key: str,
+    to_key: str,
+    max_depth: Annotated[int, Field(ge=1, le=8)] = 6,
+    limit: Annotated[int, Field(ge=1, le=10)] = 5,
+) -> ToolResult:
+    return _wrapped_list_result(
+        "trace_corpus_path",
+        query_trace_corpus_path(from_key, to_key, max_depth=max_depth, limit=limit),
+    )
+
+
+@mcp.tool(
+    description=(
+        "Compare two corpus snapshots of the same logical repository for added/removed APIs, "
+        "signature/body/definition changes and ambiguous matches. Source-level findings only; "
+        "limited extraction coverage must be considered before drawing "
+        "upgrade/security conclusions."
+    ),
+    output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
+)
+def compare_corpus_snapshots(
+    left_alias: str,
+    right_alias: str,
+    limit: Annotated[int, Field(ge=1, le=100)] = 100,
+    offset: Annotated[int, Field(ge=0, le=10_000)] = 0,
+) -> ToolResult:
+    return _wrapped_list_result(
+        "compare_corpus_snapshots",
+        query_compare_corpus_snapshots(left_alias, right_alias, limit=limit, offset=offset),
     )
 
 

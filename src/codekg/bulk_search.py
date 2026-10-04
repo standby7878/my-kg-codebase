@@ -25,6 +25,8 @@ def create_search_stage_from_registry(
     registry_path: Path,
     root: Path,
     repo: RepositoryIR,
+    *,
+    markdown_paths: Iterable[Path] | None = None,
 ) -> int:
     """Create a search stage without reconstructing repository-wide IR."""
 
@@ -42,7 +44,8 @@ def create_search_stage_from_registry(
         from codekg.docs import chunk_docs
         from codekg.ingest import iter_markdown_files
 
-        for markdown_path in iter_markdown_files(root):
+        paths = iter_markdown_files(root) if markdown_paths is None else markdown_paths
+        for markdown_path in paths:
             for chunk in chunk_docs([markdown_path], []):
                 for qname in chunk.mentions:
                     known = registry.execute(

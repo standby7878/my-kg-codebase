@@ -1,5 +1,7 @@
 .git
 .venv
+.codekg-corpus
+.codekg-worktrees
 .pytest_cache
 .ruff_cache
 __pycache__

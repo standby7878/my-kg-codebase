@@ -50,6 +50,33 @@ def test_build_import_command_keeps_header_and_shards_in_one_ordered_group(tmp_p
     assert command[-1] == f"--nodes=Function={header},{shard_one},{shard_two}"
 
 
+def test_build_import_command_adds_bounded_read_buffer_for_large_serialized_field(
+    tmp_path: Path,
+) -> None:
+    node = tmp_path / "nodes.csv"
+    node.write_text("", encoding="utf-8")
+    export = SimpleNamespace(
+        node_files={"File": node}, relationship_files={}, max_csv_field_size_bytes=5_300_007
+    )
+
+    command = build_import_command(export)
+
+    assert "--read-buffer-size=5365543" in command
+    assert command.index("--read-buffer-size=5365543") < command.index(f"--nodes=File={node}")
+
+
+@pytest.mark.parametrize("value", [True, -1, 128 * 1024 * 1024 + 4097, "5300000"])
+def test_build_import_command_rejects_invalid_field_size_metadata(tmp_path: Path, value) -> None:
+    node = tmp_path / "nodes.csv"
+    node.write_text("", encoding="utf-8")
+    export = SimpleNamespace(
+        node_files={"File": node}, relationship_files={}, max_csv_field_size_bytes=value
+    )
+
+    with pytest.raises(BulkImportError, match="CSV max field size"):
+        build_import_command(export)
+
+
 def test_build_import_command_rejects_comma_in_group_filename(tmp_path: Path) -> None:
     node = tmp_path / "nodes,part.csv"
     node.write_text("", encoding="utf-8")

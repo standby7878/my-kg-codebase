@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import shutil
 import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,11 @@ WRAPPED_LIST_OUTPUT_SCHEMA = {
     "x-fastmcp-wrap-result": True,
 }
 WRAPPED_LIST_TOOLS = {
+    "list_corpus_snapshots",
+    "search_corpus_symbols",
+    "get_dependency_evidence",
+    "trace_corpus_path",
+    "compare_corpus_snapshots",
     "list_repositories",
     "get_definition",
     "find_callers",
@@ -238,10 +245,13 @@ def _compose_or_skip() -> None:
 @pytest.mark.asyncio
 async def test_http_mcp_transport_supports_protocol_client_session(
     record_property: Any,
+    tmp_path: Path,
 ) -> None:
     _compose_or_skip()
     fastmcp = pytest.importorskip("fastmcp")
     project = f"codekg-mcp-http-{uuid.uuid4().hex[:12]}"
+    app_image = f"codekg-app:{project}"
+    metrics_path = Path(tempfile.gettempdir()) / f"mcp-transport-metrics-{project}.json"
     port = str(20000 + (uuid.uuid4().int % 1000))
     env = os.environ.copy()
     env["MCP_TRANSPORT"] = "http"
@@ -253,14 +263,56 @@ async def test_http_mcp_transport_supports_protocol_client_session(
     env["CODEKG_NEO4J_LOGS_VOLUME"] = f"{project}-neo4j-logs"
     env["CODEKG_ZVEC_DATA_VOLUME"] = f"{project}-zvec-data"
     env["CODEKG_BULK_STAGING_VOLUME"] = f"{project}-bulk-staging"
+    env["CODEKG_APP_IMAGE"] = app_image
     command = ["docker", "compose", "-p", project, "-f", str(COMPOSE_FILE)]
     try:
         built = _run_compose(command, "build", "app-image-build", env=env)
         if built.returncode != 0:
-            pytest.skip(f"Required Compose image could not be built: {built.stderr.strip()}")
+            pytest.fail(f"Required Compose image could not be built: {built.stderr.strip()}")
         started = _run_compose(command, "up", "-d", "mcp", env=env)
         if started.returncode != 0:
-            pytest.skip(f"Required Compose image or service unavailable: {started.stderr.strip()}")
+            pytest.fail(f"Required Compose image or service unavailable: {started.stderr.strip()}")
+
+        container = _run_compose(command, "ps", "-q", "mcp", env=env)
+        assert container.returncode == 0 and container.stdout.strip()
+        image = subprocess.run(
+            ["docker", "inspect", "--format", "{{.Image}}", container.stdout.strip()],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert image.returncode == 0, image.stderr
+        provenance = _run_compose(
+            command,
+            "exec",
+            "-T",
+            "mcp",
+            "python",
+            "-c",
+            "import hashlib, importlib.metadata, codekg.mcp.server as s; "
+            "print(hashlib.sha256(open(s.__file__, 'rb').read()).hexdigest()); "
+            "print(importlib.metadata.version('fastmcp'))",
+            env=env,
+        )
+        assert provenance.returncode == 0, provenance.stderr
+        installed_server_hash, installed_fastmcp_version = provenance.stdout.splitlines()
+        host_server_hash = hashlib.sha256(
+            (Path(__file__).parents[2] / "src/codekg/mcp/server.py").read_bytes()
+        ).hexdigest()
+        metrics_path.write_text(
+            json.dumps(
+                {
+                    "image_id": image.stdout.strip(),
+                    "installed_server_sha256": installed_server_hash,
+                    "host_server_sha256": host_server_hash,
+                    "fastmcp_version": installed_fastmcp_version,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        assert installed_server_hash == host_server_hash
 
         async def list_tools_when_ready() -> list[object]:
             deadline = asyncio.get_running_loop().time() + 60
@@ -275,10 +327,9 @@ async def test_http_mcp_transport_supports_protocol_client_session(
 
         tools = await asyncio.wait_for(list_tools_when_ready(), timeout=65)
         assert tools
-        assert (
-            {tool.name for tool in tools}
-            == WRAPPED_LIST_TOOLS | STRUCTURED_DISCOVERY_TOOLS | STRUCTURED_DETAIL_TOOLS
-        )
+        assert {
+            tool.name for tool in tools
+        } == WRAPPED_LIST_TOOLS | STRUCTURED_DISCOVERY_TOOLS | STRUCTURED_DETAIL_TOOLS
         for tool in tools:
             if tool.name in WRAPPED_LIST_TOOLS:
                 assert tool.outputSchema == WRAPPED_LIST_OUTPUT_SCHEMA
@@ -303,7 +354,7 @@ async def test_http_mcp_transport_supports_protocol_client_session(
             repository_sizes = _assert_compact_result(
                 repositories,
                 expected_rows=1,
-                forbidden_text=("/repos/requests", COMMIT),
+                forbidden_text=("/repos/requests",),
             )
             repository_rows = repositories.structuredContent["result"]
             assert all(
@@ -313,7 +364,7 @@ async def test_http_mcp_transport_supports_protocol_client_session(
             assert repository_row["repo_name"] == REPOSITORY
             assert repository_row["commit"] == COMMIT
             assert repository_row["root_path"] == "."
-            assert repositories.content[0].text.startswith("Found 1 indexed repository.")
+            assert repositories.content[0].text.startswith("1 repository")
             assert REPOSITORY in repositories.content[0].text
 
             first_page = await client.call_tool_mcp(
@@ -366,8 +417,7 @@ async def test_http_mcp_transport_supports_protocol_client_session(
                 "o": 2,
             }
             assert first_page.content[0].text.startswith(
-                "Found 2 symbol candidate(s) in repository=requests. "
-                "More results are available."
+                "Found 2 symbol candidate(s) in repository=requests. More results are available."
             )
             assert "src.requests.candidates.candidate_0" in first_page.content[0].text
 
@@ -392,11 +442,12 @@ async def test_http_mcp_transport_supports_protocol_client_session(
             definition_sizes = _assert_compact_result(
                 definition,
                 expected_rows=1,
-                forbidden_text=(CALLEE_ID, "prepare_request", "/repos/requests"),
+                forbidden_text=(CALLEE_ID, "/repos/requests"),
             )
             definition_row = definition.structuredContent["result"][0]
             assert set(definition_row) == {
                 "key",
+                "symbol_id",
                 "labels",
                 "name",
                 "qname",
@@ -415,11 +466,12 @@ async def test_http_mcp_transport_supports_protocol_client_session(
             caller_sizes = _assert_compact_result(
                 callers,
                 expected_rows=1,
-                forbidden_text=(CALLER_ID, "Session.request"),
+                forbidden_text=(CALLER_ID,),
             )
             caller_row = callers.structuredContent["result"][0]
             assert set(caller_row) == {
                 "key",
+                "symbol_id",
                 "qname",
                 "signature",
                 "file",
@@ -438,11 +490,12 @@ async def test_http_mcp_transport_supports_protocol_client_session(
             callee_sizes = _assert_compact_result(
                 callees,
                 expected_rows=1,
-                forbidden_text=(CALLEE_ID, "Session.prepare_request"),
+                forbidden_text=(CALLEE_ID,),
             )
             callee_row = callees.structuredContent["result"][0]
             assert set(callee_row) == {
                 "key",
+                "symbol_id",
                 "qname",
                 "signature",
                 "file",
@@ -477,8 +530,6 @@ async def test_http_mcp_transport_supports_protocol_client_session(
         text_bytes = sum(row[0] for row in size_rows)
         structured_bytes = sum(row[1] for row in size_rows)
         wire_bytes = sum(row[2] for row in size_rows)
-        assert text_bytes < structured_bytes
-        assert wire_bytes > structured_bytes
         converted_results = [repositories, definition, callers, callees]
         legacy_wire_bytes = sum(
             _legacy_duplicated_wire_bytes(result) for result in converted_results
@@ -491,36 +542,63 @@ async def test_http_mcp_transport_supports_protocol_client_session(
             rows = result.structuredContent["result"]
             legacy_text_bytes += len(json.dumps(rows, separators=(",", ":"), default=str).encode())
         text_reduction = 1 - (text_bytes / legacy_text_bytes)
+        metrics = {
+            "image_id": image.stdout.strip(),
+            "installed_server_sha256": installed_server_hash,
+            "host_server_sha256": host_server_hash,
+            "fastmcp_version": installed_fastmcp_version,
+            "tools": [
+                {
+                    "tool": name,
+                    "fixture_text": result.content[0].text,
+                    "fixture_structured": result.structuredContent,
+                    "text_bytes": sizes[0],
+                    "structured_bytes": sizes[1],
+                    "wire_bytes": sizes[2],
+                }
+                for name, result, sizes in zip(
+                    ("list_repositories", "get_definition", "find_callers", "find_callees"),
+                    converted_results,
+                    size_rows,
+                    strict=True,
+                )
+            ],
+            "after": {
+                "text_bytes": text_bytes,
+                "structured_bytes": structured_bytes,
+                "wire_bytes": wire_bytes,
+            },
+            "legacy_text_bytes": legacy_text_bytes,
+            "before_legacy_wire_bytes": legacy_wire_bytes,
+            "requests_chain": {
+                "before_wire_bytes": before_chain_wire_bytes,
+                "after_wire_bytes": after_chain_wire_bytes,
+            },
+            "aggregate_text_reduction_percent": round(text_reduction * 100, 2),
+            "wire_reduction_percent": round(
+                (1 - (after_chain_wire_bytes / before_chain_wire_bytes)) * 100, 2
+            ),
+        }
+        metrics_path.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+        record_property("mcp_transport_metrics_artifact", str(metrics_path))
+        record_property(
+            "mcp_transport_provenance",
+            json.dumps(
+                {
+                    "image_id": metrics["image_id"],
+                    "server_sha256": installed_server_hash,
+                    "fastmcp_version": installed_fastmcp_version,
+                },
+                separators=(",", ":"),
+            ),
+        )
+        assert text_bytes < structured_bytes
+        assert wire_bytes > structured_bytes
         assert text_reduction >= 0.80
         assert 1 - (after_chain_wire_bytes / before_chain_wire_bytes) >= 0.25
         record_property(
             "mcp_response_sizes",
-            json.dumps(
-                {
-                    "converted_tools": [
-                        "list_repositories",
-                        "get_definition",
-                        "find_callers",
-                        "find_callees",
-                    ],
-                    "after": {
-                        "text_bytes": text_bytes,
-                        "structured_bytes": structured_bytes,
-                        "wire_bytes": wire_bytes,
-                    },
-                    "before_legacy_wire_bytes": legacy_wire_bytes,
-                    "requests_chain": {
-                        "before_wire_bytes": before_chain_wire_bytes,
-                        "after_wire_bytes": after_chain_wire_bytes,
-                    },
-                    "aggregate_text_reduction_percent": round(text_reduction * 100, 2),
-                    "wire_reduction_percent": round(
-                        (1 - (after_chain_wire_bytes / before_chain_wire_bytes)) * 100,
-                        2,
-                    ),
-                },
-                separators=(",", ":"),
-            ),
+            json.dumps(metrics, separators=(",", ":")),
         )
     finally:
         _run_compose(command, "down", "-v", "--remove-orphans", env=env)

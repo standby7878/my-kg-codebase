@@ -16,6 +16,8 @@ dependencies = [
   "pglast>=7,<8",
   "pydantic>=2",
   "rich",
+  "tree-sitter>=0.25,<0.26",
+  "tree-sitter-c>=0.23,<0.24",
   "typer",
 ]
 

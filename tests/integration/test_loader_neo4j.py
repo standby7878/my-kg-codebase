@@ -5,7 +5,14 @@ from testcontainers.neo4j import Neo4jContainer
 
 from codekg.ingest import scan_repository
 from codekg.ir import CallIR, FileIR, ModuleInitIR, ParseDiagnosticIR, RepositoryIR, SymbolIR
-from codekg.loader import load_repository
+from codekg.loader import (
+    _CALLSITE_OWNER_LINK_QUERY,
+    _CONSTRUCTION_OWNER_LINK_QUERY,
+    _EXACT_CALL_LINK_QUERY,
+    _RESOLVED_CALL_LINK_QUERY,
+    _RESOLVES_TO_LINK_QUERY,
+    load_repository,
+)
 from codekg.neo4j_client import Neo4jClient
 from codekg.schema.bootstrap import bootstrap_schema
 
@@ -98,6 +105,32 @@ def test_loader_persists_authoritative_call_sites_and_replaces_them() -> None:
         )
         try:
             bootstrap_schema(client=client)
+            projection_queries = (
+                _CALLSITE_OWNER_LINK_QUERY,
+                _RESOLVED_CALL_LINK_QUERY,
+                _EXACT_CALL_LINK_QUERY,
+                _RESOLVES_TO_LINK_QUERY,
+                _CONSTRUCTION_OWNER_LINK_QUERY,
+            )
+            for query in projection_queries:
+                with client._driver.session(database=client.database) as session:
+                    plan = (
+                        session.run(
+                            f"EXPLAIN {query}",
+                            {"rows": [{"owner_key": "not-present", "key": "not-present"}]},
+                        )
+                        .consume()
+                        .plan
+                    )
+                pending = [plan]
+                operators = []
+                while pending:
+                    operator = pending.pop()
+                    operators.append(operator["operatorType"])
+                    pending.extend(operator.get("children", ()))
+                assert "AllNodesScan" not in operators, operators
+                assert any("IndexSeek" in operator for operator in operators), operators
+
             first = load_repository(
                 _sample_repo(commit="abc123", module_qname="worker"),
                 replace=False,

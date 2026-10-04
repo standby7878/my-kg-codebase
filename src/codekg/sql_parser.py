@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from functools import cache
 from pathlib import PurePosixPath
 
 from pglast import ast as pgast
@@ -22,6 +22,7 @@ from pglast import split as pg_split
 from pglast.parser import ParseError
 
 from codekg.ir import FileIR, ParseDiagnosticIR
+from codekg.source_locations import ByteLocations, Utf8Offsets
 from codekg.sql_config import SqlConfig
 from codekg.sql_ir import SqlArtifactIR, SqlObjectRefIR, SqlStatementIR
 
@@ -108,6 +109,11 @@ class _Builder:
     ) -> None:
         self.source = source
         self.raw = raw
+        self.locations = ByteLocations(raw)
+        self._offset_segment: tuple[int, int] | None = None
+        self._node_offsets: Utf8Offsets | None = None
+        self._node_source = ""
+        self._parse_prefix_chars = 0
         self.artifact = artifact
         self.default_schema = default_schema
         self.search_path = search_path
@@ -124,13 +130,27 @@ class _Builder:
         *,
         parent_ordinal: int | None = None,
         control_context: str | None = None,
+        parse_prefix: str = "",
     ) -> int | None:
         source_bytes = self.raw[segment.start : segment.end]
+        parse_source = parse_prefix + source_bytes.decode("utf-8", errors="replace")
+        self._parse_prefix_chars = len(parse_prefix)
+        # PL/pgSQL PERFORM has SELECT semantics, but is not standalone SQL.
+        # The equal-width replacement keeps every parser location aligned to
+        # the original source bytes.
+        if re.match(r"\s*PERFORM\b", parse_source, flags=re.I):
+            match = re.search(r"PERFORM", parse_source, flags=re.I)
+            assert match is not None
+            parse_source = parse_source[: match.start()] + "SELECT " + parse_source[match.end() :]
         try:
-            parsed = pg_parse_sql(source_bytes.decode("utf-8"))
+            parsed = pg_parse_sql(parse_source)
         except (ParseError, UnicodeDecodeError) as error:
             position = _parse_error_position(error)
-            position = segment.start + len(source_bytes.decode("utf-8")[:position].encode("utf-8"))
+            source_text = source_bytes.decode("utf-8", errors="replace")
+            source_position = len(
+                source_text[: max(0, position - self._parse_prefix_chars)].encode("utf-8")
+            )
+            position = segment.start + source_position
             location = self._location(position, segment.end)
             self.diagnostics.append(
                 ParseDiagnosticIR(
@@ -639,9 +659,7 @@ class _Builder:
             return
         if language == "plpgsql":
             try:
-                parsed = parse_plpgsql(
-                    self.source.encode("utf-8")[segment.start : segment.end].decode()
-                )
+                parsed = parse_plpgsql(self.raw[segment.start : segment.end].decode())
             except ParseError as error:
                 self._diagnostic(
                     "sql_unsupported_construct",
@@ -670,14 +688,36 @@ class _Builder:
         context: str,
         segment: _Segment,
     ) -> None:
-        cursor = 0
+        protected = _protected_query_spans(body)
+        body_offsets = Utf8Offsets(body)
+        body_locations = ByteLocations(body.encode("utf-8"))
+        begin_cursor = 0
+        begin_offset = None
+        while match := re.search(r"\bBEGIN\b", body[begin_cursor:], flags=re.I):
+            begin_start = begin_cursor + match.start()
+            begin_end = begin_cursor + match.end()
+            if _query_span_is_source(body, begin_start, begin_end, protected=protected):
+                begin_offset = begin_end
+                break
+            begin_cursor = begin_start + 1
+        cursor = begin_offset or 0
 
         conditional_warning = False
+        default_warning = False
 
         def visit(value: object, conditional: bool = False) -> None:
             nonlocal cursor
             nonlocal conditional_warning
+            nonlocal default_warning
             if isinstance(value, dict):
+                if "default_val" in value and not default_warning:
+                    self._diagnostic(
+                        "sql_unsupported_construct",
+                        "warning",
+                        body_offset,
+                        "PL/pgSQL declaration default expressions are not statically extracted",
+                    )
+                    default_warning = True
                 child_conditional = conditional or any(
                     key.startswith("PLpgSQL_stmt_")
                     and key.removeprefix("PLpgSQL_stmt_").lower()
@@ -693,39 +733,79 @@ class _Builder:
                     )
                     conditional_warning = True
                 execsql = value.get("PLpgSQL_stmt_execsql")
+                perform = value.get("PLpgSQL_stmt_perform")
+                returned = value.get("PLpgSQL_stmt_return")
+                assigned = value.get("PLpgSQL_stmt_assign")
+                expression = None
+                expression_prefix = ""
                 if isinstance(execsql, dict):
                     query_value = execsql.get("sqlstmt", {})
-                    if isinstance(query_value, dict):
-                        expression = query_value.get("PLpgSQL_expr", {})
-                        query = expression.get("query") if isinstance(expression, dict) else None
-                        if isinstance(query, str):
-                            found = _find_query(body, query, cursor)
-                            if found is not None:
-                                cursor = found + len(query)
-                                self.process_segment(
-                                    _Segment(
-                                        body_offset + len(body[:found].encode("utf-8")),
-                                        body_offset
-                                        + len(body[: found + len(query)].encode("utf-8")),
-                                    ),
-                                    parent_ordinal=parent_ordinal,
-                                    control_context=(
-                                        f"{context}:conditional" if child_conditional else context
-                                    ),
-                                )
-                            else:
-                                self._diagnostic(
-                                    "sql_unsupported_construct",
-                                    "warning",
-                                    body_offset,
-                                    "static PL/pgSQL SQL statement source span was not located",
-                                )
+                    expression = (
+                        query_value.get("PLpgSQL_expr") if isinstance(query_value, dict) else None
+                    )
+                elif isinstance(perform, dict):
+                    expression = perform.get("expr", {}).get("PLpgSQL_expr")
+                elif isinstance(returned, dict):
+                    expression = returned.get("expr", {}).get("PLpgSQL_expr")
+                    expression_prefix = "SELECT "
+                elif isinstance(assigned, dict):
+                    expression = assigned.get("expr", {}).get("PLpgSQL_expr")
+                    expression_prefix = "SELECT "
+                query = expression.get("query") if isinstance(expression, dict) else None
+                if isinstance(query, str):
+                    source_query = query
+                    if isinstance(returned, dict):
+                        source_query = query
+                    elif isinstance(assigned, dict):
+                        # PL/pgSQL's parser returns the assignment as ``name :=
+                        # expression``. Only the RHS is SQL-expression source.
+                        assignment = re.match(r"\s*[\w.]+\s*:=\s*", query)
+                        if assignment is None:
+                            self._diagnostic(
+                                "sql_unsupported_construct",
+                                "warning",
+                                body_offset,
+                                "PL/pgSQL assignment expression could not be isolated",
+                            )
+                            source_query = ""
+                        else:
+                            source_query = query[assignment.end() :]
+                    found = (
+                        _find_query(body, source_query, cursor, protected=protected)
+                        if source_query
+                        else None
+                    )
+                    if found is not None:
+                        if isinstance(execsql, dict) or isinstance(perform, dict):
+                            source_query = (
+                                "PERFORM" + query[6:]
+                                if query[:6].upper() == "SELECT"
+                                and body[found : found + 7].upper() == "PERFORM"
+                                else query
+                            )
+                        cursor = found + len(source_query)
+                        self.process_segment(
+                            _Segment(
+                                body_offset + body_offsets.byte_offset(found),
+                                body_offset + body_offsets.byte_offset(found + len(source_query)),
+                            ),
+                            parent_ordinal=parent_ordinal,
+                            control_context=(
+                                f"{context}:conditional" if child_conditional else context
+                            ),
+                            parse_prefix=expression_prefix,
+                        )
+                    else:
+                        self._diagnostic(
+                            "sql_unsupported_construct",
+                            "warning",
+                            body_offset,
+                            "static PL/pgSQL SQL statement source span was not located",
+                        )
                 dynamic = value.get("PLpgSQL_stmt_dynexecute")
                 if dynamic is not None:
                     line = dynamic.get("lineno") if isinstance(dynamic, dict) else None
-                    offset = body_offset + len(
-                        "\n".join(body.splitlines()[: max(0, int(line or 1) - 1)]).encode()
-                    )
+                    offset = body_offset + body_locations.line_start(int(line or 1))
                     self._diagnostic(
                         "sql_dynamic_reference",
                         "warning",
@@ -800,24 +880,38 @@ class _Builder:
         schema: str | None,
         object_name: str | None,
     ) -> str:
-        position = self._node_position(node, segment)
-        match = _QUALIFIED_IDENTIFIER.match(
-            self.raw[position : segment.end].decode("utf-8", errors="replace")
-        )
+        self._index_segment(segment)
+        offset = getattr(node, "location", None)
+        offset = offset if isinstance(offset, int) and offset >= 0 else 0
+        offset = max(0, offset - self._parse_prefix_chars)
+        match = _QUALIFIED_IDENTIFIER.match(self._node_source, offset)
         if match:
             return match.group(0)
         pieces = [value for value in (database, schema, object_name) if value is not None]
         return ".".join(pieces)
 
     def _location(self, start: int, end: int) -> _Location:
-        return _location(self.raw, max(0, start), max(start, end))
+        start_line, start_column = self.locations.position(max(0, start))
+        end_line, end_column = self.locations.position(max(start, end))
+        return _Location(start_line, start_column + 1, end_line, end_column + 1)
 
     def _node_position(self, node: object | None, segment: _Segment) -> int:
         value = getattr(node, "location", None)
         if not isinstance(value, int) or value < 0:
             return segment.start
-        segment_text = self.raw[segment.start : segment.end].decode("utf-8", errors="replace")
-        return segment.start + len(segment_text[:value].encode("utf-8"))
+        self._index_segment(segment)
+        assert self._node_offsets is not None
+        source_char_offset = max(0, value - self._parse_prefix_chars)
+        return segment.start + self._node_offsets.byte_offset(source_char_offset)
+
+    def _index_segment(self, segment: _Segment) -> None:
+        identity = (segment.start, segment.end)
+        if identity != self._offset_segment:
+            self._node_source = self.raw[segment.start : segment.end].decode(
+                "utf-8", errors="replace"
+            )
+            self._node_offsets = Utf8Offsets(self._node_source)
+            self._offset_segment = identity
 
     def _diagnostic(self, category: str, severity: str, position: int, message: str) -> None:
         location = self._location(position, position)
@@ -895,9 +989,10 @@ def _split_statements(source: str, raw: bytes) -> tuple[_Segment, ...]:
     except ParseError:
         return _fallback_split(raw)
     segments = []
+    offsets = Utf8Offsets(source)
     for item in slices:
-        start = _char_offset(source, item.start)
-        end = _char_offset(source, item.stop)
+        start = offsets.byte_offset(item.start)
+        end = offsets.byte_offset(item.stop)
         start = _trim_leading_sql(raw, start, end)
         if raw[start:end].strip():
             segments.append(_Segment(start, end))
@@ -1266,7 +1361,6 @@ def _unquote_identifier(value: str) -> str:
     return value[1:-1].replace('""', '"') if value.startswith('"') else value.lower()
 
 
-@cache
 def _protected_query_spans(body: str) -> tuple[tuple[int, int], ...]:
     try:
         tokens = tuple(pg_scan(body))
@@ -1282,28 +1376,46 @@ def _protected_query_spans(body: str) -> tuple[tuple[int, int], ...]:
     return tuple(protected)
 
 
-def _query_span_is_source(body: str, start: int, end: int) -> bool:
-    return not any(
-        start < protected_end and end > protected_start
-        for protected_start, protected_end in _protected_query_spans(body)
-    )
+def _query_span_is_source(
+    body: str, start: int, end: int, *, protected: tuple[tuple[int, int], ...] | None = None
+) -> bool:
+    del end
+    spans = protected if protected is not None else _protected_query_spans(body)
+    index = bisect_right(spans, (start, float("inf"))) - 1
+    return index < 0 or start >= spans[index][1]
 
 
-def _find_query(body: str, query: str, cursor: int) -> int | None:
-    exact = body.find(query, cursor)
-    while exact >= 0:
-        if _query_span_is_source(body, exact, exact + len(query)):
-            return exact
-        exact = body.find(query, exact + 1)
-    query_words = [part for part in _WHITESPACE.split(query.strip()) if part]
-    if not query_words:
-        return None
-    pattern = r"\s+".join(re.escape(part) for part in query_words)
-    for match in re.finditer(pattern, body[cursor:], flags=re.S):
-        start = cursor + match.start()
-        end = cursor + match.end()
-        if _query_span_is_source(body, start, end):
-            return start
+def _find_query(
+    body: str,
+    query: str,
+    cursor: int,
+    *,
+    protected: tuple[tuple[int, int], ...] | None = None,
+) -> int | None:
+    if protected is None:
+        protected = _protected_query_spans(body)
+    variants = [query]
+    if re.match(r"SELECT\b", query, flags=re.I):
+        variants.append(re.sub(r"^SELECT\b", "PERFORM", query, count=1, flags=re.I))
+    for candidate in variants:
+        exact_pattern = re.compile(re.escape(candidate), flags=re.I | re.S)
+        exact = exact_pattern.search(body, cursor)
+        while exact is not None:
+            start = exact.start()
+            end = exact.end()
+            if _query_span_is_source(body, start, end, protected=protected):
+                return start
+            exact = exact_pattern.search(body, start + 1)
+        query_words = [part for part in _WHITESPACE.split(candidate.strip()) if part]
+        if not query_words:
+            continue
+        pattern = r"\s+".join(re.escape(part) for part in query_words)
+        whitespace_pattern = re.compile(pattern, flags=re.I | re.S)
+        for match in whitespace_pattern.finditer(body, cursor):
+            start = match.start()
+            end = match.end()
+            if _query_span_is_source(body, start, end, protected=protected):
+                return start
     return None
 
 

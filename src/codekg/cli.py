@@ -251,3 +251,99 @@ def validate_bulk_index(manifests: Annotated[list[Path], typer.Argument(min=1)])
     )
     if not result["ok"]:
         raise typer.Exit(1)
+
+
+@app.command("bulk-export-corpus")
+def bulk_export_corpus(
+    config: Path,
+    output: Path,
+    workers: int = typer.Option(
+        1,
+        "--workers",
+        min=1,
+        help="Maximum projection workers; shared corpus extraction is file-at-a-time and serial.",
+    ),
+) -> None:
+    """Build one immutable offline corpus generation from a TOML manifest."""
+    from codekg.corpus_export import export_corpus
+
+    result = export_corpus(config, output, workers=workers)
+    console.print(
+        {
+            "manifest": str(output.resolve() / "manifest.json"),
+            "snapshots": len(result["snapshots"]),
+            "metrics": result["metrics"],
+        }
+    )
+
+
+@app.command("corpus-snapshots")
+def corpus_snapshots(
+    manifest: Path,
+    limit: int = typer.Option(100, min=1, max=100),
+    offset: int = typer.Option(0, min=0, max=10_000),
+) -> None:
+    """List snapshots recorded in an offline corpus manifest."""
+    from codekg.corpus_queries import snapshots
+
+    for row in snapshots(manifest, limit=limit, offset=offset):
+        console.print(row)
+
+
+@app.command("corpus-search")
+def corpus_search(
+    manifest: Path,
+    query: str,
+    snapshot: str | None = typer.Option(None, "--snapshot"),
+    kind: str = typer.Option("all", "--kind"),
+    limit: int = typer.Option(20, min=1, max=100),
+) -> None:
+    """Search native symbols and routines in the offline SQLite corpus."""
+    from codekg.corpus_queries import search
+
+    for row in search(manifest, query, snapshot=snapshot, kind=kind, limit=limit):
+        console.print(row)
+
+
+@app.command("corpus-compare")
+def corpus_compare(
+    manifest: Path,
+    left: str,
+    right: str,
+    limit: int = typer.Option(100, min=1, max=100),
+    offset: int = typer.Option(0, min=0, max=10_000),
+) -> None:
+    """Compare matching logical-repository snapshots offline."""
+    from codekg.corpus_queries import compare
+
+    for row in compare(manifest, left, right, limit=limit, offset=offset):
+        console.print(row)
+
+
+@app.command("corpus-trace")
+def corpus_trace(
+    manifest: Path,
+    fromkey: str,
+    tokey: str,
+    max_depth: int = typer.Option(6, "--max-depth", min=1, max=8),
+    limit: int = typer.Option(5, min=1, max=10),
+) -> None:
+    """Return asserted offline dependency traces (if available)."""
+    from codekg.corpus_queries import trace
+
+    for row in trace(manifest, fromkey, tokey, max_depth=max_depth, limit=limit):
+        console.print(row)
+
+
+@app.command("corpus-evidence")
+def corpus_evidence(
+    manifest: Path,
+    key: str,
+    direction: str = typer.Option("outgoing", "--direction"),
+    limit: int = typer.Option(50, min=1, max=100),
+) -> None:
+    """Return bounded offline evidence matching a fact key."""
+    from codekg.corpus_queries import evidence
+
+    for row in evidence(manifest, key, direction=direction, limit=limit):
+        console.print(row)

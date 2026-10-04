@@ -5,13 +5,37 @@ import hashlib
 import pytest
 
 from codekg.sql_config import SqlConfig
-from codekg.sql_parser import parse_sql
+from codekg.sql_parser import _find_query, _protected_query_spans, parse_sql
 
 pytestmark = pytest.mark.unit
 
 
 def refs(file, role=None):
     return [ref for ref in file.sql_object_refs if role is None or ref.role == role]
+
+
+def test_plpgsql_query_search_uses_absolute_offsets_without_suffix_copies() -> None:
+    decoys = "".join(f"/* SELECT app.fake_{index}(); */\n" for index in range(128))
+    body = (
+        "-- π SELECT app.comment_decoy();\n"
+        + decoys
+        + "pErFoRm app.first('π');\n"
+        + "SELECT app.second('x');\n"
+    )
+    protected = _protected_query_spans(body)
+
+    class NoSliceText(str):
+        def __getitem__(self, index):
+            if isinstance(index, slice):
+                raise AssertionError("query search copied a source suffix")
+            return super().__getitem__(index)
+
+    source = NoSliceText(body)
+    first = _find_query(source, "SELECT app.first('π')", 0, protected=protected)
+    assert first == body.index("pErFoRm")
+    cursor = first + len("PERFORM app.first('π')")
+    second = _find_query(source, "SELECT app.second('x')", cursor, protected=protected)
+    assert second == body.index("SELECT app.second")
 
 
 def test_sql_parser_extracts_ddl_dml_view_and_preserves_artifact_text() -> None:
@@ -300,6 +324,40 @@ def test_unicode_locations_are_utf8_byte_columns() -> None:
     assert ref.start_column == len(b"SELECT * FROM ") + 1
     assert ref.raw_name == "public.таблица"
     assert ref.end_column == ref.start_column + len(ref.raw_name.encode("utf-8"))
+
+
+def test_plpgsql_expression_prefix_preserves_unicode_identifier_locations() -> None:
+    source = (
+        "CREATE FUNCTION f() RETURNS text LANGUAGE plpgsql AS $$\n"
+        "BEGIN\n"
+        "  RETURN foo('λ') || bar();\n"
+        "END $$;\n"
+        "CREATE FUNCTION g() RETURNS void LANGUAGE plpgsql AS $$\n"
+        "DECLARE result text;\n"
+        "BEGIN\n"
+        "  result := early('λ') || late();\n"
+        "END $$;"
+    )
+    file = parse_sql(source)
+    calls = [
+        ref for ref in refs(file, "call") if ref.object_name in {"foo", "bar", "early", "late"}
+    ]
+    assert [(ref.raw_name, ref.start_line) for ref in calls] == [
+        ("foo", 3),
+        ("bar", 3),
+        ("early", 8),
+        ("late", 8),
+    ]
+    lines = source.splitlines()
+    for ref in calls:
+        line = lines[ref.start_line - 1].encode("utf-8")
+        start = ref.start_column - 1
+        end = ref.end_column - 1
+        assert line[start:end].decode("utf-8") == ref.raw_name
+
+    normal = refs(parse_sql("SELECT normal('λ')"), "call")[0]
+    assert normal.start_column == len(b"SELECT ") + 1
+    assert normal.end_column == normal.start_column + len(b"normal")
 
 
 def test_invalid_source_bytes_are_not_replaced() -> None:

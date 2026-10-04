@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from codekg.csv_limits import serialized_csv_field_size_bytes, validate_csv_field_size
 from codekg.ir import RepositoryIR
 from codekg.loader import (
     _callsite_rows,
@@ -31,6 +32,7 @@ from codekg.loader import (
     _symbol_key,
 )
 from codekg.logging_config import debug_event
+from codekg.sql_config import SqlConfig
 from codekg.sql_graph import (
     SQL_NODE_COLUMNS,
     SQL_REL_COLUMNS,
@@ -43,7 +45,12 @@ from codekg.sql_graph import (
 logger = logging.getLogger(__name__)
 
 
-def _extract_spool(root_value: str, paths: tuple[str, ...], spool_value: str) -> str:
+def _extract_spool(
+    root_value: str,
+    paths: tuple[str, ...],
+    spool_value: str,
+    sql_config: SqlConfig | None = None,
+) -> str:
     """Worker entry point: parse a bounded batch and publish one spool."""
     from codekg.bulk_spool import create_spool
     from codekg.ingest import try_scan_file
@@ -56,7 +63,11 @@ def _extract_spool(root_value: str, paths: tuple[str, ...], spool_value: str) ->
             resolved = Path(path)
             if not resolved.is_absolute():
                 resolved = root / resolved
-            file = try_scan_file(root, resolved)
+            file = (
+                try_scan_file(root, resolved)
+                if sql_config is None
+                else try_scan_file(root, resolved, sql_config=sql_config)
+            )
             if file is not None:
                 yield file
 
@@ -64,7 +75,15 @@ def _extract_spool(root_value: str, paths: tuple[str, ...], spool_value: str) ->
     return str(spool)
 
 
-def export_repository_path(root: Path, output_dir: Path, *, workers: int = 1) -> BulkExport:
+def export_repository_path(
+    root: Path,
+    output_dir: Path,
+    *,
+    workers: int = 1,
+    repo_name: str | None = None,
+    commit_override: str | None = None,
+    sql_config: SqlConfig | None = None,
+) -> BulkExport:
     """Export one logical repository through durable extraction staging.
 
     The public single-root entry point intentionally owns repository identity
@@ -80,6 +99,13 @@ def export_repository_path(root: Path, output_dir: Path, *, workers: int = 1) ->
     root = root.resolve()
     if not root.is_dir():
         raise ValueError(f"Repository path does not exist or is not a directory: {root}")
+    if repo_name is not None and (not isinstance(repo_name, str) or not repo_name.strip()):
+        raise ValueError("repo_name must be a non-empty snapshot alias")
+    if commit_override is not None and (
+        not isinstance(commit_override, str) or not commit_override.strip()
+    ):
+        raise ValueError("commit_override must be a non-empty revision")
+    snapshot_name = repo_name if repo_name is not None else root.name
     output_dir = Path(output_dir)
     generation = output_dir / "generations" / f"{int(time.time_ns())}"
     spool_dir = generation / ".building" / "spools"
@@ -90,7 +116,12 @@ def export_repository_path(root: Path, output_dir: Path, *, workers: int = 1) ->
     try:
         with ProcessPoolExecutor(max_workers=workers) as executor:
             pending = set()
-            for ordinal, paths in enumerate(_source_batches(root)):
+            batches = (
+                _source_batches(root)
+                if sql_config is None
+                else _source_batches(root, sql_config=sql_config)
+            )
+            for ordinal, paths in enumerate(batches):
                 spool = spool_dir / f"extract-{ordinal:06d}.sqlite"
                 catalog.execute("INSERT INTO spools VALUES (?, ?)", (ordinal, str(spool)))
                 while len(pending) >= workers * 2:
@@ -99,21 +130,25 @@ def export_repository_path(root: Path, output_dir: Path, *, workers: int = 1) ->
                         completed.result()
                 pending.add(
                     executor.submit(
-                        _extract_spool, str(root), tuple(str(path) for path in paths), str(spool)
+                        _extract_spool,
+                        str(root),
+                        tuple(str(path) for path in paths),
+                        str(spool),
+                        sql_config,
                     )
                 )
             for completed in pending:
                 completed.result()
         catalog.commit()
-        commit = _git_commit(root) or content_hash(root)
+        commit = commit_override or _git_commit(root) or content_hash(root, sql_config=sql_config)
         build_registry(
             generation / ".building" / "resolver.sqlite",
             (Path(row[0]) for row in catalog.execute("SELECT path FROM spools ORDER BY ordinal")),
-            repo_prefix=f"{root.name}@{commit}",
+            repo_prefix=f"{snapshot_name}@{commit}",
         )
         from codekg.bulk_projection import project_repository
 
-        repo = RepositoryIR(repo_name=root.name, commit=commit, root_path=str(root))
+        repo = RepositoryIR(repo_name=snapshot_name, commit=commit, root_path=str(root))
         from codekg.bulk_search import create_search_stage_from_registry
 
         search_documents = create_search_stage_from_registry(
@@ -178,13 +213,188 @@ def export_repository_path(root: Path, output_dir: Path, *, workers: int = 1) ->
     return load_bulk_export(top_manifest)
 
 
-def _source_batches(root: Path) -> Iterable[tuple[Path, ...]]:
+def stage_corpus_source_file(
+    root: Path,
+    source: Path,
+    raw: bytes | None,
+    status: str | None,
+    language: str,
+    spool_batcher,
+    catalog: sqlite3.Connection,
+    ordinal: int,
+    *,
+    sql_config: SqlConfig,
+    max_file_bytes: int,
+    markdown_dir: Path,
+) -> None:
+    """Stage one already-bounded corpus file without reopening its source."""
+    from codekg.ingest import _module_qname, scan_file_bytes
+    from codekg.ir import FileIR, ParseDiagnosticIR
+
+    relative = source.relative_to(root).as_posix()
+    ordinary_source = source.suffix.lower() in {".py", ".sql"} or source.name.lower().endswith(
+        ".sql.in"
+    )
+    if ordinary_source and raw is None:
+        diagnostic = ParseDiagnosticIR(
+            category="file_too_large" if status == "file_too_large" else "unreadable_file",
+            severity="warning",
+            line=None,
+            column=None,
+            message=f"source exceeds {max_file_bytes} byte corpus limit"
+            if status == "file_too_large"
+            else "source could not be read within corpus limits",
+        )
+        file = FileIR(
+            path=relative,
+            language=language,
+            loc=0,
+            module_qname=(
+                f"sql:{relative}"
+                if language == "sql"
+                else _module_qname(relative, repository_name=root.name)
+            ),
+            parse_status="error",
+            diagnostics=(diagnostic,),
+        )
+    elif ordinary_source:
+        file = scan_file_bytes(root, source, raw, sql_config=sql_config)
+    if ordinary_source:
+        spool_batcher.write(file, len(raw) if raw is not None else 0)
+    if source.suffix.lower() == ".md" and raw is not None:
+        staged = markdown_dir / f"{ordinal:08d}.md"
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_bytes(raw)
+        catalog.execute("INSERT INTO markdown_files VALUES (?, ?)", (relative, str(staged)))
+
+
+class CorpusSpoolBatcher:
+    """Roll incremental source spools at bounded file and byte limits."""
+
+    MAX_FILES = 128
+    MAX_SOURCE_BYTES = 32 * 1024 * 1024
+
+    def __init__(self, spool_dir: Path, catalog: sqlite3.Connection) -> None:
+        from codekg.bulk_spool import SpoolWriter
+
+        self._writer_type = SpoolWriter
+        self.spool_dir = spool_dir
+        self.catalog = catalog
+        self.ordinal = 0
+        self.writer = None
+        self.source_bytes = 0
+
+    def write(self, file, source_bytes: int) -> None:
+        if self.writer is not None and (
+            self.writer.count >= self.MAX_FILES
+            or self.source_bytes + source_bytes > self.MAX_SOURCE_BYTES
+        ):
+            self._finish_spool()
+        if self.writer is None:
+            path = self.spool_dir / f"extract-{self.ordinal:06d}.sqlite"
+            self.writer = self._writer_type(path)
+            self.current_path = path
+            self.source_bytes = 0
+        self.writer.write(file)
+        self.source_bytes += source_bytes
+
+    def finish(self) -> None:
+        self._finish_spool()
+
+    def abort(self) -> None:
+        if self.writer is not None:
+            self.writer.close(publish=False)
+            self.writer = None
+
+    def _finish_spool(self) -> None:
+        if self.writer is None:
+            return
+        self.writer.close()
+        self.catalog.execute(
+            "INSERT INTO spools VALUES (?, ?)", (self.ordinal, str(self.current_path))
+        )
+        self.ordinal += 1
+        self.writer = None
+        self.source_bytes = 0
+
+
+def finalize_corpus_snapshot(
+    root: Path,
+    stage_dir: Path,
+    alias: str,
+    revision: str,
+    sql_config: SqlConfig,
+    catalog: sqlite3.Connection,
+    markdown_dir: Path,
+    *,
+    workers: int,
+) -> tuple[BulkExport, int, int]:
+    """Build resolver/search/projection stages from corpus extraction spools."""
+    from codekg.bulk_projection import project_repository
+    from codekg.bulk_search import create_search_stage_from_registry
+    from codekg.bulk_spool import build_registry
+
+    resolver = stage_dir / ".building" / "resolver.sqlite"
+
+    def spool_paths():
+        for (value,) in catalog.execute("SELECT path FROM spools ORDER BY ordinal"):
+            yield Path(value)
+
+    spool_count = int(catalog.execute("SELECT count(*) FROM spools").fetchone()[0])
+    projection_workers = min(workers, max(1, spool_count))
+    build_registry(resolver, spool_paths(), repo_prefix=f"{alias}@{revision}")
+    repo = RepositoryIR(repo_name=alias, commit=revision, root_path=str(root))
+    search_path = stage_dir / "search.sqlite"
+    search_documents = create_search_stage_from_registry(
+        search_path,
+        resolver,
+        root,
+        repo,
+        markdown_paths=(
+            Path(row[0])
+            for row in catalog.execute(
+                "SELECT staged_path FROM markdown_files ORDER BY source_path"
+            )
+        ),
+    )
+    result = project_repository(
+        repo,
+        spool_paths(),
+        resolver,
+        stage_dir,
+        workers=projection_workers,
+    )
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    manifest.update(
+        {
+            "mode": "sharded-monorepo",
+            "workers": projection_workers,
+            "repository": {
+                "repo_name": repo.repo_name,
+                "commit": repo.commit,
+                "root_path": repo.root_path,
+            },
+            "search_stage": {"version": 1, "file": "search.sqlite", "documents": search_documents},
+        }
+    )
+    result.manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+    return result, search_documents, projection_workers
+
+
+def _source_batches(
+    root: Path, *, sql_config: SqlConfig | None = None
+) -> Iterable[tuple[Path, ...]]:
     """Yield deterministic, bounded extraction work without retaining it all."""
     from codekg.ingest import _iter_source_files
 
     batch: list[Path] = []
     bytes_used = 0
-    for path in _iter_source_files(root):
+    paths = (
+        _iter_source_files(root)
+        if sql_config is None
+        else _iter_source_files(root, sql_config=sql_config)
+    )
+    for path in paths:
         try:
             size = path.stat().st_size
         except OSError as error:
@@ -213,6 +423,7 @@ class BulkExport:
     node_groups: Mapping[str, tuple[Path, ...]] = field(default_factory=dict)
     relationship_groups: Mapping[str, tuple[Path, ...]] = field(default_factory=dict)
     search_stage: Path | None = None
+    max_csv_field_size_bytes: int = 0
 
 
 _NODE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
@@ -409,6 +620,7 @@ def export_repositories(repositories: Iterable[RepositoryIR], output_dir: Path) 
             for kind, path in relationship_files.items()
         },
         "counts": graph["counts"],
+        "max_csv_field_size_bytes": _graph_max_csv_field_size(graph),
         "search_stage": {
             "version": 1,
             "file": "search.sqlite",
@@ -434,6 +646,7 @@ def export_repositories(repositories: Iterable[RepositoryIR], output_dir: Path) 
         {label: (path,) for label, path in node_files.items()},
         {kind: (path,) for kind, path in relationship_files.items()},
         output_dir / "search.sqlite",
+        manifest["max_csv_field_size_bytes"],
     )
     debug_event(
         logger,
@@ -449,6 +662,7 @@ def load_bulk_export(manifest_path: Path) -> BulkExport:
     manifest_path = Path(manifest_path)
     debug_event(logger, "bulk_export_manifest_load_started")
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    max_csv_field_size = validate_csv_field_size(data.get("max_csv_field_size_bytes", 0))
     output_dir = Path(data["output_dir"])
     if not output_dir.is_absolute():
         output_dir = manifest_path.parent / output_dir
@@ -477,6 +691,7 @@ def load_bulk_export(manifest_path: Path) -> BulkExport:
         node_groups,
         relationship_groups,
         search_stage,
+        max_csv_field_size,
     )
     debug_event(
         logger,
@@ -546,6 +761,21 @@ def _build_graph(repositories: tuple[RepositoryIR, ...]) -> dict[str, Any]:
                 "root_path": repo.root_path,
             },
         )
+        module_owners: dict[tuple[str, str], str] = {}
+        for source_file in sorted(repo.files, key=lambda item: item.path):
+            module_owners.setdefault(
+                (source_file.language, source_file.module_qname), source_file.path
+            )
+        for language, module_qname in sorted(module_owners):
+            node(
+                "Module",
+                {
+                    "key": _key(repo, f"module:{module_qname}"),
+                    "name": module_qname.rsplit(".", maxsplit=1)[-1],
+                    "qname": module_qname,
+                    "language": language,
+                },
+            )
         type_rows: list[dict[str, Any]] = []
         callable_rows: list[dict[str, Any]] = []
         owner_rows: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -562,8 +792,13 @@ def _build_graph(repositories: tuple[RepositoryIR, ...]) -> dict[str, Any]:
                 "qname": f["module_qname"],
                 "language": f["language"],
             }
-            node("Module", m)
-            rel("DEFINES", f["key"], m["key"], {}, f"{m['key']}:defines")
+            rel(
+                "DEFINES",
+                f["key"],
+                m["key"],
+                {},
+                f"{f['key']}:{m['key']}:defines",
+            )
             for diagnostic in diagnostics_by_file[f["key"]]:
                 node("ParseDiagnostic", diagnostic)
                 rel(
@@ -764,6 +999,27 @@ def _csv_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
+
+
+def _graph_max_csv_field_size(graph: Mapping[str, Any]) -> int:
+    """Measure the largest serialized data field before writing graph CSVs."""
+    maximum = 0
+    for label, rows in graph["nodes"].items():
+        columns = _NODE_COLUMNS[label]
+        for row in rows:
+            values = [_csv_value(row.get(name)) for name, _ in columns] + [label]
+            maximum = max(maximum, *(serialized_csv_field_size_bytes(value) for value in values))
+    wide_defines = bool(graph["nodes"].get("SqlObject"))
+    for kind, rows in graph["relationships"].items():
+        columns = (
+            _PYTHON_DEFINES_COLUMNS
+            if kind == "DEFINES" and not wide_defines
+            else _REL_COLUMNS[kind]
+        )
+        for row in rows:
+            values = [_csv_value(row.get(name)) for name, _ in columns]
+            maximum = max(maximum, *(serialized_csv_field_size_bytes(value) for value in values))
+    return validate_csv_field_size(maximum)
 
 
 @contextmanager

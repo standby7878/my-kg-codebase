@@ -5,7 +5,7 @@ services:
     build:
       context: ../..
       dockerfile: docker/app.Dockerfile
-    image: codekg-app:local
+    image: ${CODEKG_APP_IMAGE:-codekg-app:local}
 
   bulk-importer:
     build:
@@ -50,7 +50,7 @@ services:
     restart: unless-stopped
 
   schema_bootstrap:
-    image: codekg-app:local
+    image: ${CODEKG_APP_IMAGE:-codekg-app:local}
     pull_policy: never
     init: true
     depends_on:
@@ -74,7 +74,7 @@ services:
     command: ["codekg", "bootstrap"]
 
   ingestion:
-    image: codekg-app:local
+    image: ${CODEKG_APP_IMAGE:-codekg-app:local}
     pull_policy: never
     init: true
     depends_on:
@@ -100,7 +100,7 @@ services:
     command: ["codekg", "list"]
 
   bulk-exporter:
-    image: codekg-app:local
+    image: ${CODEKG_APP_IMAGE:-codekg-app:local}
     pull_policy: never
     init: true
     volumes:
@@ -124,7 +124,7 @@ services:
     command: ["codekg", "--help"]
 
   mcp:
-    image: codekg-app:local
+    image: ${CODEKG_APP_IMAGE:-codekg-app:local}
     pull_policy: never
     init: true
     depends_on:

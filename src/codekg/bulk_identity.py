@@ -15,11 +15,12 @@ from codekg.ingest import (
     _sql_config_identity,
     iter_markdown_files,
 )
+from codekg.sql_config import SqlConfig
 
 _READ_CHUNK_SIZE = 1024 * 1024
 
 
-def content_hash(root: Path) -> str:
+def content_hash(root: Path, *, sql_config: SqlConfig | None = None) -> str:
     """Return the legacy twelve-character content hash for ``root``.
 
     Paths are staged in a temporary disk-backed SQLite database so the ordered
@@ -36,12 +37,15 @@ def content_hash(root: Path) -> str:
             connection.execute("CREATE TABLE paths (path TEXT NOT NULL)")
             connection.executemany(
                 "INSERT INTO paths(path) VALUES (?)",
-                ((relative_path,) for relative_path in _relative_paths(root)),
+                (
+                    (relative_path,)
+                    for relative_path in _relative_paths(root, sql_config=sql_config)
+                ),
             )
             connection.commit()
 
             digest = hashlib.sha256()
-            digest.update(_sql_config_identity(root))
+            digest.update(_sql_config_identity(root, sql_config=sql_config))
             for (relative_path,) in connection.execute(
                 "SELECT path FROM paths ORDER BY path COLLATE PATH_ORDER"
             ):
@@ -58,8 +62,8 @@ def content_hash(root: Path) -> str:
             connection.close()
 
 
-def _relative_paths(root: Path) -> Iterator[str]:
-    for path in chain(_iter_source_files(root), iter_markdown_files(root)):
+def _relative_paths(root: Path, *, sql_config: SqlConfig | None = None) -> Iterator[str]:
+    for path in chain(_iter_source_files(root, sql_config=sql_config), iter_markdown_files(root)):
         yield path.relative_to(root).as_posix()
 
 

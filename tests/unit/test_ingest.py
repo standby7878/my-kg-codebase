@@ -183,11 +183,25 @@ def test_repository_file_walkers_prune_skipped_directories_and_are_deterministic
     (root / "a" / "nested").mkdir(parents=True)
     (root / "z").mkdir()
     (root / "node_modules" / "package").mkdir(parents=True)
+    (root / ".codekg-worktrees" / "checkout").mkdir(parents=True)
+    (root / ".codekg-corpus" / "staged").mkdir(parents=True)
     (root / "a" / "nested" / "worker.py").write_text("pass\n", encoding="utf-8")
     (root / "a" / "README.md").write_text("# A\n", encoding="utf-8")
     (root / "z" / "last.py").write_text("pass\n", encoding="utf-8")
     (root / "node_modules" / "package" / "ignored.py").write_text("pass\n", encoding="utf-8")
     (root / "node_modules" / "package" / "README.md").write_text("# ignored\n", encoding="utf-8")
+    (root / ".codekg-worktrees" / "checkout" / "generated.py").write_text(
+        "def generated(): pass\n", encoding="utf-8"
+    )
+    (root / ".codekg-worktrees" / "checkout" / "README.md").write_text(
+        "Generated checkout docs.\n", encoding="utf-8"
+    )
+    (root / ".codekg-corpus" / "staged" / "generated.py").write_text(
+        "def staged(): pass\n", encoding="utf-8"
+    )
+    (root / ".codekg-corpus" / "staged" / "README.md").write_text(
+        "Staged export docs.\n", encoding="utf-8"
+    )
     (root / "linked.py").symlink_to(root / "z" / "last.py")
     (root / "linked-directory").symlink_to(root / "a", target_is_directory=True)
 
@@ -197,6 +211,18 @@ def test_repository_file_walkers_prune_skipped_directories_and_are_deterministic
     assert source_paths == ["a/nested/worker.py", "linked.py", "z/last.py"]
     assert markdown_paths == ["a/README.md"]
     assert source_paths == [path.relative_to(root).as_posix() for path in _iter_source_files(root)]
+
+
+def test_explicit_generated_checkout_root_is_still_scannable(tmp_path: Path) -> None:
+    root = tmp_path / ".codekg-worktrees" / "checkout"
+    root.mkdir(parents=True)
+    (root / "module.py").write_text("def visible(): pass\n", encoding="utf-8")
+    (root / "README.md").write_text("Explicit source-root docs.\n", encoding="utf-8")
+
+    repository = scan_repository(root)
+
+    assert [file.path for file in repository.files] == ["module.py"]
+    assert repository.markdown_descriptions == {}
 
 
 @pytest.mark.parametrize(
@@ -540,12 +566,16 @@ def test_scan_repository_skips_inaccessible_directories_and_files(tmp_path: Path
     blocked_dir = repo / "aiven" / "deploy" / "repo_gpg"
     blocked_dir.parent.mkdir(parents=True)
     blocked_dir.mkdir()
+    original_dir_mode = blocked_dir.stat().st_mode & 0o777
     blocked_dir.chmod(0o000)
 
     blocked_file = repo / "secret.py"
     blocked_file.write_text("def secret():\n    return 2\n", encoding="utf-8")
+    original_file_mode = blocked_file.stat().st_mode & 0o777
     blocked_file.chmod(0o000)
-
-    scanned = scan_repository(repo)
-
-    assert {file.path for file in scanned.files} == {"visible.py"}
+    try:
+        scanned = scan_repository(repo)
+        assert {file.path for file in scanned.files} == {"visible.py"}
+    finally:
+        blocked_file.chmod(original_file_mode)
+        blocked_dir.chmod(original_dir_mode)

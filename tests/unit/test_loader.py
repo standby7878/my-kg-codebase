@@ -337,3 +337,18 @@ def test_replace_load_deletes_before_reindexing() -> None:
 
     assert "n.key STARTS WITH prefix" in client.writes[0][0]
     assert "MERGE (r:Repository" in client.writes[1][0]
+
+
+def test_loader_hotpath_node_lookups_are_label_indexed() -> None:
+    client = FakeClient()
+    load_repository(_repo(), replace=False, client=client)  # type: ignore[arg-type]
+    client.writes.clear()
+    load_repository(_local_receiver_repo(), replace=False, client=client)  # type: ignore[arg-type]
+
+    projection_queries = [query for query, _ in client.writes if "CALL (row)" in query]
+    assert len(projection_queries) == 5
+    assert all("MATCH (owner {key:" not in query for query in projection_queries)
+    assert all("MATCH (caller {key:" not in query for query in projection_queries)
+    assert all("MATCH (callee {key:" not in query for query in projection_queries)
+    assert all(":Function" in query for query in projection_queries)
+    assert all(":Method" in query for query in projection_queries)

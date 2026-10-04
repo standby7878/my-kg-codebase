@@ -27,25 +27,63 @@ _SQLITE_CACHE_KIB = -8192
 
 def create_spool(path: Path, files: Iterable[FileIR]) -> None:
     """Write a complete, atomically-published normalized extraction spool."""
+    with SpoolWriter(path) as writer:
+        for file in files:
+            writer.write(file)
 
-    partial = path.with_suffix(path.suffix + ".partial")
-    partial.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(partial)
-    try:
-        _configure(connection)
-        _create_normalized_schema(connection, include_symbol_keys=False)
-        connection.execute(
-            "INSERT INTO metadata VALUES ('schema_version', ?)",
-            (str(SPOOL_SCHEMA_VERSION),),
-        )
-        for ordinal, file in enumerate(files):
-            _insert_file(connection, file, ordinal)
-            if (ordinal + 1) % _WRITE_BATCH_SIZE == 0:
-                connection.commit()
-        connection.commit()
-    finally:
-        connection.close()
-    partial.replace(path)
+
+class SpoolWriter:
+    """Incrementally write and atomically publish one normalized spool."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.partial = self.path.with_suffix(self.path.suffix + ".partial")
+        self.partial.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(self.partial)
+        self.count = 0
+        self.closed = False
+        try:
+            _configure(self.connection)
+            _create_normalized_schema(self.connection, include_symbol_keys=False)
+            self.connection.execute(
+                "INSERT INTO metadata VALUES ('schema_version', ?)",
+                (str(SPOOL_SCHEMA_VERSION),),
+            )
+        except BaseException:
+            self.connection.close()
+            self.partial.unlink(missing_ok=True)
+            self.closed = True
+            raise
+
+    def write(self, file: FileIR) -> None:
+        if self.closed:
+            raise ValueError("cannot write to a closed spool")
+        _insert_file(self.connection, file, self.count)
+        self.count += 1
+        if self.count % _WRITE_BATCH_SIZE == 0:
+            self.connection.commit()
+
+    def close(self, *, publish: bool = True) -> None:
+        if self.closed:
+            return
+        try:
+            if publish:
+                self.connection.commit()
+            else:
+                self.connection.rollback()
+        finally:
+            self.connection.close()
+            self.closed = True
+        if publish:
+            self.partial.replace(self.path)
+        else:
+            self.partial.unlink(missing_ok=True)
+
+    def __enter__(self) -> SpoolWriter:
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close(publish=exc_type is None)
 
 
 def iter_spool_files(path: Path) -> Iterator[FileIR]:
@@ -511,10 +549,20 @@ def _copy_attached_spool(connection: sqlite3.Connection, repo_prefix: str, file_
 def _create_registry_indexes(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
+        CREATE TABLE module_owners (
+            language TEXT NOT NULL,
+            module_qname TEXT NOT NULL,
+            owner_path TEXT NOT NULL,
+            PRIMARY KEY(language,module_qname)
+        );
+        INSERT INTO module_owners(language,module_qname,owner_path)
+            SELECT language,module_qname,MIN(path) FROM files
+            GROUP BY language,module_qname;
         CREATE INDEX symbols_qname_idx ON symbols(qname, key);
         CREATE INDEX symbols_method_idx
             ON symbols(parent_qname, qname, key) WHERE kind = 'method';
         CREATE INDEX imports_path_idx ON imports(path, ordinal);
+        CREATE INDEX imports_module_path_idx ON imports(module, path);
         CREATE INDEX inheritance_type_idx ON inheritance(type_qname, ordinal);
         CREATE INDEX calls_path_idx ON calls(path, row_ordinal);
         CREATE INDEX localbindings_path_idx ON localbindings(path, ordinal);

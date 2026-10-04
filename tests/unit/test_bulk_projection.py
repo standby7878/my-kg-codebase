@@ -79,3 +79,35 @@ def test_projection_of_empty_repository_publishes_repository_node(tmp_path: Path
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
     assert manifest["counts"] == {"nodes": 1, "nodes_Repository": 1}
     assert manifest["nodes"]["Repository"]["count"] == 1
+
+
+def test_staged_projection_tracks_max_serialized_csv_field_without_rescanning(
+    tmp_path: Path,
+) -> None:
+    from codekg.bulk_export import load_bulk_export
+    from codekg.bulk_import import build_import_command
+
+    signature = '"λ, value"' * 530_000
+    spool = tmp_path / "large.sqlite"
+    create_spool(
+        spool,
+        [
+            FileIR(
+                path="large.py",
+                language="python",
+                loc=1,
+                module_qname="large",
+                symbols=(SymbolIR("function", "large", "large.large", signature, 1, 1),),
+            )
+        ],
+    )
+    registry = tmp_path / "registry.sqlite"
+    build_registry(registry, [spool], repo_prefix="repo@abc")
+    output = tmp_path / "out"
+
+    project_repository(RepositoryIR("repo", "abc", "/repo"), [spool], registry, output)
+
+    loaded = load_bulk_export(output / "manifest.json")
+    expected_size = len(signature.encode("utf-8")) + signature.count('"') + 2
+    assert loaded.max_csv_field_size_bytes == expected_size
+    assert any(arg.startswith("--read-buffer-size=") for arg in build_import_command(loaded))

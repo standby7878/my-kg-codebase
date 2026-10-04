@@ -9,6 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from codekg.csv_limits import (
+    MAX_GENERATED_CSV_FIELD_SIZE_BYTES,
+    NEO4J_DEFAULT_READ_BUFFER_BYTES,
+    NEO4J_READ_BUFFER_MARGIN_BYTES,
+    validate_csv_field_size,
+)
 from codekg.logging_config import debug_event
 
 logger = logging.getLogger(__name__)
@@ -68,6 +74,15 @@ def build_import_command(
     ]
     if overwrite:
         command.append("--overwrite-destination=true")
+    try:
+        max_field_size = validate_csv_field_size(getattr(export, "max_csv_field_size_bytes", 0))
+    except ValueError as exc:
+        raise BulkImportError(str(exc)) from exc
+    if max_field_size > NEO4J_DEFAULT_READ_BUFFER_BYTES:
+        read_buffer_size = max_field_size + NEO4J_READ_BUFFER_MARGIN_BYTES
+        if read_buffer_size > MAX_GENERATED_CSV_FIELD_SIZE_BYTES + NEO4J_READ_BUFFER_MARGIN_BYTES:
+            raise BulkImportError("CSV max field size exceeds Neo4j import buffer bound")
+        command.append(f"--read-buffer-size={read_buffer_size}")
     command.extend(f"--nodes={label}={path}" for label, path in nodes)
     command.extend(f"--relationships={kind}={path}" for kind, path in relationships)
     return command

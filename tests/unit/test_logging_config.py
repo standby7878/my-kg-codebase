@@ -35,3 +35,14 @@ def test_debug_event_is_structured(caplog) -> None:
         debug_event(logger, "scanner_completed", files=2, calls=3)
 
     assert 'codekg_scanner_completed {"calls": 3, "files": 2}' in caplog.text
+
+
+def test_disabled_debug_event_does_not_serialize(monkeypatch, caplog) -> None:
+    def unexpected_serialization(*args, **kwargs):
+        raise AssertionError("disabled telemetry must not serialize its fields")
+
+    monkeypatch.setattr("codekg.logging_config.json.dumps", unexpected_serialization)
+    logger = logging.getLogger("codekg.tests.disabled_logging")
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        debug_event(logger, "ignored", value=object())
+    assert not caplog.records

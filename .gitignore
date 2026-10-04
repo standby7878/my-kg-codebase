@@ -16,3 +16,5 @@ codekg-csv-export/
 /runs/
 /third_party/
 /evaluation-aiven-core/
+/.codekg-worktrees/
+/.codekg-corpus/

@@ -31,6 +31,53 @@ from codekg.sql_resolver import SqliteSqlResolverIndex
 
 DEFAULT_BATCH_SIZE = 1_000
 logger = logging.getLogger(__name__)
+_CALLABLE_OWNER_LABELS = ("Function", "Method", "ModuleInit")
+_CALLABLE_TARGET_LABELS = ("Function", "Method")
+
+
+def _indexed_entity_lookup(variable: str, key_field: str, labels: tuple[str, ...]) -> str:
+    """Build a label-bounded key lookup that can use entity key indexes."""
+
+    branches = "\n  UNION ALL\n  ".join(
+        f"MATCH ({variable}:{label} {{key: row.{key_field}}}) RETURN {variable}" for label in labels
+    )
+    return f"CALL (row) {{\n  {branches}\n}}"
+
+
+_CALLSITE_OWNER_LINK_QUERY = f"""
+UNWIND $rows AS row
+{_indexed_entity_lookup("owner", "owner_key", _CALLABLE_OWNER_LABELS)}
+MATCH (site:CallSite {{key: row.key}})
+MERGE (owner)-[:HAS_CALLSITE]->(site)
+"""
+_RESOLVED_CALL_LINK_QUERY = f"""
+UNWIND $rows AS row
+{_indexed_entity_lookup("caller", "caller_key", _CALLABLE_OWNER_LABELS)}
+{_indexed_entity_lookup("callee", "callee_key", _CALLABLE_TARGET_LABELS)}
+MERGE (caller)-[rel:CALLS {{key: row.callsite_key}}]->(callee)
+SET rel.resolution = row.resolution, rel.line = row.line, rel.column = row.column
+"""
+_EXACT_CALL_LINK_QUERY = f"""
+UNWIND $rows AS row
+{_indexed_entity_lookup("caller", "caller_key", _CALLABLE_OWNER_LABELS)}
+{_indexed_entity_lookup("callee", "callee_key", _CALLABLE_TARGET_LABELS)}
+MERGE (caller)-[rel:EXACT_CALLS {{key: row.callsite_key}}]->(callee)
+SET rel.resolution = row.resolution, rel.line = row.line, rel.column = row.column
+"""
+_RESOLVES_TO_LINK_QUERY = f"""
+UNWIND $rows AS row
+MATCH (site:CallSite {{key: row.callsite_key}})
+{_indexed_entity_lookup("callee", "callee_key", _CALLABLE_TARGET_LABELS)}
+MERGE (site)-[rel:RESOLVES_TO {{key: row.callsite_key}}]->(callee)
+SET rel.strategy = row.resolution, rel.confidence = 'exact'
+"""
+_CONSTRUCTION_OWNER_LINK_QUERY = f"""
+UNWIND $rows AS row
+{_indexed_entity_lookup("owner", "owner_key", _CALLABLE_OWNER_LABELS)}
+MATCH (type:Type {{key: row.type_key}})
+MERGE (owner)-[rel:CONSTRUCTS {{key: row.callsite_key}}]->(type)
+SET rel.resolution = row.resolution, rel.line = row.line, rel.column = row.column
+"""
 
 
 def load_repository(
@@ -318,27 +365,14 @@ def load_repository(
     linked_callsite_rows = [row for row in callsite_rows if row["owner_key"] is not None]
     batch_count += _write_batched(
         db,
-        """
-        UNWIND $rows AS row
-        MATCH (owner {key: row.owner_key})
-        MATCH (site:CallSite {key: row.key})
-        MERGE (owner)-[:HAS_CALLSITE]->(site)
-        """,
+        _CALLSITE_OWNER_LINK_QUERY,
         linked_callsite_rows,
         batch_size,
         operation="link call site owners",
     )
     batch_count += _write_batched(
         db,
-        """
-        UNWIND $rows AS row
-        MATCH (caller {key: row.caller_key})
-        MATCH (callee {key: row.callee_key})
-        MERGE (caller)-[rel:CALLS {key: row.callsite_key}]->(callee)
-        SET rel.resolution = row.resolution,
-            rel.line = row.line,
-            rel.column = row.column
-        """,
+        _RESOLVED_CALL_LINK_QUERY,
         resolved_rows,
         batch_size,
         operation="load resolved call projections",
@@ -346,15 +380,7 @@ def load_repository(
 
     batch_count += _write_batched(
         db,
-        """
-        UNWIND $rows AS row
-        MATCH (caller {key: row.caller_key})
-        MATCH (callee {key: row.callee_key})
-        MERGE (caller)-[rel:EXACT_CALLS {key: row.callsite_key}]->(callee)
-        SET rel.resolution = row.resolution,
-            rel.line = row.line,
-            rel.column = row.column
-        """,
+        _EXACT_CALL_LINK_QUERY,
         resolved_rows,
         batch_size,
         operation="load exact call traversal projections",
@@ -362,14 +388,7 @@ def load_repository(
 
     batch_count += _write_batched(
         db,
-        """
-        UNWIND $rows AS row
-        MATCH (site:CallSite {key: row.callsite_key})
-        MATCH (callee {key: row.callee_key})
-        MERGE (site)-[rel:RESOLVES_TO {key: row.callsite_key}]->(callee)
-        SET rel.strategy = row.resolution,
-            rel.confidence = 'exact'
-        """,
+        _RESOLVES_TO_LINK_QUERY,
         resolved_rows,
         batch_size,
         operation="link resolved call sites",
@@ -393,15 +412,7 @@ def load_repository(
     )
     batch_count += _write_batched(
         db,
-        """
-        UNWIND $rows AS row
-        MATCH (owner {key: row.owner_key})
-        MATCH (type:Type {key: row.type_key})
-        MERGE (owner)-[rel:CONSTRUCTS {key: row.callsite_key}]->(type)
-        SET rel.resolution = row.resolution,
-            rel.line = row.line,
-            rel.column = row.column
-        """,
+        _CONSTRUCTION_OWNER_LINK_QUERY,
         construction_rows,
         batch_size,
         operation="load construction owner projections",

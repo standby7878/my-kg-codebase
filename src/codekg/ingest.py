@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import io
 import json
 import logging
 import os
@@ -33,7 +34,7 @@ from codekg.search_index import (
     iter_callable_rows,
     validate_search_index_consistency,
 )
-from codekg.sql_config import load_sql_config
+from codekg.sql_config import SqlConfig, load_sql_config
 from codekg.zvec_store import delete_repo, open_write, optimize_and_flush, upsert_symbol_docs
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,8 @@ LANGUAGES_BY_SUFFIX = {
 SKIP_DIRS = {
     ".git",
     ".hg",
+    ".codekg-corpus",
+    ".codekg-worktrees",
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
@@ -783,11 +786,16 @@ def scan_repository(path: Path) -> RepositoryIR:
     return repository
 
 
-def _iter_source_files(root: Path) -> Iterable[Path]:
-    config = load_sql_config(root)
-    suffixes = LANGUAGES_BY_SUFFIX if config.enabled else {".py"}
+def _iter_source_files(root: Path, *, sql_config: SqlConfig | None = None) -> Iterable[Path]:
+    config = sql_config if sql_config is not None else load_sql_config(root)
+    # SQL templates need to pass discovery before include/exclude matching.
+    # Other .in files are never treated as SQL.
+    suffixes = {".py", ".sql", ".in"} if config.enabled else {".py"}
     for path in _iter_files(root, suffixes):
-        if path.suffix.lower() == ".py" or config.matches(path.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        if path.suffix.lower() == ".py" or (
+            relative.lower().endswith((".sql", ".sql.in")) and config.matches(relative)
+        ):
             yield path
 
 
@@ -795,10 +803,12 @@ def iter_markdown_files(root: Path) -> Iterable[Path]:
     yield from _iter_files(root, {".md"})
 
 
-def try_scan_file(root: Path, path: Path) -> FileIR | None:
+def try_scan_file(root: Path, path: Path, *, sql_config: SqlConfig | None = None) -> FileIR | None:
     """Parse one source file, returning None when the path is not readable."""
     try:
-        return _scan_file(root, path)
+        if sql_config is None:
+            return _scan_file(root, path)
+        return _scan_file(root, path, sql_config=sql_config)
     except OSError as error:
         _log_scan_skip("scan_skip_file", path.relative_to(root).as_posix(), error)
         return None
@@ -846,14 +856,30 @@ def _log_scan_skip(event: str, path: str, error: OSError) -> None:
     debug_event(logger, event, path=path, error=str(error))
 
 
-def _scan_file(root: Path, path: Path) -> FileIR:
+def _scan_file(root: Path, path: Path, *, sql_config: SqlConfig | None = None) -> FileIR:
+    return _scan_file_bytes(root, path, path.read_bytes(), sql_config=sql_config)
+
+
+def scan_file_bytes(
+    root: Path, path: Path, raw: bytes, *, sql_config: SqlConfig | None = None
+) -> FileIR:
+    """Parse one already-bounded source buffer (used by corpus staging)."""
+    return _scan_file_bytes(root, path, raw, sql_config=sql_config)
+
+
+def _scan_file_bytes(
+    root: Path, path: Path, raw: bytes, *, sql_config: SqlConfig | None = None
+) -> FileIR:
     started = time.perf_counter()
     rel_path = path.relative_to(root).as_posix()
-    language = LANGUAGES_BY_SUFFIX[path.suffix.lower()]
+    language = (
+        "sql" if rel_path.lower().endswith(".sql.in") else LANGUAGES_BY_SUFFIX[path.suffix.lower()]
+    )
     if language == "sql":
         from codekg.sql_parser import parse_sql
 
-        file = parse_sql(path.read_bytes(), context=rel_path, config=load_sql_config(root))
+        config = sql_config if sql_config is not None else load_sql_config(root)
+        file = parse_sql(raw, context=rel_path, config=config)
         debug_event(
             logger,
             "scan_file",
@@ -867,15 +893,14 @@ def _scan_file(root: Path, path: Path) -> FileIR:
         return file
     module_qname = _module_qname(rel_path, repository_name=root.name)
     if language != "python":
-        text = path.read_text(encoding="utf-8", errors="replace")
+        text = raw.decode("utf-8", errors="replace")
         loc = text.count("\n") + int(bool(text) and not text.endswith("\n"))
         return FileIR(path=rel_path, language=language, loc=loc, module_qname=module_qname)
 
     try:
-        with tokenize.open(path) as source_file:
-            text = source_file.read()
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+        text = raw.decode(encoding)
     except (LookupError, SyntaxError, UnicodeError) as error:
-        raw = path.read_bytes()
         loc = _raw_line_count(raw)
         diagnostic = _source_read_diagnostic(error)
         debug_event(
@@ -1353,9 +1378,9 @@ def _content_hash(root: Path) -> str:
     return digest.hexdigest()[:12]
 
 
-def _sql_config_identity(root: Path) -> bytes:
+def _sql_config_identity(root: Path, *, sql_config: SqlConfig | None = None) -> bytes:
     """Include validated SQL semantics without changing disabled legacy hashes."""
-    config = load_sql_config(root)
+    config = sql_config if sql_config is not None else load_sql_config(root)
     if not config.enabled:
         return b""
     return (

@@ -33,4 +33,6 @@ def configure_logging() -> None:
 def debug_event(logger: logging.Logger, event: str, /, **fields: Any) -> None:
     """Emit structured lifecycle telemetry; callers must pass aggregate-safe fields only."""
 
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
     logger.debug("codekg_%s %s", event, json.dumps(fields, sort_keys=True, default=str))

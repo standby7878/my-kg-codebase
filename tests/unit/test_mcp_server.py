@@ -12,11 +12,12 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.mark.asyncio
-async def test_mcp_registers_fourteen_tools() -> None:
+async def test_mcp_registers_nineteen_tools() -> None:
     tools = await mcp.get_tools()
 
-    assert len(tools) == 14
+    assert len(tools) == 19
     assert sorted(tools) == [
+        "compare_corpus_snapshots",
         "find_callees",
         "find_callers",
         "find_dead_code",
@@ -25,12 +26,16 @@ async def test_mcp_registers_fourteen_tools() -> None:
         "get_class_hierarchy",
         "get_complexity",
         "get_definition",
+        "get_dependency_evidence",
         "get_sql_in_file",
         "get_sql_object",
+        "list_corpus_snapshots",
         "list_repositories",
+        "search_corpus_symbols",
         "search_sql_objects",
         "search_symbols",
         "trace_call_path",
+        "trace_corpus_path",
     ]
     assert all(tool.description for tool in tools.values())
     assert "line bounds" in tools["get_definition"].description.lower()
@@ -252,13 +257,16 @@ async def test_list_repositories_uses_structured_rows_and_hides_storage_root(
         ]
     }
     text = result.content[0].text
-    assert text.startswith("Found 1 indexed repository.")
-    assert "requests @ f361ead047be (37 files)" in text
+    assert text.startswith("1 repository")
+    assert "requests@f361ead0 37 files" in text
+    assert "f361ead047be" not in text
     assert "/repos/requests" not in text
     assert text != json.dumps(result.structured_content)
-    assert server._wrapped_list_result("list_repositories", [{}, {}, {}, {}, {}]).content[
-        0
-    ].text.startswith("Found 5 indexed repositories.")
+    assert (
+        server._wrapped_list_result("list_repositories", [{}, {}, {}, {}, {}])
+        .content[0]
+        .text.startswith("5 repositories")
+    )
 
 
 @pytest.mark.asyncio
@@ -293,7 +301,7 @@ async def test_definition_normalizes_only_file_and_preserves_stable_row_fields(
 
     assert normalized == {**row, "file": "src/requests/sessions.py", "symbol_id": row["key"]}
     text = result.content[0].text
-    assert text.startswith("Found 1 definition record.")
+    assert text.startswith("1 definition")
     assert "src.requests.sessions.Session.prepare_request" in text
     assert "src/requests/sessions.py:511" in text
     assert json.dumps(normalized) not in text
@@ -331,7 +339,7 @@ async def test_relationship_rows_use_symbol_identity_to_normalize_paths_and_fail
     assert result.structured_content == {
         "result": [{**caller, "file": "caller.py", "symbol_id": caller["key"]}],
     }
-    assert "caller (caller.py:1)" in result.content[0].text
+    assert "caller caller.py:1" in result.content[0].text
     monkeypatch.setattr(
         server,
         "query_list_repositories",
@@ -492,7 +500,8 @@ async def test_find_callers_empty_result_includes_callback_hint(
     )
 
     text = result.content[0].text
-    assert text.startswith("Found 0 callers for demo@abc:pkg.py:demo.PGService.callback:9.")
+    assert text.startswith("Found 0 callers for demo.PGService.callback (demo@abc).")
+    assert "demo@abc:pkg.py" not in text
     assert "callback" in text.lower()
     assert "list_repositories" in text
 
@@ -518,8 +527,52 @@ def test_wrapped_list_result_includes_bounded_previews() -> None:
 
     assert result.structured_content["result"][0]["symbol_id"] == rows[0]["key"]
     text = result.content[0].text
-    assert "demo.fn_one (a.py:1) [heuristic]" in text
-    assert "demo.fn_two (b.py:2)" in text
+    assert "demo.fn_one a.py:1 [heuristic]" in text
+    assert "demo.fn_two b.py:2" in text
+
+
+def test_mcp_text_is_bounded_and_keeps_opaque_ids_structured_only() -> None:
+    opaque_key = "secret-repo@0123456789abcdef:src/pkg.py:pkg.secret:44"
+    rows = [
+        {
+            "key": opaque_key,
+            "symbol_id": opaque_key,
+            "qname": "pkg.visible_name",
+            "file": "src/pkg.py",
+            "start_line": 44,
+            "resolution": "heuristic",
+            "description": "x" * 10000,
+        }
+        for _ in range(30)
+    ]
+
+    result = server._wrapped_list_result("find_callers", rows, subject=opaque_key)
+    text = result.content[0].text
+
+    assert len(text.encode("utf-8")) <= server._SUMMARY_TEXT_BUDGET_BYTES
+    assert "pkg.visible_name" in text
+    assert "src/pkg.py:44" in text
+    assert "[heuristic]" in text
+    assert "0123456789abcdef" not in text
+    assert "secret-repo@01234567" in text
+    assert opaque_key == result.structured_content["result"][0]["symbol_id"]
+    assert "and 25 more" in text
+
+
+def test_preview_does_not_fall_back_to_raw_backend_keys() -> None:
+    secret_key = "demo@0123456789abcdef:src/mod.py:pkg.fn:1"
+
+    text = (
+        server._wrapped_list_result(
+            "trace_call_path",
+            [{"path": [{"key": secret_key}], "depth": 1}],
+        )
+        .content[0]
+        .text
+    )
+
+    assert "demo@0123456789abcdef" not in text
+    assert "src/mod.py:pkg.fn:1" not in text
 
 
 def test_path_normalization_rejects_ambiguous_snapshot_roots(

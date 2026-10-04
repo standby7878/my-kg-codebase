@@ -116,6 +116,9 @@ class ResolverIndex:
     def base_state(self, type_qname: str) -> BaseState:
         raise NotImplementedError
 
+    def module_owner(self, language: str, module_qname: str) -> str | None:
+        raise NotImplementedError
+
 
 class InMemoryResolverIndex(ResolverIndex):
     """Legacy resolver data with the lookup contract used by bulk export."""
@@ -136,6 +139,9 @@ class InMemoryResolverIndex(ResolverIndex):
         self._types = _group_by_qname(types)
         self._files = {file.path: file for file in repo.files}
         self._base_states = _base_states_from_files(repo.files, self)
+        self._module_owners: dict[tuple[str, str], str] = {}
+        for file in sorted(repo.files, key=lambda item: item.path):
+            self._module_owners.setdefault((file.language, file.module_qname), file.path)
 
     def owners(self, path: str, qname: str) -> tuple[SymbolRef, ...]:
         return self._owners.get((path, qname), ())
@@ -155,6 +161,9 @@ class InMemoryResolverIndex(ResolverIndex):
     def base_state(self, type_qname: str) -> BaseState:
         return self._base_states.get(type_qname, BaseState())
 
+    def module_owner(self, language: str, module_qname: str) -> str | None:
+        return self._module_owners.get((language, module_qname))
+
 
 class SqliteResolverIndex(ResolverIndex):
     """Read-only lookup backend for the sharded export resolver registry."""
@@ -165,6 +174,13 @@ class SqliteResolverIndex(ResolverIndex):
 
     def close(self) -> None:
         self.connection.close()
+
+    def module_owner(self, language: str, module_qname: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT owner_path FROM module_owners WHERE language=? AND module_qname=?",
+            (language, module_qname),
+        ).fetchone()
+        return str(row[0]) if row is not None else None
 
     def owners(self, path: str, qname: str) -> tuple[SymbolRef, ...]:
         # Module initializers are not in symbols, so callers add their local
@@ -191,8 +207,7 @@ class SqliteResolverIndex(ResolverIndex):
 
     def file(self, path: str) -> FileIR | None:
         row = self.connection.execute(
-            "SELECT path, language, loc, module_qname, parse_status "
-            "FROM files WHERE path = ?",
+            "SELECT path, language, loc, module_qname, parse_status FROM files WHERE path = ?",
             (path,),
         ).fetchone()
         if row is None:
@@ -239,12 +254,11 @@ class SqliteResolverIndex(ResolverIndex):
             file = self.file(str(path))
             assert file is not None
             candidates = _inheritance_candidates(
-                str(base_name), str(base_qname) if base_qname is not None else None,
+                str(base_name),
+                str(base_qname) if base_qname is not None else None,
                 _import_bindings(file),
             )
-            parent_refs = {
-                ref.key: ref for qname in candidates for ref in self.types(qname)
-            }
+            parent_refs = {ref.key: ref for qname in candidates for ref in self.types(qname)}
             if len(parent_refs) != 1:
                 return BaseState(incomplete=True)
             bases.append(next(iter(parent_refs.values())).qname)
@@ -279,9 +293,9 @@ def resolve_call_sites(
     resolver = _Resolver(
         InMemoryResolverIndex(
             repo,
-        owners_by_file_qname=owners_by_file_qname,
-        callables=callables,
-        types=types,
+            owners_by_file_qname=owners_by_file_qname,
+            callables=callables,
+            types=types,
         ),
     )
     return tuple(resolver.resolve(file, call) for file in repo.files for call in file.calls)
@@ -539,9 +553,7 @@ class _Resolver:
         return CallResolution(call, file.path, owner.key, "unresolved", ())
 
     def _type_candidates(self, qnames: Iterable[str]) -> tuple[SymbolRef, ...]:
-        candidates = {
-            ref.key: ref for qname in qnames for ref in self.index.types(qname)
-        }
+        candidates = {ref.key: ref for qname in qnames for ref in self.index.types(qname)}
         return tuple(sorted(candidates.values(), key=lambda ref: ref.key))
 
     def _initializer_for_type(
@@ -660,9 +672,7 @@ class _Resolver:
         return root in _import_bindings(file)
 
     def _callable_candidates(self, qnames: Iterable[str]) -> tuple[SymbolRef, ...]:
-        candidates = {
-            ref.key: ref for qname in qnames for ref in self.index.callables(qname)
-        }
+        candidates = {ref.key: ref for qname in qnames for ref in self.index.callables(qname)}
         return tuple(candidates[key] for key in sorted(candidates))
 
     def _methods_for_type(self, type_qname: str, method_name: str | None) -> tuple[SymbolRef, ...]:
@@ -726,9 +736,7 @@ def _base_states_from_files(files: Iterable[FileIR], index: ResolverIndex) -> di
             candidate_qnames = _inheritance_candidates(
                 inheritance.base_name, inheritance.base_qname, bindings
             )
-            parent_refs = {
-                ref.key: ref for qname in candidate_qnames for ref in index.types(qname)
-            }
+            parent_refs = {ref.key: ref for qname in candidate_qnames for ref in index.types(qname)}
             if len(parent_refs) != 1:
                 incomplete.add(inheritance.type_qname)
                 continue
@@ -736,8 +744,7 @@ def _base_states_from_files(files: Iterable[FileIR], index: ResolverIndex) -> di
                 next(iter(parent_refs.values())).qname
             )
     return {
-        qname: BaseState(tuple(values), qname in incomplete)
-        for qname, values in bases.items()
+        qname: BaseState(tuple(values), qname in incomplete) for qname, values in bases.items()
     } | {qname: BaseState((), True) for qname in incomplete if qname not in bases}
 
 

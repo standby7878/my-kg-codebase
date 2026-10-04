@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from codekg.bulk_spool import create_spool, iter_spool_files
+from codekg.bulk_projection import project_repository
+from codekg.bulk_spool import build_registry, create_spool, iter_spool_files
 from codekg.ir import (
     CallIR,
     FileIR,
@@ -14,10 +15,106 @@ from codekg.ir import (
     LocalBindingIR,
     ModuleInitIR,
     ParseDiagnosticIR,
+    RepositoryIR,
     SymbolIR,
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_import_owner_lookup_uses_covering_index(tmp_path: Path) -> None:
+    spool = tmp_path / "spool.sqlite"
+    registry = tmp_path / "registry.sqlite"
+    create_spool(
+        spool,
+        (
+            FileIR(
+                path="app.py",
+                language="python",
+                loc=1,
+                module_qname="app",
+                imports=(ImportIR("pkg", "helper"),),
+            ),
+        ),
+    )
+    build_registry(registry, (spool,), repo_prefix="app@revision")
+    with sqlite3.connect(registry) as connection:
+        plan = connection.execute(
+            "EXPLAIN QUERY PLAN SELECT path FROM imports WHERE module=? ORDER BY path LIMIT 1",
+            ("pkg",),
+        ).fetchall()
+    details = " ".join(row[3] for row in plan)
+    assert "COVERING INDEX imports_module_path_idx" in details
+    assert "SCAN" not in details and "TEMP B-TREE" not in details
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_module_owner_index_deduplicates_python_package_collision_across_spools(
+    tmp_path: Path, workers: int
+) -> None:
+    files = (
+        FileIR(
+            path="utils/docs/ci_status.py",
+            language="python",
+            loc=4,
+            module_qname="utils.docs.ci_status",
+            module_init=ModuleInitIR("utils.docs.ci_status.__module__", 1, 4),
+            symbols=(
+                SymbolIR("function", "from_file", "utils.docs.ci_status.from_file", "()", 1, 2, 1),
+            ),
+        ),
+        FileIR(
+            path="utils/docs/ci_status/__init__.py",
+            language="python",
+            loc=5,
+            module_qname="utils.docs.ci_status",
+            module_init=ModuleInitIR("utils.docs.ci_status.__module__", 1, 5),
+            symbols=(
+                SymbolIR(
+                    "function",
+                    "from_package",
+                    "utils.docs.ci_status.from_package",
+                    "()",
+                    1,
+                    2,
+                    1,
+                ),
+            ),
+        ),
+    )
+    spools = []
+    for index, file in enumerate(files):
+        path = tmp_path / f"spool-{index}.sqlite"
+        create_spool(path, (file,))
+        spools.append(path)
+    registry = tmp_path / "registry.sqlite"
+    build_registry(registry, spools, repo_prefix="postgis@revision")
+    with sqlite3.connect(registry) as connection:
+        owner = connection.execute(
+            "SELECT owner_path FROM module_owners WHERE language=? AND module_qname=?",
+            ("python", "utils.docs.ci_status"),
+        ).fetchone()
+        plan = connection.execute(
+            "EXPLAIN QUERY PLAN SELECT owner_path FROM module_owners "
+            "WHERE language=? AND module_qname=?",
+            ("python", "utils.docs.ci_status"),
+        ).fetchall()
+    assert owner == ("utils/docs/ci_status.py",)
+    assert "SEARCH module_owners USING INDEX" in " ".join(row[3] for row in plan)
+
+    output = tmp_path / f"projection-{workers}"
+    result = project_repository(
+        RepositoryIR(repo_name="postgis", commit="revision", root_path="."),
+        spools,
+        registry,
+        output,
+        workers=workers,
+    )
+    assert result.counts["nodes_Module"] == 1
+    assert result.counts["relationships_DEFINES"] == 2
+    assert result.counts["nodes_Function"] == 2
+    assert result.counts["nodes_ModuleInit"] == 2
+    assert len(result.node_files["Module"].read_text(encoding="utf-8").splitlines()) == 1
 
 
 def test_spool_round_trip_preserves_complete_file_ir(tmp_path: Path) -> None:
