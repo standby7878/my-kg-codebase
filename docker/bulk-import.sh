@@ -8,6 +8,20 @@ set -- neo4j-admin database import full neo4j --id-type=string --multiline-field
 
 test -f /import/manifest.json
 
+# Keep the shell importer aligned with codekg.bulk_import.build_import_command:
+# generated CSV can contain large multiline bodies, so never pass an unbounded
+# value from a manifest to neo4j-admin.
+max_csv_field_size_bytes=$(jq -er '
+    (if has("max_csv_field_size_bytes") then .max_csv_field_size_bytes else 0 end) as $n |
+    if ($n | type) == "number" and $n == ($n | floor) and
+       $n >= 0 and $n <= 134221824
+    then $n else error("invalid max_csv_field_size_bytes") end
+' /import/manifest.json)
+if [ "$max_csv_field_size_bytes" -gt 4194304 ]; then
+    read_buffer_size=$((max_csv_field_size_bytes + 65536))
+    set -- "$@" "--read-buffer-size=$read_buffer_size"
+fi
+
 append_groups() {
     group_kind=$1
     option=$2

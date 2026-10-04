@@ -1,5 +1,8 @@
 # CodeKG
 
+See [Rebuilding a local CodeKG graph](docs/rebuilding-kg.md) for rebuilding
+from local application, PostgreSQL, and extension source checkouts.
+
 CodeKG builds a local Neo4j knowledge graph from Python repositories and exposes
 read-only code queries through an MCP server. It also creates a local lexical
 description index for functions and methods, implemented with zvec full-text
