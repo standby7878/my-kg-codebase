@@ -37,6 +37,8 @@ class Neo4jClient:
         password: str | None = None,
         database: str | None = None,
         transaction_timeout_seconds: float | None = None,
+        connection_timeout_seconds: float | None = None,
+        max_transaction_retry_time_seconds: float | None = None,
     ) -> None:
         self.uri = uri or os.getenv("NEO4J_URI", DEFAULT_URI)
         self.username = username or os.getenv("NEO4J_USERNAME", DEFAULT_USERNAME)
@@ -49,7 +51,19 @@ class Neo4jClient:
         )
         if not self.password:
             raise CodeKGNeo4jError("NEO4J_PASSWORD must be set")
-        self._driver = GraphDatabase.driver(self.uri, auth=(self.username, self.password))
+        driver_options = {}
+        if connection_timeout_seconds is not None:
+            if connection_timeout_seconds <= 0:
+                raise ValueError("connection timeout must be positive")
+            driver_options["connection_timeout"] = connection_timeout_seconds
+            driver_options["connection_acquisition_timeout"] = connection_timeout_seconds
+        if max_transaction_retry_time_seconds is not None:
+            if max_transaction_retry_time_seconds < 0:
+                raise ValueError("transaction retry timeout must be non-negative")
+            driver_options["max_transaction_retry_time"] = max_transaction_retry_time_seconds
+        self._driver = GraphDatabase.driver(
+            self.uri, auth=(self.username, self.password), **driver_options
+        )
         debug_event(
             logger,
             "neo4j_client_created",

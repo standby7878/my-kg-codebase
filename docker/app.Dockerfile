@@ -6,6 +6,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Corpus revision identities use the source checkout's exact Git commit when
+# mounted repositories are available; fall back to content identity otherwise.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml code-kg-mcp-plan.md ./
 COPY src ./src
 COPY third_party/wheels ./third_party/wheels

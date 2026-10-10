@@ -225,11 +225,25 @@ def create_native_registry(path: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_evidence_owner
             ON evidence(snapshot_alias,path,json_extract(fact,'$.origin'),
                         json_extract(fact,'$.owner_qname'),json_extract(fact,'$.owner_line'));
+        CREATE INDEX IF NOT EXISTS idx_evidence_sql_name
+            ON evidence(snapshot_alias,json_extract(fact,'$.object_name'),
+                        json_extract(fact,'$.origin'));
+        CREATE INDEX IF NOT EXISTS idx_evidence_sql_schema_name
+            ON evidence(snapshot_alias,json_extract(fact,'$.schema_name'),
+                        json_extract(fact,'$.object_name'),json_extract(fact,'$.origin'));
+        CREATE INDEX IF NOT EXISTS idx_evidence_reverse_name_schema
+            ON evidence(json_extract(fact,'$.object_name'),json_extract(fact,'$.schema_name'),
+                        snapshot_alias,path,ordinal);
+        CREATE INDEX IF NOT EXISTS idx_evidence_owner_qname
+            ON evidence(json_extract(fact,'$.owner_qname'),snapshot_alias,path,ordinal);
+        CREATE INDEX IF NOT EXISTS idx_evidence_owner_path
+            ON evidence(path,snapshot_alias,ordinal);
         CREATE INDEX IF NOT EXISTS idx_symbols_owner
             ON symbols(snapshot_alias,path,json_extract(fact,'$.name'),
                        json_extract(fact,'$.start_line'));
         CREATE INDEX IF NOT EXISTS idx_python_owners_scope
             ON python_owners(snapshot_alias,path,start_line,qname);
+        CREATE INDEX IF NOT EXISTS idx_python_owners_key ON python_owners(key);
         CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_key,kind,status);
         CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_key,kind,status);
         CREATE INDEX IF NOT EXISTS idx_fact_keys_occurrence

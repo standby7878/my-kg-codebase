@@ -1,7 +1,12 @@
 # CodeKG
 
-See [Rebuilding a local CodeKG graph](docs/rebuilding-kg.md) for rebuilding
-from local application, PostgreSQL, and extension source checkouts.
+See [Independent graph generations](docs/independent-graph-operations.md) for
+separate application and PostgreSQL/extensions KGs behind one MCP. The
+[refactoring plan](docs/version-scoped-kg-refactoring-plan.md) explains the design.
+The [legacy rebuild](docs/rebuilding-kg.md) still replaces a single dev-local graph.
+
+See the [live two-KG validation report](docs/federated-kg-demo.md) for the PG18,
+pg_cron/PostGIS, and Django/Patroni build results and demonstrated MCP queries.
 
 CodeKG builds a local Neo4j knowledge graph from Python repositories and exposes
 read-only code queries through an MCP server. It also creates a local lexical

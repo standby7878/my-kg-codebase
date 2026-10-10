@@ -9,15 +9,21 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.mark.asyncio
-async def test_mcp_registers_fourteen_tools_including_sql() -> None:
+async def test_mcp_registers_twenty_five_tools_including_sql_and_federation() -> None:
     tools = await mcp.get_tools()
 
-    assert len(tools) == 19
+    assert len(tools) == 25
     assert {
         "search_sql_objects",
         "get_sql_object",
         "find_sql_usages",
         "get_sql_in_file",
+        "list_knowledge_graphs",
+        "list_database_intents",
+        "resolve_database_intent",
+        "trace_application_database_path",
+        "find_application_database_usages",
+        "compare_knowledge_graphs",
     } <= set(tools)
 
 

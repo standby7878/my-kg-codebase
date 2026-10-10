@@ -43,7 +43,13 @@ class ProjectionValidator:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(self.path)
-        self.connection.execute("PRAGMA journal_mode=DELETE")
+        # This database is a private, rebuildable validation scratch file, not
+        # the durable serving corpus. Avoid one fsync per small batch commit.
+        self.connection.execute("PRAGMA journal_mode=OFF")
+        self.connection.execute("PRAGMA synchronous=OFF")
+        self.connection.execute("PRAGMA cache_size=-8192")
+        # Keep SQLite's temporary sort structures disk-backed and bounded.
+        self.connection.execute("PRAGMA temp_store=FILE")
         self.connection.executescript(
             """
             CREATE TABLE nodes (key TEXT PRIMARY KEY, label TEXT NOT NULL);
@@ -58,6 +64,7 @@ class ProjectionValidator:
             """
         )
         self._pending_writes = 0
+        self._closed = False
         self.connection.commit()
 
     def _flush_if_needed(self) -> None:
@@ -116,6 +123,8 @@ class ProjectionValidator:
         return True
 
     def close(self, *, validate_endpoints: bool = True) -> None:
+        if self._closed:
+            return
         try:
             self.connection.commit()
             self._pending_writes = 0
@@ -133,8 +142,21 @@ class ProjectionValidator:
                 raise ValueError(
                     f"dangling {missing[0]} relationship endpoint: {missing[1]} -> {missing[2]}"
                 )
+        except Exception:
+            self.connection.close()
+            _remove_validation_scratch(self.path)
+            raise
         finally:
             self.connection.close()
+            self._closed = True
+
+    def abort(self) -> None:
+        """Close and discard this private validation scratch after a failed build."""
+        if not self._closed:
+            with suppress(sqlite3.Error):
+                self.connection.close()
+            self._closed = True
+        _remove_validation_scratch(self.path)
 
     @classmethod
     def merge(cls, destination: Path, sources: Iterable[Path]) -> None:
@@ -175,7 +197,7 @@ class ProjectionValidator:
                 validator._pending_writes = 0
             validator.close()
         except Exception:
-            validator.connection.close()
+            validator.abort()
             raise
 
 
@@ -336,6 +358,8 @@ def project_partition(
         validator.connection.commit()
     except Exception:
         writer.close()
+        if owns_validator:
+            validator.abort()
         raise
     finally:
         if owns_registry:
@@ -366,6 +390,7 @@ def project_repository(
     catalog_path = output_dir / ".building" / "projection-catalog.sqlite"
     catalog_path.parent.mkdir(parents=True, exist_ok=True)
     catalog = sqlite3.connect(catalog_path)
+    validation_paths: list[Path] = []
     try:
         catalog.execute(
             "CREATE TABLE spools (ordinal INTEGER PRIMARY KEY, path TEXT NOT NULL, part INTEGER)"
@@ -381,6 +406,10 @@ def project_repository(
         catalog.execute("UPDATE spools SET part = ordinal % ?", (partition_count,))
         catalog.commit()
         catalog.close()
+        validation_paths = [
+            output_dir / ".building" / f"projection-validation-{partition:06d}.sqlite"
+            for partition in range(partition_count)
+        ]
 
         pending = set()
         results: dict[int, dict[str, Any]] = {}
@@ -405,10 +434,6 @@ def project_repository(
                 result = completed.result()
                 results[result["partition"]] = result
 
-        validation_paths = [
-            output_dir / ".building" / f"projection-validation-{partition:06d}.sqlite"
-            for partition in range(partition_count)
-        ]
         ProjectionValidator.merge(output_dir / ".projection-validation.sqlite", validation_paths)
         counts: dict[str, int] = {}
         max_csv_field_size = 0
@@ -422,6 +447,9 @@ def project_repository(
                 {(node, kind, partition): path for (node, kind), path in result["files"].items()}
             )
     except Exception:
+        for path in validation_paths:
+            _remove_validation_scratch(path)
+        _remove_validation_scratch(output_dir / ".projection-validation.sqlite")
         raise
     finally:
         with suppress(sqlite3.ProgrammingError):
@@ -811,6 +839,12 @@ def _increment(counts: dict[str, int], key: str) -> None:
     counts[key] = counts.get(key, 0) + 1
     total = "nodes" if key.startswith("nodes_") else "relationships"
     counts[total] = counts.get(total, 0) + 1
+
+
+def _remove_validation_scratch(path: Path) -> None:
+    """Remove a failed disposable validator and any SQLite sidecar files."""
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        Path(f"{path}{suffix}").unlink(missing_ok=True)
 
 
 def _publish_projection(

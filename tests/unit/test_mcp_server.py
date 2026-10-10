@@ -12,16 +12,18 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.mark.asyncio
-async def test_mcp_registers_nineteen_tools() -> None:
+async def test_mcp_registers_twenty_five_tools_including_federation() -> None:
     tools = await mcp.get_tools()
 
-    assert len(tools) == 19
-    assert sorted(tools) == [
+    assert len(tools) == 25
+    assert set(tools) == {
         "compare_corpus_snapshots",
+        "compare_knowledge_graphs",
         "find_callees",
         "find_callers",
         "find_dead_code",
         "find_importers",
+        "find_application_database_usages",
         "find_sql_usages",
         "get_class_hierarchy",
         "get_complexity",
@@ -29,14 +31,18 @@ async def test_mcp_registers_nineteen_tools() -> None:
         "get_dependency_evidence",
         "get_sql_in_file",
         "get_sql_object",
+        "list_database_intents",
+        "list_knowledge_graphs",
         "list_corpus_snapshots",
         "list_repositories",
         "search_corpus_symbols",
         "search_sql_objects",
         "search_symbols",
+        "resolve_database_intent",
+        "trace_application_database_path",
         "trace_call_path",
         "trace_corpus_path",
-    ]
+    }
     assert all(tool.description for tool in tools.values())
     assert "line bounds" in tools["get_definition"].description.lower()
     assert "static callers" in tools["find_callers"].description.lower()
@@ -48,11 +54,35 @@ async def test_mcp_registers_nineteen_tools() -> None:
         "search_sql_objects",
         "get_sql_object",
         "get_sql_in_file",
+        "compare_knowledge_graphs",
+        "find_application_database_usages",
+        "list_database_intents",
+        "list_knowledge_graphs",
+        "resolve_database_intent",
+        "trace_application_database_path",
     }
     assert tools["search_symbols"].output_schema is None
     assert tools["search_sql_objects"].output_schema is None
     assert tools["get_sql_object"].output_schema is None
     assert tools["get_sql_in_file"].output_schema is None
+    for name in (
+        "compare_knowledge_graphs",
+        "find_application_database_usages",
+        "list_database_intents",
+        "list_knowledge_graphs",
+        "resolve_database_intent",
+        "trace_application_database_path",
+    ):
+        assert tools[name].output_schema is None
+    assert {"left_graph_id", "right_graph_id", "left_alias", "right_alias"} <= set(
+        tools["compare_knowledge_graphs"].parameters["properties"]
+    )
+    assert {"context_id", "evidence_ref"} <= set(
+        tools["resolve_database_intent"].parameters["properties"]
+    )
+    assert {"context_id", "entry_ref", "target_ref"} <= set(
+        tools["trace_application_database_path"].parameters["properties"]
+    )
     assert all(
         tools[name].output_schema == server._WRAPPED_LIST_OUTPUT_SCHEMA
         for name in wrapped_list_tools
@@ -460,6 +490,54 @@ async def test_path_normalization_supports_windows_paths_and_search_results(
     assert "\\" not in hit["file"]
     assert hit["symbol_id"] == response["results"][0]["symbol_id"]
     assert result.structured_content["next_cursor"] == "stable-cursor"
+
+
+@pytest.mark.asyncio
+async def test_search_cursor_is_bound_to_selected_graph_generation(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("CODEKG_GRAPH_REGISTRY", "/fixture/registry.toml")
+    selected = SimpleNamespace(
+        graph_id="app-a", generation_id="app-a:g1", spec=SimpleNamespace(kind="application")
+    )
+    current = {"handle": selected}
+    monkeypatch.setattr(server.graph_federation, "handle", lambda _graph_id=None: current["handle"])
+    monkeypatch.setattr(server, "_application_backend", lambda _graph_id=None: (object(), None))
+    monkeypatch.setattr(
+        server,
+        "_graph_metadata",
+        lambda graph_id, _kind: {
+            "graph_id": graph_id or current["handle"].graph_id,
+            "generation_id": current["handle"].generation_id,
+        },
+    )
+    seen = []
+
+    def discover(**kwargs):
+        seen.append(kwargs["cursor"])
+        return {
+            "status": "ok",
+            "repository": "repo",
+            "commit": "c1",
+            "results": [],
+            "next_cursor": "raw-offset" if kwargs["cursor"] is None else None,
+        }
+
+    monkeypatch.setattr(server, "query_discover_symbols", discover)
+    tool = (await mcp.get_tools())["search_symbols"]
+    first = await tool.run({"query": "q", "graph_id": "app-a"})
+    envelope = first.structured_content["next_cursor"]
+    assert envelope.startswith("ck1.")
+    second = await tool.run({"query": "q", "graph_id": "app-a", "cursor": envelope})
+    assert second.structured_content["status"] == "ok"
+    assert seen == [None, "raw-offset"]
+
+    current["handle"] = SimpleNamespace(
+        graph_id="app-b", generation_id="app-b:g1", spec=SimpleNamespace(kind="application")
+    )
+    rejected = await tool.run({"query": "q", "graph_id": "app-b", "cursor": envelope})
+    assert rejected.structured_content["status"] == "invalid_cursor"
+    assert seen == [None, "raw-offset"]
 
 
 @pytest.mark.parametrize(

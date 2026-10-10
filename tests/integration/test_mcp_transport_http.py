@@ -47,6 +47,14 @@ WRAPPED_LIST_TOOLS = {
 }
 STRUCTURED_DISCOVERY_TOOLS = {"search_symbols", "search_sql_objects"}
 STRUCTURED_DETAIL_TOOLS = {"get_sql_object", "get_sql_in_file"}
+STRUCTURED_FEDERATION_TOOLS = {
+    "list_knowledge_graphs",
+    "list_database_intents",
+    "resolve_database_intent",
+    "trace_application_database_path",
+    "find_application_database_usages",
+    "compare_knowledge_graphs",
+}
 REPOSITORY = "requests"
 COMMIT = "f361ead047be"
 CALLER_ID = (
@@ -327,13 +335,18 @@ async def test_http_mcp_transport_supports_protocol_client_session(
 
         tools = await asyncio.wait_for(list_tools_when_ready(), timeout=65)
         assert tools
-        assert {
-            tool.name for tool in tools
-        } == WRAPPED_LIST_TOOLS | STRUCTURED_DISCOVERY_TOOLS | STRUCTURED_DETAIL_TOOLS
+        assert {tool.name for tool in tools} == (
+            WRAPPED_LIST_TOOLS
+            | STRUCTURED_DISCOVERY_TOOLS
+            | STRUCTURED_DETAIL_TOOLS
+            | STRUCTURED_FEDERATION_TOOLS
+        )
         for tool in tools:
             if tool.name in WRAPPED_LIST_TOOLS:
                 assert tool.outputSchema == WRAPPED_LIST_OUTPUT_SCHEMA
-            elif tool.name in STRUCTURED_DISCOVERY_TOOLS | STRUCTURED_DETAIL_TOOLS:
+            elif tool.name in (
+                STRUCTURED_DISCOVERY_TOOLS | STRUCTURED_DETAIL_TOOLS | STRUCTURED_FEDERATION_TOOLS
+            ):
                 assert tool.outputSchema is None
             else:
                 raise AssertionError(f"unexpected tool {tool.name}")
@@ -347,6 +360,27 @@ async def test_http_mcp_transport_supports_protocol_client_session(
             "benchmarks",
             "all",
         ]
+        federation_tools = {
+            tool.name: tool for tool in tools if tool.name in STRUCTURED_FEDERATION_TOOLS
+        }
+        assert {"graph_id"} <= federation_tools["list_database_intents"].inputSchema[
+            "properties"
+        ].keys()
+        assert {
+            "context_id",
+            "evidence_ref",
+        } <= federation_tools["resolve_database_intent"].inputSchema["properties"].keys()
+        assert {
+            "context_id",
+            "entry_ref",
+            "target_ref",
+        } <= federation_tools["trace_application_database_path"].inputSchema["properties"].keys()
+        assert {
+            "left_graph_id",
+            "right_graph_id",
+            "left_alias",
+            "right_alias",
+        } <= federation_tools["compare_knowledge_graphs"].inputSchema["properties"].keys()
         _seed_transport_graph(command, env)
 
         async with fastmcp.Client(f"http://127.0.0.1:{port}/mcp") as client:

@@ -1,12 +1,17 @@
 # Rebuild the local knowledge graph
 
-| Goal | Command |
-| --- | --- |
-| Fast aiven-core only (~13 min) | `bash scripts/rebuild-core-fast.sh` |
-| Full corpus (PG + extensions) | `bash scripts/rebuild-corpus-full.sh --dry-run` then `--yes` |
+For independently refreshed application and PostgreSQL/extensions KGs, use
+[Independent graph generations](independent-graph-operations.md). Each KG has
+its own Neo4j Community instance; one MCP composes cross-KG evidence on demand.
+Candidate publication preserves existing graphs and supports rollback.
 
-Operator spec (approaches, PG versions, extensions): [`kg-build-approaches-spec.md`](kg-build-approaches-spec.md).  
-Details for the full corpus path: [`building-aiven-postgres-kg.md`](building-aiven-postgres-kg.md).
+## Legacy single-graph rebuild
+
+The command below is retained for the original single-graph dev-local workflow.
+It duplicates applications across PostgreSQL contexts and is not the independent
+KG build path. The previous references to `scripts/rebuild-core-fast.sh`,
+`scripts/rebuild-corpus-full.sh`, and their operator specifications were removed
+because those files are not present in this repository.
 
 `rebuild-kg.sh` replaces **only the dev-local Docker Compose stack** and its
 graph, search, log, and staging volumes. It ingests local Git checkouts into one

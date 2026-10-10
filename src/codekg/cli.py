@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import resource
 import time
 from pathlib import Path
@@ -12,6 +13,8 @@ from rich.console import Console
 from codekg.logging_config import configure_logging, debug_event
 
 app = typer.Typer(help="Operate the offline code knowledge graph.")
+graph_app = typer.Typer(help="Prepare, validate, and activate isolated graph generations.")
+app.add_typer(graph_app, name="graph")
 console = Console()
 logger = logging.getLogger(__name__)
 
@@ -347,3 +350,122 @@ def corpus_evidence(
 
     for row in evidence(manifest, key, direction=direction, limit=limit):
         console.print(row)
+
+
+@graph_app.command("freeze")
+def graph_freeze(source_manifest: Path, generation_manifest: Path) -> None:
+    """Freeze a bulk corpus manifest and rebase all generation artifact paths."""
+    from codekg.graph_artifacts import freeze_generation_manifest
+
+    try:
+        path = freeze_generation_manifest(source_manifest, generation_manifest)
+    except (OSError, ValueError, FileExistsError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print({"generation_manifest": str(path)})
+
+
+@graph_app.command("check")
+def graph_check(
+    registry: Annotated[Path | None, typer.Option("--registry")] = None,
+    backend: Annotated[
+        bool, typer.Option("--backend", help="Verify each exact Neo4j marker.")
+    ] = False,
+) -> None:
+    """Validate registry generations and optionally their live Neo4j backends."""
+    from codekg.graph_lifecycle import check_graph_registry
+    from codekg.graph_registry import GraphRegistry
+
+    try:
+        result = check_graph_registry(GraphRegistry.load(registry), include_backends=backend)
+    except Exception as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(result)
+
+
+@graph_app.command("prepare")
+def graph_prepare(
+    graph_id: str,
+    env_file: Annotated[
+        Path, typer.Option("--env-file", help="External Neo4j env file; never printed.")
+    ] = ...,
+    registry: Annotated[Path | None, typer.Option("--registry")] = None,
+    network: Annotated[str, typer.Option("--network")] = "codekg-graphs",
+    import_memory: Annotated[str, typer.Option("--import-memory")] = "2G",
+    heap_max: Annotated[str, typer.Option("--heap-max")] = "1G",
+    pagecache: Annotated[str, typer.Option("--pagecache")] = "2G",
+    http_port: Annotated[int | None, typer.Option("--http-port", min=1, max=65535)] = None,
+    bolt_port: Annotated[int | None, typer.Option("--bolt-port", min=1, max=65535)] = None,
+) -> None:
+    """Start a new isolated Neo4j Community candidate without activating it."""
+    from codekg.graph_lifecycle import GraphLifecycleError, prepare_graph_candidate
+    from codekg.graph_registry import GraphRegistry
+
+    try:
+        candidate = prepare_graph_candidate(
+            GraphRegistry.load(registry),
+            graph_id,
+            env_file=env_file,
+            network=network,
+            import_memory=import_memory,
+            heap_max=heap_max,
+            pagecache=pagecache,
+            http_port=http_port,
+            bolt_port=bolt_port,
+        )
+    except (GraphLifecycleError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(candidate)
+
+
+@graph_app.command("bootstrap")
+def graph_bootstrap(
+    graph_id: str,
+    registry: Annotated[Path | None, typer.Option("--registry")] = None,
+) -> None:
+    """Apply Neo4j schema and the exact generation marker to one graph."""
+    from codekg.graph_lifecycle import GraphLifecycleError, bootstrap_graph
+    from codekg.graph_registry import GraphRegistry, GraphRegistryError
+
+    try:
+        result = bootstrap_graph(GraphRegistry.load(registry), graph_id)
+    except (GraphLifecycleError, GraphRegistryError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    except Exception as exc:
+        raise typer.BadParameter(f"graph bootstrap failed ({type(exc).__name__})") from None
+    console.print(result)
+
+
+@graph_app.command("activate")
+def graph_activate(
+    candidate_registry: Path,
+    active_registry: Annotated[Path | None, typer.Option("--active")] = None,
+) -> None:
+    """Validate backends and atomically activate a sibling registry candidate."""
+    from codekg.graph_lifecycle import activate_registry
+
+    try:
+        active_registry = active_registry or Path(
+            os.environ.get("CODEKG_GRAPH_REGISTRY", "codekg-graphs.toml")
+        )
+        result = activate_registry(candidate_registry, active_registry)
+    except Exception as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(result)
+
+
+@graph_app.command("rollback")
+def graph_rollback(
+    active_registry: Annotated[Path | None, typer.Option("--active")] = None,
+    previous_registry: Annotated[Path | None, typer.Option("--previous")] = None,
+) -> None:
+    """Validate and restore the previous registry; MCP restart remains explicit."""
+    from codekg.graph_lifecycle import rollback_registry
+
+    try:
+        active_registry = active_registry or Path(
+            os.environ.get("CODEKG_GRAPH_REGISTRY", "codekg-graphs.toml")
+        )
+        result = rollback_registry(active_registry, previous_path=previous_registry)
+    except Exception as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(result)

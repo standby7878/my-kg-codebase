@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import time
+from contextvars import ContextVar
 from enum import StrEnum
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Annotated, Any, Literal
@@ -12,6 +14,7 @@ from fastmcp import FastMCP
 from fastmcp.tools.tool import ToolResult
 from pydantic import Field
 
+from codekg import federation as graph_federation
 from codekg.logging_config import configure_logging, debug_event
 from codekg.queries.code import discover_symbols as query_discover_symbols
 from codekg.queries.code import (
@@ -91,6 +94,93 @@ class SearchScope(StrEnum):
 
 
 logger = logging.getLogger(__name__)
+_REQUEST_GRAPH_METADATA: ContextVar[dict[str, str] | None] = ContextVar(
+    "codekg_request_graph_metadata", default=None
+)
+
+
+def _pack_cursor(purpose: str, payload: dict[str, Any]) -> str:
+    raw = json.dumps({"v": 1, "purpose": purpose, **payload}, separators=(",", ":")).encode()
+    return "ck1." + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _unpack_cursor(token: str, purpose: str) -> dict[str, Any]:
+    if not isinstance(token, str) or not token.startswith("ck1.") or len(token) > 8192:
+        raise ValueError("invalid or stale continuation cursor")
+    try:
+        raw = token[4:]
+        data = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+    except Exception:
+        raise ValueError("invalid or stale continuation cursor") from None
+    if not isinstance(data, dict) or data.get("v") != 1 or data.get("purpose") != purpose:
+        raise ValueError("invalid or stale continuation cursor")
+    return data
+
+
+def _application_backend(graph_id: str | None = None):
+    """Select an application client without touching the process-wide singleton."""
+    if graph_id is None and not os.environ.get("CODEKG_GRAPH_REGISTRY"):
+        _REQUEST_GRAPH_METADATA.set({})
+        return None, None
+    selected = graph_federation.handle(graph_id)
+    if selected.spec.kind != "application":
+        raise ValueError("Python and SQL tools require an application graph")
+    selected.verify_generation()
+    _REQUEST_GRAPH_METADATA.set(_graph_metadata(selected.graph_id, "application"))
+    return selected.client, str(selected.zvec_path) if selected.zvec_path else None
+
+
+def _sql_backend(graph_id: str | None = None):
+    """SQL-object tools default to the app graph but may inspect an explicit DB graph."""
+    if graph_id is None or not os.environ.get("CODEKG_GRAPH_REGISTRY"):
+        return _application_backend(graph_id)[0]
+    selected = graph_federation.handle(graph_id)
+    selected.verify_generation()
+    _REQUEST_GRAPH_METADATA.set(_graph_metadata(selected.graph_id, selected.spec.kind))
+    return selected.client
+
+
+def _database_backend(graph_id: str | None = None):
+    if graph_id is None and not os.environ.get("CODEKG_GRAPH_REGISTRY"):
+        _REQUEST_GRAPH_METADATA.set({})
+        return None
+    if graph_id is None:
+        registry = graph_federation.registry()
+        databases = [item.id for item in registry.graphs.values() if item.kind == "database"]
+        if len(databases) != 1:
+            raise ValueError("graph_id is required when multiple database graphs are registered")
+        graph_id = databases[0]
+    selected = graph_federation.handle(graph_id)
+    if selected.spec.kind != "database":
+        raise ValueError("corpus tools require a database graph")
+    selected.verify_generation()
+    _REQUEST_GRAPH_METADATA.set(_graph_metadata(selected.graph_id, "database"))
+    return selected.client
+
+
+def _backend_kwargs(client, **extra):
+    """Keep registry-less calls byte-for-byte compatible with direct query mocks."""
+    values = {key: value for key, value in extra.items() if value is not None}
+    if client is not None:
+        values["client"] = client
+    return values
+
+
+def _graph_metadata(graph_id: str | None, kind: str) -> dict[str, str]:
+    if not os.environ.get("CODEKG_GRAPH_REGISTRY"):
+        return {}
+    registry = graph_federation.registry()
+    selected_id = graph_id
+    if selected_id is None and kind == "application":
+        selected_id = registry.default_application_graph
+    if selected_id is None:
+        matches = [item.id for item in registry.graphs.values() if item.kind == kind]
+        if len(matches) != 1:
+            raise ValueError(f"graph_id is required when multiple {kind} graphs are registered")
+        selected_id = matches[0]
+    selected = graph_federation.handle(selected_id)
+    return {"graph_id": selected.graph_id, "generation_id": selected.generation_id}
+
 
 _WRAPPED_LIST_OUTPUT_SCHEMA = {
     "description": "Generic wrapper for non-object return types.",
@@ -135,6 +225,15 @@ they are not vulnerability verdicts. Other PL bodies have explicit limited cover
 
 Static call edges may be heuristic; resolution=heuristic is approximate. Zero callers/callees
 or no trace path does not exclude callbacks, dynamic dispatch, or runtime wiring.
+
+Federated workflow (when a graph registry is configured): list_knowledge_graphs →
+list_database_intents → resolve_database_intent → trace_application_database_path or
+find_application_database_usages. EntityRefs include graph_id, generation_id, and local_key;
+use exact refs from discovery results. Python tools default to the selected application graph;
+SQL-object tools default there too, but accept graph_id to inspect a database graph. Database
+corpus tools require an explicit selector when multiple database graphs are registered. Search
+cursors are graph/generation-bound. Do not query across graphs with ad hoc Cypher; use the
+federation tools and an explicit context. Registry activation requires an MCP process restart.
 """
 
 mcp = FastMCP(
@@ -151,9 +250,10 @@ mcp = FastMCP(
     ),
     output_schema=_WRAPPED_LIST_OUTPUT_SCHEMA,
 )
-def list_repositories() -> ToolResult:
-    rows = _normalize_public_rows(query_list_repositories())
-    return _wrapped_list_result("list_repositories", rows)
+def list_repositories(graph_id: str | None = None) -> ToolResult:
+    client, _ = _application_backend(graph_id)
+    rows = _normalize_public_rows(query_list_repositories(**_backend_kwargs(client)))
+    return _wrapped_list_result("list_repositories", rows, graph_id=graph_id)
 
 
 @mcp.tool(
@@ -207,13 +307,34 @@ def search_symbols(
         Field(
             description=(
                 "Opaque next_cursor; reuse only with the same repository, commit, query, "
-                "mode, kind, and scope."
+                "mode, kind, scope, graph, and generation."
             )
         ),
     ] = None,
+    graph_id: str | None = None,
 ) -> ToolResult:
     """Return canonical structured discovery data plus a deliberately small text summary."""
     started = time.perf_counter()
+    client, zvec_path = _application_backend(graph_id)
+    selected = (
+        graph_federation.handle(graph_id) if os.environ.get("CODEKG_GRAPH_REGISTRY") else None
+    )
+    query_cursor = cursor
+    if selected is not None and cursor is not None:
+        try:
+            envelope = _unpack_cursor(cursor, "symbol-search")
+            if (
+                envelope.get("graph_id") != selected.graph_id
+                or envelope.get("generation_id") != selected.generation_id
+                or not isinstance(envelope.get("cursor"), str)
+            ):
+                raise ValueError("invalid or stale continuation cursor")
+            query_cursor = envelope["cursor"]
+        except ValueError as exc:
+            return ToolResult(
+                content=str(exc),
+                structured_content={"status": "invalid_cursor", "results": []},
+            )
     response = dict(
         query_discover_symbols(
             repository=repository,
@@ -223,9 +344,20 @@ def search_symbols(
             mode=mode,
             scope=scope.value,
             limit=limit,
-            cursor=cursor,
+            cursor=query_cursor,
+            **_backend_kwargs(client, zvec_path=zvec_path),
         )
     )
+    response.update(_graph_metadata(graph_id, "application"))
+    if selected is not None and response.get("next_cursor"):
+        response["next_cursor"] = _pack_cursor(
+            "symbol-search",
+            {
+                "graph_id": selected.graph_id,
+                "generation_id": selected.generation_id,
+                "cursor": response["next_cursor"],
+            },
+        )
     # Query diagnostics remain available to direct callers and internal logging,
     # but discovery's public MCP response is intentionally selection-focused.
     diagnostics = response.pop("diagnostics", {})
@@ -359,6 +491,8 @@ def _wrapped_list_result(
     *,
     subject: str | None = None,
     empty_hint: str | None = None,
+    graph_id: str | None = None,
+    graph_kind: str = "application",
 ) -> ToolResult:
     """Keep MCP list output structured while including compact previews in text."""
     public_rows = _with_symbol_ids(rows)
@@ -381,7 +515,10 @@ def _wrapped_list_result(
         tool_name=tool_name,
         empty_hint=empty_hint if count == 0 else None,
     )
-    structured_content = {"result": public_rows}
+    metadata = _graph_metadata(graph_id, graph_kind) if graph_id is not None else {}
+    if not metadata:
+        metadata = _REQUEST_GRAPH_METADATA.get() or {}
+    structured_content = {"result": public_rows, **metadata}
     logger.info(
         "codekg_%s %s",
         tool_name,
@@ -679,10 +816,14 @@ def get_definition(
         Field(description="Required for qualified-name or suffix lookup."),
     ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client, _ = _application_backend(graph_id)
     return _wrapped_list_result(
         "get_definition",
-        _normalize_public_rows(query_get_definition(identifier, repo=repository, commit=commit)),
+        _normalize_public_rows(
+            query_get_definition(identifier, repo=repository, commit=commit, client=client)
+        ),
     )
 
 
@@ -712,10 +853,14 @@ def find_callers(
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS traversal depth.")] = 1,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client, _ = _application_backend(graph_id)
     repository_hint, commit_hint = _symbol_identity_hints(identifier, repository, commit)
     rows = _normalize_public_rows(
-        query_find_callers(identifier, repo=repository, commit=commit, depth=depth, limit=limit),
+        query_find_callers(
+            identifier, repo=repository, commit=commit, depth=depth, limit=limit, client=client
+        ),
         repository_hint=repository_hint,
         commit_hint=commit_hint,
     )
@@ -753,10 +898,14 @@ def find_callees(
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS traversal depth.")] = 1,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client, _ = _application_backend(graph_id)
     repository_hint, commit_hint = _symbol_identity_hints(identifier, repository, commit)
     rows = _normalize_public_rows(
-        query_find_callees(identifier, repo=repository, commit=commit, depth=depth, limit=limit),
+        query_find_callees(
+            identifier, repo=repository, commit=commit, depth=depth, limit=limit, client=client
+        ),
         repository_hint=repository_hint,
         commit_hint=commit_hint,
     )
@@ -801,7 +950,9 @@ def trace_call_path(
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     max_depth: Annotated[int, Field(ge=1, le=10, description="Maximum CALLS path depth.")] = 8,
     limit: Annotated[int, Field(ge=1, le=10, description="Maximum paths to return.")] = 5,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client, _ = _application_backend(graph_id)
     return _wrapped_list_result(
         "trace_call_path",
         _normalize_public_rows(
@@ -812,6 +963,7 @@ def trace_call_path(
                 commit=commit,
                 max_depth=max_depth,
                 limit=limit,
+                client=client,
             )
         ),
     )
@@ -836,11 +988,15 @@ def find_importers(
     ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 100,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client, _ = _application_backend(graph_id)
     return _wrapped_list_result(
         "find_importers",
         _normalize_public_rows(
-            query_find_importers(module_identifier, repo=repository, commit=commit, limit=limit)
+            query_find_importers(
+                module_identifier, repo=repository, commit=commit, limit=limit, client=client
+            )
         ),
     )
 
@@ -874,7 +1030,9 @@ def get_class_hierarchy(
     ] = "ancestors",
     depth: Annotated[int, Field(ge=1, le=10, description="Maximum hierarchy depth.")] = 5,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client, _ = _application_backend(graph_id)
     return _wrapped_list_result(
         "get_class_hierarchy",
         _normalize_public_rows(
@@ -885,6 +1043,7 @@ def get_class_hierarchy(
                 direction=direction,
                 depth=depth,
                 limit=limit,
+                client=client,
             )
         ),
     )
@@ -902,11 +1061,13 @@ def find_dead_code(
     repository: Annotated[str, Field(description="Repository name.")],
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 100,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client, _ = _application_backend(graph_id)
     return _wrapped_list_result(
         "find_dead_code",
         _normalize_public_rows(
-            query_find_dead_code(repository, commit=commit, limit=limit),
+            query_find_dead_code(repository, commit=commit, limit=limit, client=client),
             repository_hint=repository,
             commit_hint=commit,
         ),
@@ -945,7 +1106,9 @@ def search_sql_objects(
     limit: Annotated[
         int, Field(ge=1, le=20, description="Maximum compact SQL object candidates to return.")
     ] = 5,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client = _sql_backend(graph_id)
     response = dict(
         query_search_sql_objects(
             query,
@@ -955,8 +1118,10 @@ def search_sql_objects(
             kind=kind,
             commit=commit,
             limit=limit,
+            client=client,
         )
     )
+    response.update(_REQUEST_GRAPH_METADATA.get() or {})
     results = response.get("results")
     if isinstance(results, list) and all(isinstance(row, dict) for row in results):
         response["results"] = _normalize_public_rows(
@@ -989,15 +1154,19 @@ def get_sql_object(
         ),
     ] = None,
     commit: Annotated[str | None, Field(description="Optional indexed commit filter.")] = None,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client = _sql_backend(graph_id)
     response = dict(
         query_get_sql_object(
             identifier,
             repository=repository,
             database=database,
             commit=commit,
+            client=client,
         )
     )
+    response.update(_REQUEST_GRAPH_METADATA.get() or {})
     definitions = response.get("definitions")
     if isinstance(definitions, list) and all(isinstance(row, dict) for row in definitions):
         response["definitions"] = _normalize_public_rows(
@@ -1053,7 +1222,9 @@ def find_sql_usages(
         ),
     ] = "exact",
     limit: Annotated[int, Field(ge=1, le=500, description="Maximum rows to return.")] = 50,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client = _sql_backend(graph_id)
     rows = query_find_sql_usages(
         identifier,
         repository=repository,
@@ -1062,6 +1233,7 @@ def find_sql_usages(
         role=role,
         resolution=resolution,
         limit=limit,
+        client=client,
     )
     repository_hint = rows[0].get("repo") if rows else repository
     commit_hint = rows[0].get("commit") if rows else commit
@@ -1093,7 +1265,9 @@ def get_sql_in_file(
         int,
         Field(ge=1, le=500, description="Maximum rows per returned collection (artifacts, etc.)."),
     ] = 100,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client = _sql_backend(graph_id)
     response = dict(
         query_get_sql_in_file(
             file,
@@ -1101,8 +1275,10 @@ def get_sql_in_file(
             commit=commit,
             include_text=include_text,
             limit=limit,
+            client=client,
         )
     )
+    response.update(_REQUEST_GRAPH_METADATA.get() or {})
     text = _sql_file_summary(response)
     return ToolResult(content=text, structured_content=response)
 
@@ -1185,11 +1361,15 @@ def get_complexity(
         int | None,
         Field(ge=1, le=500, description="Top-N ranking when identifier is omitted."),
     ] = 25,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client, _ = _application_backend(graph_id)
     return _wrapped_list_result(
         "get_complexity",
         _normalize_public_rows(
-            query_get_complexity(identifier, repo=repository, commit=commit, top_n=top_n),
+            query_get_complexity(
+                identifier, repo=repository, commit=commit, top_n=top_n, client=client
+            ),
             repository_hint=repository,
             commit_hint=commit,
         ),
@@ -1203,9 +1383,12 @@ def get_complexity(
 def list_corpus_snapshots(
     limit: Annotated[int, Field(ge=1, le=100)] = 100,
     offset: Annotated[int, Field(ge=0, le=10_000)] = 0,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client = _database_backend(graph_id)
     return _wrapped_list_result(
-        "list_corpus_snapshots", query_list_corpus_snapshots(limit=limit, offset=offset)
+        "list_corpus_snapshots",
+        query_list_corpus_snapshots(limit=limit, offset=offset, client=client),
     )
 
 
@@ -1222,11 +1405,18 @@ def search_corpus_symbols(
     kind: Literal["native", "routine", "all"] = "all",
     limit: Annotated[int, Field(ge=1, le=100)] = 20,
     offset: Annotated[int, Field(ge=0, le=10_000)] = 0,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client = _database_backend(graph_id)
     return _wrapped_list_result(
         "search_corpus_symbols",
         query_search_corpus_symbols(
-            query, snapshot_alias=snapshot_alias, kind=kind, limit=limit, offset=offset
+            query,
+            snapshot_alias=snapshot_alias,
+            kind=kind,
+            limit=limit,
+            offset=offset,
+            client=client,
         ),
     )
 
@@ -1243,10 +1433,14 @@ def get_dependency_evidence(
     direction: Literal["outgoing", "incoming"] = "incoming",
     limit: Annotated[int, Field(ge=1, le=100)] = 50,
     offset: Annotated[int, Field(ge=0, le=10_000)] = 0,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client = _database_backend(graph_id)
     return _wrapped_list_result(
         "get_dependency_evidence",
-        query_get_dependency_evidence(key, direction=direction, limit=limit, offset=offset),
+        query_get_dependency_evidence(
+            key, direction=direction, limit=limit, offset=offset, client=client
+        ),
     )
 
 
@@ -1263,10 +1457,12 @@ def trace_corpus_path(
     to_key: str,
     max_depth: Annotated[int, Field(ge=1, le=8)] = 6,
     limit: Annotated[int, Field(ge=1, le=10)] = 5,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client = _database_backend(graph_id)
     return _wrapped_list_result(
         "trace_corpus_path",
-        query_trace_corpus_path(from_key, to_key, max_depth=max_depth, limit=limit),
+        query_trace_corpus_path(from_key, to_key, max_depth=max_depth, limit=limit, client=client),
     )
 
 
@@ -1284,10 +1480,220 @@ def compare_corpus_snapshots(
     right_alias: str,
     limit: Annotated[int, Field(ge=1, le=100)] = 100,
     offset: Annotated[int, Field(ge=0, le=10_000)] = 0,
+    graph_id: str | None = None,
 ) -> ToolResult:
+    client = _database_backend(graph_id)
     return _wrapped_list_result(
         "compare_corpus_snapshots",
-        query_compare_corpus_snapshots(left_alias, right_alias, limit=limit, offset=offset),
+        query_compare_corpus_snapshots(
+            left_alias, right_alias, limit=limit, offset=offset, client=client
+        ),
+    )
+
+
+def _federated_result(name: str, response: dict[str, Any]) -> ToolResult:
+    """Preserve complete structured federation results with a compact text preview."""
+    payload = json.dumps(response, ensure_ascii=False, separators=(",", ":"), default=str)
+    if len(payload.encode("utf-8")) > 64 * 1024:
+        response = {
+            "status": "result_too_large",
+            "truncated": True,
+            "reason": "response_bytes_limit",
+            "message": "structured result exceeded 64 KiB",
+        }
+    return ToolResult(
+        content=f"{name}: {response.get('status', 'ok')}", structured_content=response
+    )
+
+
+@mcp.tool(
+    description=(
+        "Discover registered application/database graphs, immutable generations, "
+        "and bridge contexts."
+    )
+)
+def list_knowledge_graphs() -> ToolResult:
+    try:
+        return _federated_result("list_knowledge_graphs", graph_federation.list_knowledge_graphs())
+    except Exception as exc:
+        return _federated_result(
+            "list_knowledge_graphs", {"status": "registry_error", "message": str(exc)}
+        )
+
+
+@mcp.tool(
+    description=(
+        "Page SQL/database boundary evidence from the selected application graph by owner "
+        "path, owner name, or exact evidence key."
+    )
+)
+def list_database_intents(
+    owner_path: str | None = None,
+    owner_qname: str | None = None,
+    evidence_key: str | None = None,
+    graph_id: str | None = None,
+    after_key: Annotated[
+        str | None,
+        Field(description="Continuation token from this selector and application generation."),
+    ] = None,
+    limit: Annotated[int, Field(ge=1, le=1000)] = 100,
+) -> ToolResult:
+    try:
+        selector = (
+            graph_federation.handle(graph_id) if os.environ.get("CODEKG_GRAPH_REGISTRY") else None
+        )
+        selected_after = after_key
+        if selector is not None and after_key is not None:
+            token = _unpack_cursor(after_key, "database-intents")
+            if (
+                token.get("graph_id") != selector.graph_id
+                or token.get("generation_id") != selector.generation_id
+                or token.get("owner_path") != owner_path
+                or token.get("owner_qname") != owner_qname
+                or token.get("evidence_key") != evidence_key
+            ):
+                raise ValueError("invalid or stale continuation cursor")
+            selected_after = token.get("after_key")
+        result = graph_federation.list_database_intents(
+            graph_id=graph_id,
+            owner_path=owner_path,
+            owner_qname=owner_qname,
+            evidence_key=evidence_key,
+            after_key=selected_after,
+            limit=limit,
+        )
+        if selector is not None and result.get("continuation"):
+            result["continuation"] = _pack_cursor(
+                "database-intents",
+                {
+                    "graph_id": selector.graph_id,
+                    "generation_id": selector.generation_id,
+                    "owner_path": owner_path,
+                    "owner_qname": owner_qname,
+                    "evidence_key": evidence_key,
+                    "after_key": result["continuation"],
+                },
+            )
+    except Exception as exc:
+        result = {"status": "invalid_graph_or_selector", "message": str(exc)}
+    return _federated_result("list_database_intents", result)
+
+
+@mcp.tool(
+    description=(
+        "Resolve one exact generation-scoped application evidence reference under an "
+        "explicit deployment context."
+    )
+)
+def resolve_database_intent(evidence_ref: dict[str, str], context_id: str) -> ToolResult:
+    try:
+        result = graph_federation.resolve_database_intent(evidence_ref, context_id=context_id)
+    except Exception as exc:
+        result = {"status": "invalid_graph_or_context", "message": str(exc)}
+    return _federated_result("resolve_database_intent", result)
+
+
+@mcp.tool(
+    description=(
+        "Compose bounded application evidence and database routine/native paths across one "
+        "explicit context."
+    )
+)
+def trace_application_database_path(
+    context_id: str,
+    evidence_ref: dict[str, str] | None = None,
+    owner_path: str | None = None,
+    owner_qname: str | None = None,
+    entry_ref: dict[str, str] | None = None,
+    target_ref: dict[str, str] | None = None,
+    database_target_key: str | None = None,
+    max_depth: Annotated[int, Field(ge=1, le=32)] = 8,
+    limit: Annotated[int, Field(ge=1, le=5)] = 5,
+) -> ToolResult:
+    try:
+        result = graph_federation.trace_application_database_path(
+            context_id=context_id,
+            evidence_ref=evidence_ref,
+            owner_path=owner_path,
+            owner_qname=owner_qname,
+            entry_ref=entry_ref,
+            target_ref=target_ref,
+            database_target_key=database_target_key,
+            max_depth=max_depth,
+            limit=limit,
+        )
+    except Exception as exc:
+        result = {"status": "invalid_graph_or_context", "message": str(exc)}
+    return _federated_result("trace_application_database_path", result)
+
+
+@mcp.tool(
+    description=(
+        "Find application evidence that may invoke a selected exact routine or native API; "
+        "candidates are forward-resolved under the context."
+    )
+)
+def find_application_database_usages(
+    context_id: str,
+    target_ref: dict[str, str],
+    limit: Annotated[int, Field(ge=1, le=1000)] = 100,
+    max_depth: Annotated[int, Field(ge=1, le=32)] = 8,
+    cursor: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Opaque continuation bound to context, app/database generations, target, and depth."
+            )
+        ),
+    ] = None,
+) -> ToolResult:
+    try:
+        continuation = None
+        if cursor is not None:
+            token = _unpack_cursor(cursor, "database-usages")
+            continuation = token.get("continuation")
+            if not isinstance(continuation, dict):
+                raise ValueError("invalid or stale continuation cursor")
+        result = graph_federation.find_application_database_usages(
+            context_id=context_id,
+            target_ref=target_ref,
+            limit=limit,
+            max_depth=max_depth,
+            continuation=continuation,
+        )
+        if result.get("continuation"):
+            result["continuation"] = _pack_cursor(
+                "database-usages", {"continuation": result["continuation"]}
+            )
+    except Exception as exc:
+        result = {"status": "invalid_graph_or_context", "message": str(exc)}
+    return _federated_result("find_application_database_usages", result)
+
+
+@mcp.tool(
+    description=(
+        "Compare two database graph generations by logical repository using bounded "
+        "source-catalog comparison."
+    )
+)
+def compare_knowledge_graphs(
+    left_graph_id: str,
+    right_graph_id: str,
+    left_alias: str,
+    right_alias: str,
+    limit: Annotated[int, Field(ge=1, le=100)] = 100,
+    offset: Annotated[int, Field(ge=0, le=10000)] = 0,
+) -> ToolResult:
+    return _federated_result(
+        "compare_knowledge_graphs",
+        graph_federation.compare_knowledge_graphs(
+            left_graph_id=left_graph_id,
+            right_graph_id=right_graph_id,
+            left_alias=left_alias,
+            right_alias=right_alias,
+            limit=limit,
+            offset=offset,
+        ),
     )
 
 

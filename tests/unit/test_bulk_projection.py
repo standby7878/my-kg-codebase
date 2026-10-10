@@ -2,15 +2,69 @@ from __future__ import annotations
 
 import csv
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
 
-from codekg.bulk_projection import project_repository
+from codekg.bulk_projection import ProjectionValidator, project_partition, project_repository
 from codekg.bulk_spool import build_registry, create_spool
 from codekg.ir import FileIR, ImportIR, RepositoryIR, SymbolIR
 
 pytestmark = pytest.mark.unit
+
+
+def test_projection_validator_uses_rebuildable_scratch_pragmas(tmp_path: Path) -> None:
+    path = tmp_path / "validator.sqlite"
+    validator = ProjectionValidator(path)
+    assert validator.connection.execute("PRAGMA journal_mode").fetchone()[0] == "off"
+    assert validator.connection.execute("PRAGMA synchronous").fetchone()[0] == 0
+    assert validator.connection.execute("PRAGMA cache_size").fetchone()[0] == -8192
+    validator.node("File", "file-key")
+    validator.relationship("CONTAINS", "contains-key", "repo", "file-key")
+    with pytest.raises(ValueError, match="dangling"):
+        validator.close()
+    assert not path.exists()
+
+
+def test_projection_validator_merge_failure_discards_only_destination_scratch(
+    tmp_path: Path,
+) -> None:
+    sources = []
+    for index in range(2):
+        path = tmp_path / f"source-{index}.sqlite"
+        validator = ProjectionValidator(path)
+        validator.node("Repository", "same-key")
+        validator.close(validate_endpoints=False)
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            validator.connection.execute("SELECT 1")
+        sources.append(path)
+
+    destination = tmp_path / "merged.sqlite"
+    with pytest.raises(ValueError, match="duplicate node key"):
+        ProjectionValidator.merge(destination, sources)
+    assert not destination.exists()
+    assert all(path.exists() for path in sources)
+
+
+def test_partition_error_is_preserved_while_owned_validator_scratch_is_removed(
+    monkeypatch, tmp_path: Path
+) -> None:
+    spool = tmp_path / "one.sqlite"
+    create_spool(spool, [FileIR(path="one.py", language="python", loc=1, module_qname="one")])
+    registry = tmp_path / "registry.sqlite"
+    build_registry(registry, [spool], repo_prefix="repo@abc")
+    output = tmp_path / "projection"
+    scratch = output / ".projection-validation.sqlite"
+
+    def fail_projection(*args, **kwargs):
+        raise RuntimeError("projection sentinel")
+
+    monkeypatch.setattr("codekg.bulk_projection._project_file", fail_projection)
+    with pytest.raises(RuntimeError, match="projection sentinel"):
+        project_partition(RepositoryIR("repo", "abc", "/repo"), [spool], registry, output)
+
+    assert not scratch.exists()
 
 
 def test_projection_writes_header_then_headerless_shard(tmp_path: Path) -> None:
