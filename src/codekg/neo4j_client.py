@@ -39,17 +39,25 @@ class Neo4jClient:
         transaction_timeout_seconds: float | None = None,
         connection_timeout_seconds: float | None = None,
         max_transaction_retry_time_seconds: float | None = None,
+        auth_enabled: bool | None = None,
     ) -> None:
         self.uri = uri or os.getenv("NEO4J_URI", DEFAULT_URI)
         self.username = username or os.getenv("NEO4J_USERNAME", DEFAULT_USERNAME)
-        self.password = password or os.getenv("NEO4J_PASSWORD")
+        if auth_enabled is None:
+            auth_enabled = os.getenv("NEO4J_AUTH", "").strip() != "none"
+        self.auth_enabled = auth_enabled
+        self.password = (
+            (password if password is not None else os.getenv("NEO4J_PASSWORD"))
+            if auth_enabled
+            else None
+        )
         self.database = database or os.getenv("NEO4J_DATABASE", DEFAULT_DATABASE)
         self.transaction_timeout_seconds = (
             transaction_timeout_seconds
             if transaction_timeout_seconds is not None
             else _optional_timeout_from_environment()
         )
-        if not self.password:
+        if auth_enabled and not self.password:
             raise CodeKGNeo4jError("NEO4J_PASSWORD must be set")
         driver_options = {}
         if connection_timeout_seconds is not None:
@@ -61,9 +69,12 @@ class Neo4jClient:
             if max_transaction_retry_time_seconds < 0:
                 raise ValueError("transaction retry timeout must be non-negative")
             driver_options["max_transaction_retry_time"] = max_transaction_retry_time_seconds
-        self._driver = GraphDatabase.driver(
-            self.uri, auth=(self.username, self.password), **driver_options
-        )
+        if auth_enabled:
+            self._driver = GraphDatabase.driver(
+                self.uri, auth=(self.username, self.password), **driver_options
+            )
+        else:
+            self._driver = GraphDatabase.driver(self.uri, **driver_options)
         debug_event(
             logger,
             "neo4j_client_created",

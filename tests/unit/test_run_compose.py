@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -222,3 +223,59 @@ def test_mcp_has_frontend_network_for_loopback_port_publishing() -> None:
     frontend_network = re.search(r"(?ms)^  frontend:\n(?P<config>.*?)(?=^  \S|\Z)", networks_block)
     assert frontend_network is not None
     assert "    internal:" not in frontend_network["config"]
+
+
+def test_compose_propagates_auth_mode_and_healthcheck_branches_without_auth(
+    tmp_path: Path,
+) -> None:
+    compose = COMPOSE_FILE.read_text(encoding="utf-8")
+    services_block = compose.split("\nservices:\n", 1)[1].split("\nnetworks:\n", 1)[0]
+    python_services = ("schema_bootstrap", "ingestion", "bulk-exporter", "mcp")
+
+    for service in python_services:
+        block = re.search(
+            rf"(?ms)^  {re.escape(service)}:\n(.*?)(?=^  [a-z0-9_-]+:\n|\Z)",
+            services_block,
+        )
+        assert block is not None
+        assert "NEO4J_AUTH: ${NEO4J_AUTH:-neo4j/change-me-123}" in block[1]
+        assert "NEO4J_PASSWORD: ${NEO4J_PASSWORD:-change-me-123}" in block[1]
+
+    healthcheck = re.search(r'(?m)^\s+("if \[.*\")\s*,?$', compose)
+    assert healthcheck is not None
+    shell_command = json.loads(healthcheck[1]).replace("$$", "$")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    cypher_shell = fake_bin / "cypher-shell"
+    cypher_shell.write_text('#!/bin/sh\nprintf \'%s\\n\' "$@" > "$CYPHER_ARGS"\n', encoding="utf-8")
+    cypher_shell.chmod(0o755)
+    args_file = tmp_path / "cypher-args"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{fake_bin}:{environment['PATH']}",
+            "CYPHER_ARGS": str(args_file),
+            "NEO4J_AUTH": "none",
+        }
+    )
+    no_auth = subprocess.run(["sh", "-c", shell_command], env=environment, check=False)
+    assert no_auth.returncode == 0
+    assert args_file.read_text(encoding="utf-8").splitlines() == ["RETURN 1"]
+
+    environment.update(
+        {
+            "NEO4J_AUTH": "neo4j/test-password",
+            "NEO4J_USERNAME": "neo4j",
+            "NEO4J_PASSWORD": "test-password",
+        }
+    )
+    authenticated = subprocess.run(["sh", "-c", shell_command], env=environment, check=False)
+    assert authenticated.returncode == 0
+    assert args_file.read_text(encoding="utf-8").splitlines() == [
+        "-u",
+        "neo4j",
+        "-p",
+        "test-password",
+        "RETURN 1",
+    ]

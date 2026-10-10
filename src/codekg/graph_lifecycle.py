@@ -18,7 +18,12 @@ from codekg.csv_limits import (
     validate_csv_field_size,
 )
 from codekg.graph_artifacts import write_generation_marker
-from codekg.graph_registry import GraphRegistry, GraphRegistryError, GraphSpec
+from codekg.graph_registry import (
+    GraphRegistry,
+    GraphRegistryError,
+    GraphSpec,
+    _graph_auth_settings,
+)
 
 NEO4J_COMMUNITY_IMAGE = "neo4j:5.26-community"
 DEFAULT_GRAPH_NETWORK = "codekg-graphs"
@@ -356,13 +361,13 @@ def open_graph_client(spec: GraphSpec):
 
     uri = _required_env(spec.endpoint_env)
     prefix = spec.credential_env_prefix
-    password = _required_env(f"{prefix}_PASSWORD")
-    username = os.environ.get(f"{prefix}_USERNAME", "neo4j")
+    username, password, auth_enabled = _graph_auth_settings(prefix)
     database = os.environ.get(f"{prefix}_DATABASE", "neo4j")
     return Neo4jClient(
         uri=uri,
         username=username,
         password=password,
+        auth_enabled=auth_enabled,
         database=database,
         connection_timeout_seconds=3.0,
         max_transaction_retry_time_seconds=2.0,

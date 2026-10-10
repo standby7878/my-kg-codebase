@@ -113,6 +113,39 @@ view. Export each on its own cadence.
    # Explicitly restart MCP again after rollback.
    ```
 
+### Local no-auth demo
+
+For an isolated local/demo deployment only, Neo4j can run without built-in
+authentication. Set `NEO4J_AUTH=none` in the Docker env file and set each
+graph's credential mode explicitly, for example `CODEKG_APP_NEO4J_AUTH=none`.
+Do not set a password for that graph. The graph-local setting is intentionally
+explicit; an unset `<credential_env_prefix>_AUTH` continues to require that
+graph's `<credential_env_prefix>_PASSWORD`, regardless of the process-wide
+`NEO4J_AUTH` setting.
+
+When switching an existing local demo to no-auth, no graph data rebuild is
+needed. The Python services must use an image containing this auth-mode support;
+rebuild the application image only if the currently installed image predates
+it. Recreate the Neo4j and Python service containers so they receive the new
+auth configuration, while retaining the existing Neo4j data and log volumes.
+With the Neo4j 5.26 image and an existing data volume, add
+`NEO4J_dbms_security_auth__enabled: "false"` to the `neo4j.environment`
+mapping while running this no-auth configuration. Remove that override when
+switching back to authenticated mode; do not add it unconditionally to the
+default Compose service environment.
+For the bundled Compose profile, update `compose/dev-local/env` and run:
+
+```sh
+docker compose --env-file compose/dev-local/env \
+  -f compose/dev-local/docker-compose.yml \
+  up -d --force-recreate neo4j schema_bootstrap ingestion bulk-exporter mcp
+```
+
+This changes container configuration only; do not remove or rename the
+persistent volumes. Custom authenticated Compose setups can keep using the
+default `neo4j/<configured password>` auth fallback. If overriding
+`NEO4J_AUTH`, set a matching `NEO4J_PASSWORD` for the Python services.
+
 `graph check` without `--backend` validates local registry, manifest, SQLite
 revision, role, and context invariants without contacting Neo4j. `graph check
 --backend` additionally checks every configured generation marker. The normal

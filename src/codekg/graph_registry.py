@@ -88,13 +88,13 @@ class GraphHandle:
 
                 uri = _required_env(self.spec.endpoint_env)
                 prefix = self.spec.credential_env_prefix
-                password = _required_env(f"{prefix}_PASSWORD")
-                username = os.environ.get(f"{prefix}_USERNAME", "neo4j")
+                username, password, auth_enabled = _graph_auth_settings(prefix)
                 database = os.environ.get(f"{prefix}_DATABASE", "neo4j")
                 client = Neo4jClient(
                     uri=uri,
                     username=username,
                     password=password,
+                    auth_enabled=auth_enabled,
                     database=database,
                     connection_timeout_seconds=min(2.0, timeout_seconds),
                     max_transaction_retry_time_seconds=0.0,
@@ -505,3 +505,11 @@ def _required_env(name: str) -> str:
     if value is None or not value.strip():
         raise GraphRegistryError(f"required environment variable {name} is not set")
     return value
+
+
+def _graph_auth_settings(prefix: str) -> tuple[str, str | None, bool]:
+    """Read graph-local auth settings; unset AUTH keeps the secure default."""
+    auth_enabled = os.environ.get(f"{prefix}_AUTH", "").strip() != "none"
+    username = os.environ.get(f"{prefix}_USERNAME", "neo4j")
+    password = _required_env(f"{prefix}_PASSWORD") if auth_enabled else None
+    return username, password, auth_enabled

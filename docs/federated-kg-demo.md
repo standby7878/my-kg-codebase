@@ -87,6 +87,22 @@ separate Community instances:
 | Python KG | `codekg-python-47561fe51e0c-63cfaf36` | Bolt `17687`, HTTP `17474` |
 | PG18 KG | `codekg-pg18-fdc8c1f30637-e908ab07` | Bolt `27687`, HTTP `27474` |
 
+### Current local authentication mode
+
+Both demo Neo4j containers now use `NEO4J_AUTH=none` and explicit
+`NEO4J_dbms_security_auth__enabled=false`. The MCP environment sets
+`CODEKG_APP_NEO4J_AUTH=none` and `CODEKG_PG18_NEO4J_AUTH=none`; all three
+containers have no password environment variables. Select **No authentication**
+when connecting in Neo4j Browser. Endpoints, volumes, generation markers, and
+node/relationship counts are unchanged; neither KG was rebuilt.
+
+The switch was verified with unauthenticated Bolt clients, direct lifecycle
+clients, `cypher-shell`, HTTP transaction requests without an Authorization
+header, and all 19 live MCP assertions. The auth change's full unit suite passed
+505 tests, and Sol approved its review. The legacy authenticated Compose path
+also remains supported. See the [no-auth operator recipe](independent-graph-operations.md#local-no-auth-demo)
+for the explicit per-graph mode and how to retain existing volumes.
+
 Runtime manifests, registries, logs, and private env files live under the
 ignored `.codekg-corpus/federated-demo/` directory. Credentials are not tracked.
 The active registry is `config/active.toml`; manifests are frozen `serving.json`
@@ -182,7 +198,8 @@ before/after benchmarks remain the next phases of the design roadmap.
 
 ## Verification
 
-- Full unit suite: 495 tests passed after final changes.
+- Initial federation unit suite: 495 tests passed; the subsequent no-auth
+  update's unit suite passed 505 tests.
 - Actual HTTP MCP protocol integration: 1 test passed.
 - Neo4j corpus/offline-import integration: 3 tests passed, including a measured
   large-field CSV import and live cross-language corpus queries.

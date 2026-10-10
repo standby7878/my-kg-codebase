@@ -81,6 +81,46 @@ def test_handle_revalidates_marker_without_managed_retries(tmp_path, monkeypatch
     assert state["closed"]
 
 
+def test_handle_auth_none_is_graph_local_and_needs_no_password(tmp_path, monkeypatch):
+    _, registry_path = _registry(tmp_path)
+    handle = GraphRegistry.load(registry_path).handle()
+    monkeypatch.setenv("CODEKG_APP_NEO4J_URI", "bolt://example.invalid:7687")
+    monkeypatch.setenv("NEO4J_AUTH", "none")
+    monkeypatch.setenv("NEO4J_PASSWORD", "global-password-must-not-be-used")
+    monkeypatch.setenv("CODEKG_APP_NEO4J_AUTH", "none")
+    monkeypatch.delenv("CODEKG_APP_NEO4J_PASSWORD", raising=False)
+    received = {}
+
+    class Client:
+        def __init__(self, **kwargs):
+            received.update(kwargs)
+
+        def execute_read(self, query, **kwargs):
+            return [{"graph_id": "app", "generation_id": handle.generation_id}]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("codekg.neo4j_client.Neo4jClient", Client)
+    handle.verify_generation()
+
+    assert received["auth_enabled"] is False
+    assert received["password"] is None
+
+
+def test_unset_graph_auth_requires_graph_password_even_if_global_auth_none(tmp_path, monkeypatch):
+    _, registry_path = _registry(tmp_path)
+    handle = GraphRegistry.load(registry_path).handle()
+    monkeypatch.setenv("CODEKG_APP_NEO4J_URI", "bolt://example.invalid:7687")
+    monkeypatch.setenv("NEO4J_AUTH", "none")
+    monkeypatch.setenv("NEO4J_PASSWORD", "global-password-must-not-be-used")
+    monkeypatch.delenv("CODEKG_APP_NEO4J_AUTH", raising=False)
+    monkeypatch.delenv("CODEKG_APP_NEO4J_PASSWORD", raising=False)
+
+    with pytest.raises(GraphRegistryError, match="CODEKG_APP_NEO4J_PASSWORD"):
+        handle.verify_generation()
+
+
 def test_database_can_be_prepared_before_application_registry_exists(tmp_path):
     _, path = _registry(tmp_path, role="postgres")
     path.write_text(

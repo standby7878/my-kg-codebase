@@ -8,6 +8,7 @@ from codekg.graph_lifecycle import (
     GraphLifecycleError,
     _build_generation_import_args,
     activate_registry,
+    open_graph_client,
     prepare_graph_candidate,
     rollback_registry,
 )
@@ -182,6 +183,40 @@ def test_activation_failure_leaves_active_bytes_unchanged_and_success_is_atomic(
     assert (tmp_path / "active.toml.previous").read_bytes() == active_bytes
     assert result["mcp_restart_required"] is True
     assert result["mcp_restart_performed"] is False
+
+
+def test_open_graph_client_supports_graph_local_auth_none(tmp_path, monkeypatch):
+    registry = GraphRegistry.load(_make_registry(tmp_path))
+    monkeypatch.setenv("APP_URI", "bolt://example.invalid:7687")
+    monkeypatch.setenv("NEO4J_AUTH", "none")
+    monkeypatch.setenv("NEO4J_PASSWORD", "global-password-must-not-be-used")
+    monkeypatch.setenv("APP_AUTH", "none")
+    monkeypatch.delenv("APP_PASSWORD", raising=False)
+    received = {}
+
+    class Client:
+        def __init__(self, **kwargs):
+            received.update(kwargs)
+
+    monkeypatch.setattr("codekg.neo4j_client.Neo4jClient", Client)
+    open_graph_client(registry.graphs["app"])
+
+    assert received["auth_enabled"] is False
+    assert received["password"] is None
+
+
+def test_open_graph_client_rejects_missing_graph_password_when_auth_unset(tmp_path, monkeypatch):
+    registry = GraphRegistry.load(_make_registry(tmp_path))
+    monkeypatch.setenv("APP_URI", "bolt://example.invalid:7687")
+    monkeypatch.setenv("NEO4J_AUTH", "none")
+    monkeypatch.setenv("NEO4J_PASSWORD", "global-password-must-not-be-used")
+    monkeypatch.delenv("APP_AUTH", raising=False)
+    monkeypatch.delenv("APP_PASSWORD", raising=False)
+
+    from codekg.graph_registry import GraphRegistryError
+
+    with pytest.raises(GraphRegistryError, match="APP_PASSWORD"):
+        open_graph_client(registry.graphs["app"])
 
 
 def test_rollback_validates_before_replacing_current_active(tmp_path):
