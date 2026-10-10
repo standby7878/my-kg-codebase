@@ -8,6 +8,10 @@ The [legacy rebuild](docs/rebuilding-kg.md) still replaces a single dev-local gr
 See the [live two-KG validation report](docs/federated-kg-demo.md) for the PG18,
 pg_cron/PostGIS, and Django/Patroni build results and demonstrated MCP queries.
 
+For the graph model and language boundaries, see the
+[model overview](docs/kg-model-overview.md) and
+[detailed model specification](docs/kg-model-detailed-spec.md).
+
 CodeKG builds a local Neo4j knowledge graph from Python repositories and exposes
 read-only code queries through an MCP server. It also creates a local lexical
 description index for functions and methods, implemented with zvec full-text
