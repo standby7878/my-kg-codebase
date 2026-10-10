@@ -185,6 +185,12 @@ def test_find_sql_usages_exact_edges_only_by_default() -> None:
     assert "sql-object-reference-usages" not in client.calls[-1][0]
 
 
+@pytest.mark.parametrize("path", ["../secrets.sql", "/tmp/x.sql", "a\\..\\x.sql", ""])
+def test_get_sql_in_file_rejects_unsafe_paths(path: str) -> None:
+    with pytest.raises(ValueError):
+        get_sql_in_file(path, repository="demo", client=FakeClient())  # type: ignore[arg-type]
+
+
 def test_get_sql_in_file_returns_structured_sections() -> None:
     client = FakeClient(
         {

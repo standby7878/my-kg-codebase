@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Literal
 
 from codekg.neo4j_client import Neo4jClient, get_client
@@ -272,9 +273,7 @@ def get_sql_in_file(
 ) -> dict[str, object]:
     """Return SQL artifacts, statements, and references for one indexed file."""
 
-    normalized_file = file.strip().replace("\\", "/")
-    if not normalized_file:
-        raise ValueError("file must be a non-empty repository-relative path")
+    normalized_file = _validate_repository_relative_path(file)
 
     db = client or get_client()
     context = _resolve_repository_context(db, repository, commit)
@@ -545,6 +544,21 @@ def _require_repo_for_qualified_name(identifier: str, repo: str | None) -> None:
             f"Qualified SQL name {identifier!r} requires an explicit repository; "
             "use an exact object_key or provide repository."
         )
+
+
+def _validate_repository_relative_path(value: str) -> str:
+    normalized = value.strip().replace("\\", "/")
+    if not normalized:
+        raise ValueError("file must be a non-empty repository-relative path")
+    if (
+        PurePosixPath(normalized).is_absolute()
+        or PureWindowsPath(value).is_absolute()
+        or value.startswith("\\")
+    ):
+        raise ValueError("file must be a repository-relative path")
+    if ".." in PurePosixPath(normalized).parts:
+        raise ValueError("Cannot safely normalize an indexed file path containing traversal.")
+    return normalized
 
 
 def _repository_snapshots(db: Neo4jClient) -> list[dict[str, object]]:

@@ -78,7 +78,7 @@ for role in "${roles[@]}"; do
     [[ "$role" != postgres ]] || ((pg_count+=1))
     [[ "$role" != application ]] || ((app_count+=1))
 done
-((pg_count && app_count)) || die 'provide at least one --application and --postgres'
+((pg_count)) || die 'provide at least one --postgres'
 
 # Validate aliases that will be synthesized for each PostgreSQL context before
 # crossing the destructive Compose boundary.
@@ -121,6 +121,18 @@ for ((i=0; i<${#aliases[@]}; i++)); do
     mounts+=(-v "$source:/repos/${aliases[i]}:ro")
 done
 
+# Temporary export perf: skip generated monorepo SQL and other non-source trees.
+emit_snapshot_sql_config() {
+    echo '[snapshots.sql]'
+    echo 'enabled = true'
+    echo 'include = ["**/*.sql", "**/*.sql.in"]'
+    echo 'exclude = ['
+    echo '  "**/pg-extensions-catalog-generator/scratch/**",'
+    echo '  "**/node_modules/**",'
+    echo '  "**/deps-upstream/**",'
+    echo ']'
+}
+
 snapshot() {
     local alias="$1" logical="$2" version="$3" role="$4" source_alias="$5" deps="$6"
     {
@@ -131,10 +143,8 @@ snapshot() {
         printf 'role = '; toml_string "$role"; echo
         printf 'path = '; toml_string "/repos/$source_alias"; echo
         [[ -z "$deps" ]] || printf 'dependencies = [%s]\n' "$deps"
-        if [[ "$role" == application ]]; then
-            echo '[snapshots.sql]'
-            echo 'enabled = true'
-            echo 'include = ["**/*.sql", "**/*.sql.in"]'
+        if [[ "$role" == application || "$role" == postgres || "$role" == extension ]]; then
+            emit_snapshot_sql_config
         fi
         echo
     } >> "$config"

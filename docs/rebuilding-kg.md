@@ -1,5 +1,13 @@
 # Rebuild the local knowledge graph
 
+| Goal | Command |
+| --- | --- |
+| Fast aiven-core only (~13 min) | `bash scripts/rebuild-core-fast.sh` |
+| Full corpus (PG + extensions) | `bash scripts/rebuild-corpus-full.sh --dry-run` then `--yes` |
+
+Operator spec (approaches, PG versions, extensions): [`kg-build-approaches-spec.md`](kg-build-approaches-spec.md).  
+Details for the full corpus path: [`building-aiven-postgres-kg.md`](building-aiven-postgres-kg.md).
+
 `rebuild-kg.sh` replaces **only the dev-local Docker Compose stack** and its
 graph, search, log, and staging volumes. It ingests local Git checkouts into one
 corpus, then starts Neo4j and MCP. It does not fetch, switch, or modify the
