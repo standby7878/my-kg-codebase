@@ -9,6 +9,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from codekg.native_ir import routine_target_kinds
+
 
 class CatalogDeadline(TimeoutError):
     """A catalog query exceeded its shared operation deadline."""
@@ -271,6 +273,7 @@ class GraphCatalog:
         *,
         name: str,
         arity: int | None = None,
+        routine_kind: str | None = None,
         schema_name: str | None = None,
         local_aliases: tuple[str, ...] = (),
         search_path: tuple[str, ...] = (),
@@ -307,15 +310,28 @@ class GraphCatalog:
                     + ") OR json_extract(fact,'$.schema_name') IS NULL)"
                 )
                 params.extend(search_path)
-            if arity is not None:
+            if routine_kind is not None:
+                target_kinds = routine_target_kinds(routine_kind)
+                if not target_kinds:
+                    return _page([], False, None, self.graph_id, self.generation_id)
                 clauses.append(
-                    "(json_extract(fact,'$.arity')=? OR "
+                    "json_extract(fact,'$.kind') IN (" + ",".join("?" for _ in target_kinds) + ")"
+                )
+                params.extend(target_kinds)
+            if arity is not None:
+                invocation_arity = (
+                    "(json_extract(fact,'$.arity') + CASE WHEN "
+                    "json_extract(fact,'$.kind')='procedure' THEN "
+                    "coalesce(json_extract(fact,'$.out_arg_count'),0) ELSE 0 END)"
+                )
+                clauses.append(
+                    f"({invocation_arity}=? OR "
                     "(json_extract(fact,'$.default_arg_count')>0 AND "
-                    "? BETWEEN json_extract(fact,'$.arity')-"
+                    f"? BETWEEN {invocation_arity}-"
                     "json_extract(fact,'$.default_arg_count') "
-                    "AND json_extract(fact,'$.arity')) OR "
+                    f"AND {invocation_arity}) OR "
                     "(json_extract(fact,'$.variadic_arg_count')>0 AND "
-                    "? >= json_extract(fact,'$.arity')-json_extract(fact,'$.default_arg_count')-"
+                    f"? >= {invocation_arity}-json_extract(fact,'$.default_arg_count')-"
                     "json_extract(fact,'$.variadic_arg_count')))"
                 )
                 params.extend((arity, arity, arity))

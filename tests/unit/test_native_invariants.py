@@ -309,3 +309,235 @@ def test_many_sql_references_do_not_duplicate_large_body_in_staged_facts():
     assert len(facts.evidence) == 1000
     assert all(e.text is None and e.text_hash for e in facts.evidence)
     assert len(json.dumps([asdict(e) for e in facts.evidence])) < len(snippet) * 50
+
+
+def test_typedef_callback_shadowing_global_function_remains_dynamic():
+    facts = parse_native_source(
+        b"typedef int (*Callback)(int); "
+        b"int victim(int x) { return x; } "
+        b"int caller(Callback victim) { return victim(1); } "
+        b"int direct(void) { return victim(2); }",
+        "callback.c",
+    )
+    callback, direct = facts.calls
+    assert callback.dynamic and callback.callee_name is None
+    assert not direct.dynamic and direct.callee_name == "victim"
+
+
+def test_local_callback_does_not_poison_direct_calls_outside_its_block():
+    facts = parse_native_source(
+        b"typedef int (*Callback)(int); int victim(int x) { return x; } "
+        b"int caller(Callback cb) { { Callback victim=cb; victim(1); } return victim(2); }",
+        "callback.c",
+    )
+    assert facts.calls[0].dynamic
+    assert facts.calls[1].callee_name == "victim" and not facts.calls[1].dynamic
+
+
+def test_explicit_pointer_local_does_not_poison_another_function():
+    facts = parse_native_source(
+        b"int victim(int x) { return x; } "
+        b"int indirect(void) { int (*victim)(int); return victim(1); } "
+        b"int direct(void) { return victim(2); }",
+        "callback.c",
+    )
+    assert facts.calls[0].dynamic
+    assert facts.calls[1].callee_name == "victim" and not facts.calls[1].dynamic
+
+
+def test_routine_body_preserves_zero_and_nested_argument_counts():
+    facts = parse_routine_source(
+        b"CREATE FUNCTION wrapper() RETURNS int LANGUAGE sql "
+        b"AS $$ SELECT target(inner_call(1), 2) + zero_call(); $$;",
+        "body.sql",
+        SqlConfig(),
+    )
+    assert {e.object_name: e.arity for e in facts.evidence} == {
+        "target": 2,
+        "inner_call": 1,
+        "zero_call": 0,
+    }
+
+
+def test_unknown_execute_receiver_is_not_verified_db_api():
+    facts = parse_python_sql(
+        b"class Logger:\n def execute(self, value): print(value)\n"
+        b"def entry():\n Logger().execute('SELECT target()')\n",
+        "logger.py",
+    )
+    assert len(facts.evidence) == 1  # Keep useful heuristic evidence, not a proven DB call.
+    assert facts.evidence[0].receiver_status == "unverified"
+
+
+def test_imported_db_api_cursor_chain_has_verified_receiver():
+    facts = parse_python_sql(
+        b"import sqlite3\nsqlite3.connect(':memory:').cursor().execute('SELECT target()')\n",
+        "client.py",
+    )
+    assert facts.evidence[0].receiver_status == "verified"
+
+
+def test_verified_driver_bindings_and_context_managers():
+    facts = parse_python_sql(
+        b"from sqlite3 import connect as open_db\n"
+        b"def run():\n"
+        b" connection=open_db(':memory:')\n"
+        b" with connection.cursor() as cursor:\n"
+        b"  cursor.executemany('SELECT target(1)', [])\n",
+        "client.py",
+    )
+    assert facts.evidence[0].receiver_status == "verified"
+
+
+def test_shadowed_or_rebound_driver_receivers_remain_unverified():
+    sources = [
+        b"import sqlite3\ndef run(sqlite3):\n sqlite3.connect('x').cursor().execute('SELECT f()')",
+        b"import sqlite3\nsqlite3=other\nsqlite3.connect('x').cursor().execute('SELECT f()')",
+        b"import sqlite3\nsqlite3.connect=other\n"
+        b"sqlite3.connect('x').cursor().execute('SELECT f()')",
+        b"import sqlite3\ndef outer(sqlite3):\n def inner():\n"
+        b"  sqlite3.connect('x').cursor().execute('SELECT f()')",
+        b"import sqlite3\ndef run():\n c=sqlite3.connect('x').cursor()\n c=other\n"
+        b" c.execute('SELECT f()')",
+        b"import sqlite3\ndef run(flag):\n if flag:\n  c=sqlite3.connect('x').cursor()\n"
+        b" c.execute('SELECT f()')",
+    ]
+    for source in sources:
+        facts = parse_python_sql(source, "client.py")
+        assert facts.evidence[0].receiver_status == "unverified", source
+
+
+def test_plpgsql_procedure_calls_preserve_argument_counts():
+    facts = parse_routine_source(
+        b"CREATE PROCEDURE wrapper() LANGUAGE plpgsql AS $$ BEGIN "
+        b"CALL target(1, 'a,b'); PERFORM nested(2); END; $$;",
+        "procedure.sql",
+        SqlConfig(),
+    )
+    assert {e.object_name: e.arity for e in facts.evidence} == {"target": 2, "nested": 1}
+
+
+def test_for_initializer_callback_scope_and_comma_declarations():
+    facts = parse_native_source(
+        b"typedef int (*Callback)(int); int victim(int x) { return x; } "
+        b"void f(Callback cb) { for(Callback victim=cb, second=cb; 0;) victim(1); victim(2); }",
+        "callback.c",
+    )
+    assert facts.calls[0].dynamic
+    assert facts.calls[1].callee_name == "victim" and not facts.calls[1].dynamic
+
+
+def test_implicit_scope_and_reflective_driver_mutation_are_unverified():
+    for source in [
+        b"import sqlite3\nf=lambda sqlite3: sqlite3.connect('x').cursor().execute('SELECT f()')",
+        b"import sqlite3\n"
+        b"[sqlite3.connect('x').cursor().execute('SELECT f()') for sqlite3 in others]",
+        b"import sqlite3\nsetattr(sqlite3, 'connect', other)\n"
+        b"sqlite3.connect('x').cursor().execute('SELECT f()')",
+    ]:
+        assert parse_python_sql(source, "client.py").evidence[0].receiver_status == "unverified"
+
+
+def test_custom_or_unpacked_factories_cannot_verify_receiver_identity():
+    for source in [
+        b"import sqlite3\nsqlite3.connect('x', factory=Logger).execute('SELECT f()')",
+        b"import psycopg2\n"
+        b"psycopg2.connect('x').cursor(cursor_factory=Logger).execute('SELECT f()')",
+        b"import sqlite3\nsqlite3.connect('x', **options).execute('SELECT f()')",
+    ]:
+        assert parse_python_sql(source, "client.py").evidence[0].receiver_status == "unverified"
+
+
+def test_prototype_parameters_do_not_shadow_unrelated_direct_calls():
+    facts = parse_native_source(
+        b"typedef int (*Callback)(int); int victim(int); "
+        b"void register_callback(Callback victim); "
+        b"int direct(void) { return victim(2); }",
+        "prototype.c",
+    )
+    assert facts.calls[0].callee_name == "victim" and not facts.calls[0].dynamic
+
+
+def test_mutated_aliases_cannot_verify_original_driver_or_connection():
+    for source in [
+        b"import sqlite3\nother=sqlite3\nother.connect=custom\n"
+        b"sqlite3.connect('x').cursor().execute('SELECT f()')",
+        b"import sqlite3\nc=sqlite3.connect('x')\nother=c\nother.cursor=custom\n"
+        b"c.cursor().execute('SELECT f()')",
+        b"import sqlite3 as db\nimport sqlite3 as other\nother.connect=custom\n"
+        b"db.connect('x').cursor().execute('SELECT f()')",
+    ]:
+        assert parse_python_sql(source, "client.py").evidence[0].receiver_status == "unverified"
+
+
+def test_python_embedded_call_keeps_procedure_and_nested_function_kinds():
+    facts = parse_python_sql(
+        b"import psycopg\npsycopg.connect('x').execute('CALL proc(nested(1))')",
+        "client.py",
+    )
+    assert [
+        (e.object_name, e.arity, e.routine_kind, e.receiver_status) for e in facts.evidence
+    ] == [
+        ("proc", 1, "procedure", "verified"),
+        ("nested", 1, "function", "verified"),
+    ]
+
+
+def test_callback_parameter_shadowing_survives_function_returning_callable():
+    facts = parse_native_source(
+        b"typedef int (*Callback)(int); int victim(int); "
+        b"int (*caller(Callback victim))(int) { victim(1); return 0; }",
+        "returns_callback.c",
+    )
+    assert len(facts.calls) == 1
+    assert facts.calls[0].callee_name is None and facts.calls[0].dynamic
+
+
+def test_receiver_mutation_through_control_flow_aliases_invalidates_source():
+    for mutation in [
+        b"for alias in [c]:\n    alias.cursor=custom\n",
+        b"with c as alias:\n    alias.cursor=custom\n",
+        b"[setattr(alias, 'cursor', custom) for alias in [c]]\n",
+        b"(alias := c)\nalias.cursor=custom\n",
+        b"bag: list = [c]\nfor alias in bag:\n    alias.cursor=custom\n",
+        b"(bag := [c])\nfor alias in bag:\n    alias.cursor=custom\n",
+        b"bag=[c]\nbag[0].cursor=custom\n",
+        b"bag=[c]\nsetattr(bag[0], 'cursor', custom)\n",
+    ]:
+        facts = parse_python_sql(
+            b"import psycopg\nc=psycopg.connect('db')\n"
+            + mutation
+            + b"c.cursor().execute('SELECT target()')",
+            "client.py",
+        )
+        assert facts.evidence[0].receiver_status == "unverified"
+
+
+def test_pg_proc_procedure_kind_and_out_count_are_preserved():
+    facts = parse_pg_proc_catalog(
+        b"{ proname => 'p', prokind => 'p', proargtypes => 'int4', "
+        b"proargmodes => '{i,o}', prosrc => 'p_native' }",
+        "pg_proc.dat",
+    )
+    assert [(r.kind, r.arity, r.out_arg_count) for r in facts.routines] == [("procedure", 1, 1)]
+
+
+def test_large_receiver_alias_group_has_bounded_extraction_memory():
+    import tracemalloc
+
+    # A generated source can legitimately mention thousands of names in one
+    # container. Alias taint must preserve reachability without an O(names²) clique.
+    names = ",".join(f"v{i}" for i in range(2000))
+    source = (
+        "import psycopg\nc=psycopg.connect('db')\n"
+        f"bag=[c,{names}]\nfor alias in bag:\n    alias.cursor=custom\n"
+        "c.cursor().execute('SELECT target()')"
+    ).encode()
+    tracemalloc.start()
+    try:
+        facts = parse_python_sql(source, "generated.py")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert facts.evidence[0].receiver_status == "unverified"
+    assert peak < 32 * 1024 * 1024

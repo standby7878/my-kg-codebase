@@ -12,12 +12,23 @@ from codekg.corpus_registry import create_native_registry, resolve_corpus_facts
 from codekg.sql_config import SqlConfig
 
 
-def _export(tmp_path, *, c_source: str, sql_source: str = ""):
+def _export(
+    tmp_path,
+    *,
+    c_source: str,
+    sql_source: str = "",
+    python_source: str = "",
+    catalog_source: str = "",
+):
     root = tmp_path / "repo"
     root.mkdir()
     (root / "native.c").write_text(c_source)
     if sql_source:
         (root / "routines.sql").write_text(sql_source)
+    if catalog_source:
+        (root / "pg_proc.dat").write_text(catalog_source)
+    if python_source:
+        (root / "client.py").write_text(python_source)
     config = tmp_path / "corpus.toml"
     config.write_text(
         '[[snapshots]]\nalias="repo"\nlogical_repo="repo"\nversion="1"\n'
@@ -297,6 +308,7 @@ def test_sql_arity_filter_precedes_the_candidate_sentinel(tmp_path):
     )
     evidence = {
         "origin": "sql_source",
+        "routine_kind": "function",
         "schema_name": "public",
         "object_name": "api",
         "arity": 1,
@@ -480,6 +492,7 @@ def test_routine_guards_combine_and_sqlobject_signature_filter_uses_composite_in
     )
     evidence = {
         "origin": "sql_source",
+        "routine_kind": "function",
         "schema_name": "public",
         "object_name": "api",
         "arity": 1,
@@ -652,6 +665,7 @@ def test_distinct_dependency_aliases_remain_ambiguous_after_candidate_grouping(t
         )
     evidence = {
         "origin": "sql_source",
+        "routine_kind": "function",
         "schema_name": "public",
         "object_name": "shared_api",
         "arity": 1,
@@ -767,6 +781,7 @@ def test_resolution_uses_selected_ordinals_without_fact_json_lookups(tmp_path):
         )
         sql_evidence = {
             "origin": "sql_source",
+            "routine_kind": "function",
             "schema_name": "public",
             "object_name": f"routine_{ordinal}",
             "arity": 0,
@@ -1005,3 +1020,219 @@ def test_native_scope_precedence_filters_before_its_candidate_limit(tmp_path):
         is None
     )
     db.close()
+
+
+def test_typedef_callback_does_not_export_false_exact_native_call(tmp_path):
+    _, _, db = _export(
+        tmp_path,
+        c_source=(
+            "typedef int (*Callback)(int); int victim(int x) { return x; } "
+            "int caller(Callback victim) { return victim(1); } "
+            "int direct(void) { return victim(2); }"
+        ),
+    )
+    try:
+        edges = db.execute(
+            "SELECT json_extract(s.fact,'$.name') FROM edges e "
+            "JOIN fact_keys k ON k.key=e.source_key AND k.table_name='symbols' "
+            "JOIN symbols s ON s.snapshot_alias=k.snapshot_alias AND s.path=k.path "
+            "AND s.ordinal=k.ordinal WHERE e.kind='CALLS_NATIVE' AND e.status='exact'"
+        ).fetchall()
+        assert edges == [("direct",)]
+        assert db.execute(
+            "SELECT 1 FROM evidence WHERE json_extract(fact,'$.origin')='native_call' "
+            "AND json_extract(fact,'$.dynamic')=1"
+        ).fetchone()
+    finally:
+        db.close()
+
+
+def test_wrong_routine_body_arity_cannot_export_exact_invocation(tmp_path):
+    _, _, db = _export(
+        tmp_path,
+        c_source="int unused(void) { return 0; }",
+        sql_source=(
+            "CREATE FUNCTION target() RETURNS int LANGUAGE SQL AS $$ SELECT 1; $$; "
+            "CREATE FUNCTION wrapper() RETURNS int LANGUAGE SQL "
+            "AS $$ SELECT target(1, 2); $$;"
+        ),
+    )
+    try:
+        assert not db.execute(
+            "SELECT 1 FROM edges WHERE kind='INVOKES_ROUTINE' AND status='exact'"
+        ).fetchone()
+        assert db.execute(
+            "SELECT json_extract(fact,'$.arity') FROM evidence "
+            "WHERE json_extract(fact,'$.object_name')='target'"
+        ).fetchone() == (2,)
+    finally:
+        db.close()
+
+
+def test_unverified_python_receiver_stays_candidate_in_sqlite_and_csv(tmp_path):
+    output, manifest, db = _export(
+        tmp_path,
+        c_source="int unused(void) { return 0; }",
+        sql_source="CREATE FUNCTION target() RETURNS int LANGUAGE SQL AS $$ SELECT 1; $$;",
+        python_source=(
+            "import sqlite3\n"
+            "class Logger:\n def execute(self, value): print(value)\n"
+            "Logger().execute('SELECT target()')\n"
+            "sqlite3.connect(':memory:').cursor().execute('SELECT target()')\n"
+        ),
+    )
+    try:
+        edges = db.execute(
+            "SELECT json_extract(v.fact,'$.receiver_status'),e.kind,e.status "
+            "FROM edges e JOIN fact_keys k ON k.key=e.source_key AND k.table_name='evidence' "
+            "JOIN evidence v ON v.snapshot_alias=k.snapshot_alias AND v.path=k.path "
+            "AND v.ordinal=k.ordinal WHERE json_extract(v.fact,'$.origin')='python_execute' "
+            "ORDER BY v.ordinal"
+        ).fetchall()
+        assert edges == [
+            ("unverified", "ROUTINE_CANDIDATE", "receiver_unverified"),
+            ("verified", "INVOKES_ROUTINE", "exact"),
+        ]
+        with (output / manifest["nodes"]["SourceEvidence"]["file"]).open(newline="") as source:
+            rows = [r for r in csv.DictReader(source) if r["origin"] == "python_execute"]
+        assert {(r["receiver_status"], r["status"]) for r in rows} == {
+            ("unverified", "receiver_unverified"),
+            ("verified", "exact"),
+        }
+    finally:
+        db.close()
+
+
+def test_procedure_call_cannot_bind_to_same_name_function(tmp_path):
+    _, _, db = _export(
+        tmp_path,
+        c_source="int unused(void) { return 0; }",
+        sql_source=(
+            "CREATE FUNCTION target() RETURNS int LANGUAGE SQL AS $$ SELECT 1; $$; "
+            "CREATE PROCEDURE wrapper() LANGUAGE plpgsql AS $$ BEGIN CALL target(); END; $$;"
+        ),
+    )
+    try:
+        assert not db.execute(
+            "SELECT 1 FROM edges WHERE kind='INVOKES_ROUTINE' AND status='exact'"
+        ).fetchone()
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("target_definition", "invocation", "expected_kind", "expected_edges"),
+    [
+        (
+            "CREATE PROCEDURE target() LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$;",
+            "CALL target()",
+            "procedure",
+            1,
+        ),
+        (
+            "CREATE PROCEDURE target() LANGUAGE plpgsql AS $$ BEGIN NULL; END; $$;",
+            "PERFORM target()",
+            "function",
+            0,
+        ),
+    ],
+)
+def test_routine_body_resolution_respects_invocation_kind(
+    tmp_path, target_definition, invocation, expected_kind, expected_edges
+):
+    output, manifest, db = _export(
+        tmp_path,
+        c_source="int unused(void) { return 0; }",
+        sql_source=target_definition
+        + f"CREATE PROCEDURE wrapper() LANGUAGE plpgsql AS $$ BEGIN {invocation}; END; $$;",
+    )
+    try:
+        fact = json.loads(
+            db.execute(
+                "SELECT fact FROM evidence WHERE json_extract(fact,'$.object_name')='target'"
+            ).fetchone()[0]
+        )
+        assert fact["routine_kind"] == expected_kind
+        assert (
+            db.execute(
+                "SELECT count(*) FROM edges WHERE kind='INVOKES_ROUTINE' AND status='exact'"
+            ).fetchone()[0]
+            == expected_edges
+        )
+        with (output / manifest["nodes"]["SourceEvidence"]["file"]).open(newline="") as source:
+            assert {row["routine_kind"] for row in csv.DictReader(source)} == {expected_kind}
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(("arguments", "expected_edges"), [("1", 0), ("1,NULL", 1)])
+def test_call_arity_includes_required_out_parameters(tmp_path, arguments, expected_edges):
+    output, manifest, db = _export(
+        tmp_path,
+        c_source="int unused(void) { return 0; }",
+        sql_source=(
+            "CREATE PROCEDURE target(IN x int, OUT y int) LANGUAGE plpgsql "
+            "AS $$ BEGIN y := x; END; $$; "
+            f"CREATE PROCEDURE wrapper() LANGUAGE sql AS $$ CALL target({arguments}); $$;"
+        ),
+    )
+    try:
+        assert (
+            db.execute(
+                "SELECT count(*) FROM edges WHERE kind='INVOKES_ROUTINE' AND status='exact'"
+            ).fetchone()[0]
+            == expected_edges
+        )
+        with (output / manifest["nodes"]["Routine"]["file"]).open(newline="") as source:
+            target = next(row for row in csv.DictReader(source) if row["name"] == "target")
+            assert (target["arity:int"], target["out_arg_count:int"]) == ("1", "1")
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("catalog_kind", "name", "args", "invocation"),
+    [
+        ("a", "aggregate_api", "int4", "pg_catalog.aggregate_api(1)"),
+        ("w", "window_api", "", "pg_catalog.window_api() OVER ()"),
+    ],
+)
+def test_pg_proc_aggregate_and_window_function_syntax_resolves(
+    tmp_path, catalog_kind, name, args, invocation
+):
+    _, _, db = _export(
+        tmp_path,
+        c_source="int unused(void) { return 0; }",
+        catalog_source=(
+            f"{{ proname => '{name}', prokind => '{catalog_kind}', "
+            f"proargtypes => '{args}', prosrc => '{name}_native' }}"
+        ),
+        sql_source=f"SELECT {invocation};",
+    )
+    try:
+        assert (
+            db.execute(
+                "SELECT count(*) FROM edges WHERE kind='INVOKES_ROUTINE' AND status='exact'"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        db.close()
+
+
+def test_procedure_out_and_default_combination_remains_candidate_only(tmp_path):
+    _, _, db = _export(
+        tmp_path,
+        c_source="int unused(void) { return 0; }",
+        sql_source=(
+            "CREATE PROCEDURE target(IN x int DEFAULT 1, OUT y int) LANGUAGE plpgsql "
+            "AS $$ BEGIN y:=x; END; $$; CALL target(1);"
+        ),
+    )
+    try:
+        assert not db.execute(
+            "SELECT 1 FROM edges WHERE kind='INVOKES_ROUTINE' AND status='exact'"
+        ).fetchone()
+        assert db.execute("SELECT 1 FROM edges WHERE kind='ROUTINE_CANDIDATE'").fetchone()
+    finally:
+        db.close()

@@ -596,6 +596,7 @@ class _Builder:
             node,
             segment,
             dynamic=False,
+            call_arity=len(args) if role == "call" and isinstance(node, pgast.FuncCall) else None,
         )
 
     def _drop_object(
@@ -734,6 +735,7 @@ class _Builder:
                     conditional_warning = True
                 execsql = value.get("PLpgSQL_stmt_execsql")
                 perform = value.get("PLpgSQL_stmt_perform")
+                called = value.get("PLpgSQL_stmt_call")
                 returned = value.get("PLpgSQL_stmt_return")
                 assigned = value.get("PLpgSQL_stmt_assign")
                 expression = None
@@ -745,6 +747,8 @@ class _Builder:
                     )
                 elif isinstance(perform, dict):
                     expression = perform.get("expr", {}).get("PLpgSQL_expr")
+                elif isinstance(called, dict):
+                    expression = called.get("expr", {}).get("PLpgSQL_expr")
                 elif isinstance(returned, dict):
                     expression = returned.get("expr", {}).get("PLpgSQL_expr")
                     expression_prefix = "SELECT "
@@ -849,6 +853,7 @@ class _Builder:
         *,
         dynamic: bool,
         position: int | None = None,
+        call_arity: int | None = None,
     ) -> SqlObjectRefIR:
         if position is None:
             position = self._node_position(node, segment)
@@ -867,6 +872,7 @@ class _Builder:
             signature_hint=signature,
             dynamic=dynamic,
             search_path=self.search_path,
+            call_arity=call_arity,
             **_location_values(location),
         )
         self.object_refs.append(ref)

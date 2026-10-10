@@ -455,7 +455,11 @@ def test_application_sql_routines_and_python_link_through_extension_to_postgres(
         "$$;\n"
     )
     (app / "procedures.sql").write_text(sql_source)
-    (app / "client.py").write_text('def run(db):\n    db.execute("SELECT app.pl_wrapper()")\n')
+    (app / "client.py").write_text(
+        "import sqlite3\ndef run():\n"
+        '    db=sqlite3.connect(":memory:").cursor()\n'
+        '    db.execute("SELECT app.pl_wrapper()")\n'
+    )
     corpus = CorpusConfig(
         tmp_path / "manifest.toml",
         (

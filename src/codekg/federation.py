@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
+import json
 import time
 from collections import OrderedDict, deque
 from pathlib import Path
@@ -11,6 +13,7 @@ from typing import Any
 
 from codekg.graph_catalog import CatalogDeadline
 from codekg.graph_registry import EntityRef, GraphHandle, GraphRegistry, GraphRegistryError
+from codekg.native_ir import routine_target_kinds
 
 _HANDLES: OrderedDict[tuple[str, str, str], GraphHandle] = OrderedDict()
 _REGISTRY: GraphRegistry | None = None
@@ -364,6 +367,7 @@ def trace_application_database_path(
         result = _status("ok" if paths else "unresolved", app, db, context_id=context_id)
         result.update(
             {
+                "context_fingerprint": _context_fingerprint(context),
                 "paths": paths[:limit],
                 "unresolved": unresolved[:32],
                 "truncated": truncated or len(intents) >= 32,
@@ -406,6 +410,7 @@ def find_application_database_usages(
         if continuation is not None:
             expected = {
                 "context_id": context_id,
+                "context_fingerprint": _context_fingerprint(context),
                 "app_graph_id": app.graph_id,
                 "app_generation_id": app.generation_id,
                 "db_graph_id": db.graph_id,
@@ -432,11 +437,14 @@ def find_application_database_usages(
         edges = 0
         truncated = False
         bfs_truncated = False
+        fact_cache = {}
         while queue and len(visited) <= 1000 and edges < 10000 and time.monotonic() < deadline:
             key, depth = queue.popleft()
-            fact = db.catalog.fact(key, deadline_seconds=_remaining(deadline))
-            if fact and fact.get("name"):
-                names.add(fact["name"])
+            fact = _database_fact(db, key, deadline, fact_cache)
+            if fact and fact.get("fact_table") == "routines":
+                routine_keys.add(key)
+                if fact.get("name"):
+                    names.add(fact["name"])
             if depth >= max_depth:
                 truncated = True
                 bfs_truncated = True
@@ -451,12 +459,11 @@ def find_application_database_usages(
             bfs_truncated |= page["truncated"]
             for edge in page["items"]:
                 edges += 1
-                if edge["kind"] not in {"BINDS_TO_NATIVE", "CALLS_NATIVE", "INVOKES_ROUTINE"}:
+                if not _database_edge_allowed(db, edge, deadline, fact_cache):
                     continue
                 if edge["source_key"] not in visited:
                     source_key = edge["source_key"]
                     visited.add(source_key)
-                    routine_keys.add(source_key)
                     queue.append((source_key, depth + 1))
         if queue or time.monotonic() >= deadline:
             truncated = True
@@ -500,6 +507,7 @@ def find_application_database_usages(
                     elif check["status"] in {
                         "ambiguous",
                         "conditional",
+                        "receiver_unverified",
                     } and resolved_keys.intersection(routine_keys | {target.local_key}):
                         candidates.append(
                             {"intent": item, "resolution": check, "candidate_only": True}
@@ -535,6 +543,7 @@ def find_application_database_usages(
             next_state.update(
                 {
                     "context_id": context_id,
+                    "context_fingerprint": _context_fingerprint(context),
                     "app_graph_id": app.graph_id,
                     "app_generation_id": app.generation_id,
                     "db_graph_id": db.graph_id,
@@ -550,6 +559,7 @@ def find_application_database_usages(
         result = _status("ok", app, db, context_id=context_id)
         result.update(
             {
+                "context_fingerprint": _context_fingerprint(context),
                 "usages": candidates,
                 "truncated": truncated,
                 "continuation": next_state,
@@ -795,6 +805,7 @@ def _resolve(evidence, context, app, db, *, deadline_seconds=2.0):
         "status": "unresolved",
         "evidence": _source_segment(evidence, app),
         "context_id": context.id,
+        "context_fingerprint": _context_fingerprint(context),
         "candidates": [],
         "assumptions": [],
     }
@@ -815,6 +826,7 @@ def _resolve(evidence, context, app, db, *, deadline_seconds=2.0):
         own = app.catalog.routine_candidates(
             name=name,
             arity=evidence.get("arity"),
+            routine_kind=evidence.get("routine_kind"),
             schema_name=scope_schema,
             local_aliases=tuple(s["alias"] for s in app.generation.snapshots),
             limit=32,
@@ -828,6 +840,7 @@ def _resolve(evidence, context, app, db, *, deadline_seconds=2.0):
             found = db.catalog.routine_candidates(
                 name=name,
                 arity=evidence.get("arity"),
+                routine_kind=evidence.get("routine_kind"),
                 schema_name=scope_schema,
                 local_aliases=(),
                 visible_aliases=aliases,
@@ -843,6 +856,9 @@ def _resolve(evidence, context, app, db, *, deadline_seconds=2.0):
             if found.get("truncated"):
                 result["status"] = "candidate_overflow"
                 result["truncated"] = True
+            elif origin == "python_execute" and evidence.get("receiver_status") != "verified":
+                result["status"] = "receiver_unverified"
+                result["assumptions"].append("execute receiver is not a verified DB-API object")
             elif evidence.get("condition") or any(c.get("condition") for c in candidates):
                 result["status"] = "conditional"
             elif len(candidates) == 1 and _signature_known(evidence, candidates[0]):
@@ -870,12 +886,25 @@ def _resolve(evidence, context, app, db, *, deadline_seconds=2.0):
 
 def _signature_known(evidence, candidate):
     arity = evidence.get("arity")
-    if arity is not None and candidate.get("arity") != arity:
+    if (
+        arity is None
+        or evidence.get("routine_kind") not in {"function", "procedure"}
+        or candidate.get("kind") not in routine_target_kinds(evidence["routine_kind"])
+    ):
+        return False
+    candidate_arity = candidate.get("arity", -1)
+    if evidence["routine_kind"] == "procedure":
+        if candidate.get("out_arg_count") is None:
+            return False  # Legacy input-only arity cannot prove a CALL signature.
+        if candidate["out_arg_count"] and candidate.get("default_arg_count"):
+            return False  # OUT positions vs default omission require argument-name analysis.
+        candidate_arity += candidate["out_arg_count"]
+    if candidate_arity != arity:
         defaults = candidate.get("default_arg_count") or 0
         variadic = candidate.get("variadic_arg_count") or 0
         if not (
-            candidate.get("arity", -1) - defaults <= arity
-            and (variadic > 0 or arity <= candidate.get("arity", -1))
+            candidate_arity - defaults - variadic <= arity
+            and (variadic > 0 or arity <= candidate_arity)
         ):
             return False
     # Similar arity/signature does not prove type-compatible overload selection.
@@ -883,10 +912,66 @@ def _signature_known(evidence, candidate):
     return not arg_types and not candidate.get("condition")
 
 
+def _context_fingerprint(context):
+    fields = (
+        "id",
+        "application_graph",
+        "database_graph",
+        "application_database",
+        "visible_extensions",
+        "search_path",
+    )
+    effective = {field: getattr(context, field, None) for field in fields}
+    return hashlib.sha256(
+        json.dumps(effective, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _database_fact(graph, key, deadline, cache):
+    if key not in cache:
+        cache[key] = graph.catalog.fact(key, deadline_seconds=_remaining(deadline))
+    return cache[key]
+
+
+def _database_edge_allowed(graph, edge, deadline, cache):
+    """Shared typed transitions: never treat file ownership as an execution hop."""
+    kind = edge["kind"]
+    if kind in {"BINDS_TO_NATIVE", "CALLS_NATIVE"}:
+        return True  # neighbors already restricts to exact, unconditional edges.
+    if kind not in {"HAS_EVIDENCE", "INVOKES_ROUTINE"}:
+        return False
+    source = _database_fact(graph, edge["source_key"], deadline, cache)
+    target = _database_fact(graph, edge["target_key"], deadline, cache)
+    if not source or not target:
+        return False
+    evidence = target if kind == "HAS_EVIDENCE" else source
+    if (
+        evidence.get("fact_table") != "evidence"
+        or evidence.get("origin") != "routine_body"
+        or evidence.get("dynamic")
+        or evidence.get("condition")
+        or evidence.get("arity") is None
+    ):
+        return False
+    routine = source if kind == "HAS_EVIDENCE" else target
+    if routine.get("fact_table") != "routines" or routine.get("condition"):
+        return False
+    if kind == "INVOKES_ROUTINE":
+        return _signature_known(evidence, routine)
+    return (
+        routine.get("snapshot_alias") == evidence.get("snapshot_alias")
+        and routine.get("path") == evidence.get("path")
+        and routine.get("start_line") is not None
+        and routine["start_line"] == evidence.get("owner_line")
+        and f"{routine.get('schema_name')}.{routine.get('name')}" == evidence.get("owner_qname")
+    )
+
+
 def _bounded_paths(db, start, target, max_depth, deadline, budget):
     paths = []
     queue = deque([(start, [start], [])])
     truncated = False
+    fact_cache = {}
     while queue and len(paths) < 5:
         if time.monotonic() >= deadline or budget["visited"] >= 1000 or budget["edges"] >= 10000:
             return paths, True
@@ -902,7 +987,7 @@ def _bounded_paths(db, start, target, max_depth, deadline, budget):
         truncated |= page["truncated"]
         for edge in page["items"]:
             budget["edges"] += 1
-            if edge["kind"] not in {"BINDS_TO_NATIVE", "CALLS_NATIVE", "INVOKES_ROUTINE"}:
+            if not _database_edge_allowed(db, edge, deadline, fact_cache):
                 continue
             nxt = edge["target_key"]
             if nxt in nodes:
@@ -1026,6 +1111,8 @@ def _source_segment(fact, graph):
         "start_column": fact.get("start_column"),
         "end_column": fact.get("end_column"),
         "origin": fact.get("origin"),
+        "receiver_status": fact.get("receiver_status"),
+        "routine_kind": fact.get("routine_kind"),
         "relationship": "HAS_EVIDENCE",
     }
 

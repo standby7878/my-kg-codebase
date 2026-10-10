@@ -57,3 +57,4 @@ class SqlObjectRefIR:
     end_column: int = 1
     dynamic: bool = False
     search_path: tuple[str, ...] = ()
+    call_arity: int | None = None

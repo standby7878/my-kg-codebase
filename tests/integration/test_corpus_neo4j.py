@@ -88,7 +88,9 @@ def test_exported_fixture_offline_import_and_five_live_queries(tmp_path, monkeyp
     for path in (app, cron, pg18, pg19):
         path.mkdir()
     (app / "main.py").write_text(
-        'def run(db):\n    return db.execute("SELECT app.cron_wrapper(1)")\n',
+        "import sqlite3\ndef run():\n"
+        '    db=sqlite3.connect(":memory:").cursor()\n'
+        '    return db.execute("SELECT app.cron_wrapper(1)")\n',
         encoding="utf-8",
     )
     (app / "functions.sql").write_text(
@@ -205,8 +207,13 @@ def test_exported_fixture_offline_import_and_five_live_queries(tmp_path, monkeyp
                 "RETURN f.key AS key, file.path AS path, f.start_line AS line"
             )
             assert len(app_functions) == 1
-            assert (app_functions[0]["path"], app_functions[0]["line"]) == ("main.py", 1)
+            assert (app_functions[0]["path"], app_functions[0]["line"]) == ("main.py", 2)
             app_key = app_functions[0]["key"]
+            receiver_metadata = client.execute_read(
+                "MATCH (e:SourceEvidence {snapshot_alias:'app', origin:'python_execute'}) "
+                "RETURN e.receiver_status AS receiver, e.routine_kind AS routine_kind"
+            )
+            assert receiver_metadata == [{"receiver": "verified", "routine_kind": "function"}]
             source_evidence_ownership = client.execute_read(
                 "MATCH (e:SourceEvidence) WHERE e.snapshot_alias IN ['app','cron'] "
                 "OPTIONAL MATCH (file:File)-[:HAS_EVIDENCE]->(e) "
@@ -276,8 +283,8 @@ def test_exported_fixture_offline_import_and_five_live_queries(tmp_path, monkeyp
             assert paths and len(paths[0]["evidence"]) == 6
             assert any(node["key"] == app_routines[0]["key"] for node in paths[0]["nodes"])
             assert [(edge["path"], edge["line"]) for edge in paths[0]["evidence"]] == [
-                ("main.py", 2),
-                ("main.py", 2),
+                ("main.py", 4),
+                ("main.py", 4),
                 ("functions.sql", 1),
                 ("functions.sql", 1),
                 ("cron--1.0.sql", 1),

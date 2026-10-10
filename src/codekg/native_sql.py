@@ -165,6 +165,11 @@ def parse_routine_source(raw: bytes, path: str, config: SqlConfig) -> NativeFile
                 ),
                 definition_hash=hashlib.sha256(RawStream()(stmt).encode()).hexdigest(),
                 condition="unevaluated SQL template guard" if conditional else None,
+                out_arg_count=sum(
+                    1
+                    for item in parameters
+                    if getattr(getattr(item, "mode", None), "value", "i") == "o"
+                ),
             )
         )
         # The established SQL parser already handles SQL and statically
@@ -224,7 +229,7 @@ def parse_routine_source(raw: bytes, path: str, config: SqlConfig) -> NativeFile
                     "routine_body",
                     reference.schema_name,
                     reference.object_name,
-                    None,
+                    reference.call_arity,
                     f"{schema}.{name}",
                     start_line,
                     evidence_start_line,
@@ -251,6 +256,7 @@ def parse_routine_source(raw: bytes, path: str, config: SqlConfig) -> NativeFile
                         if value
                     )
                     or None,
+                    routine_kind=reference.object_kind_hint,
                 )
             )
     return NativeFileFacts(
@@ -344,10 +350,14 @@ def parse_pg_proc_catalog(raw: bytes, path: str) -> NativeFileFacts:
                             line,
                             col,
                             *locations.position(offsets.byte_offset(index + 1)),
-                            kind={"a": "aggregate", "w": "window"}.get(
+                            kind={"a": "aggregate", "w": "window", "p": "procedure"}.get(
                                 fields.get("prokind", "f"), "function"
                             ),
                             default_arg_count=int(default_count),
+                            out_arg_count=fields.get("proargmodes", "{}")
+                            .strip("{}")
+                            .split(",")
+                            .count("o"),
                             return_type=(
                                 ("setof " if fields.get("proretset") == "t" else "")
                                 + fields["prorettype"]

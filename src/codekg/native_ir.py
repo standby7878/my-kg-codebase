@@ -54,6 +54,7 @@ class RoutineIR:
     return_type: str | None = None
     definition_hash: str | None = None
     condition: str | None = None
+    out_arg_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,8 @@ class SourceEvidenceIR:
     text: str | None
     text_hash: str | None
     condition: str | None = None
+    receiver_status: str | None = None
+    routine_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -91,3 +94,10 @@ class NativeFileFacts:
     evidence: tuple[SourceEvidenceIR, ...] = ()
     diagnostics: tuple[NativeDiagnosticIR, ...] = ()
     includes: tuple[str, ...] = ()
+
+
+def routine_target_kinds(invocation_kind: str | None) -> tuple[str, ...]:
+    """SQL function syntax also invokes catalog aggregates/window functions."""
+    return {"function": ("function", "aggregate", "window"), "procedure": ("procedure",)}.get(
+        invocation_kind, ()
+    )

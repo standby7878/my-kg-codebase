@@ -35,9 +35,8 @@ def parse_native_source(raw: bytes, path: str) -> NativeFileFacts:
     diagnostics: list[NativeDiagnosticIR] = []
     includes: list[str] = []
     evidence: list[SourceEvidenceIR] = []
-    function_pointer_names = _function_pointer_identifiers(raw, root)
 
-    def visit(node, owner: tuple[str, int] | None = None) -> None:
+    def visit(node, owner: tuple[str, int] | None, scopes: tuple[set[str], ...]):
         if node.type in {"ERROR", "MISSING"}:
             diagnostics.append(
                 NativeDiagnosticIR(
@@ -145,10 +144,20 @@ def parse_native_source(raw: bytes, path: str) -> NativeFileFacts:
                             raw, node, name, is_static, True, _condition_context(raw, node), None
                         )
                     )
+        # C ordinary-identifier bindings shadow global functions, including
+        # parameters whose callable type is hidden behind a typedef. Track
+        # lexical scope rather than poisoning a name across the whole file.
+        if node.type in {"declaration", "parameter_declaration"}:
+            for declarator in node.children_by_field_name("declarator"):
+                if node.type == "declaration" and _declarator_name(raw, declarator):
+                    continue  # A genuine function declaration is not an object binding.
+                name = _object_binding_name(raw, declarator)
+                if name:
+                    scopes[-1].add(name)
         if node.type == "call_expression" and owner:
             function = node.child_by_field_name("function")
             callee = _identifier_from_expression(raw, function)
-            if callee in function_pointer_names:
+            if any(callee in scope for scope in reversed(scopes)):
                 callee = None
             calls.append(
                 NativeCallIR(
@@ -165,11 +174,18 @@ def parse_native_source(raw: bytes, path: str) -> NativeFileFacts:
             )
         return owner
 
-    pending = [(root, None)]
+    pending = [(root, None, (set(),))]
     while pending:
-        node, owner = pending.pop()
-        owner = visit(node, owner)
-        pending.extend((child, owner) for child in reversed(node.named_children))
+        node, owner, scopes = pending.pop()
+        if node.type in {"function_definition", "compound_statement", "for_statement"} or (
+            node.type == "parameter_list"
+            and node.parent is not None
+            and node.parent.type == "function_declarator"
+            and not _definition_parameters(node.parent)
+        ):
+            scopes = (*scopes, set())
+        owner = visit(node, owner, scopes)
+        pending.extend((child, owner, scopes) for child in reversed(node.named_children))
     static_names = {
         symbol.name for symbol in symbols if symbol.static and symbol.kind == "function"
     }
@@ -255,22 +271,40 @@ def _descendants(node):
         stack.extend(reversed(item.named_children))
 
 
-def _function_pointer_identifiers(raw: bytes, root) -> set[str]:
-    names: set[str] = set()
-    for node in _descendants(root):
-        if node.type != "function_declarator":
-            continue
-        declarator = node.child_by_field_name("declarator")
-        if declarator and any(
-            item.type == "pointer_declarator" for item in _descendants(declarator)
-        ):
-            identifier = next(
-                (item for item in _descendants(declarator) if item.type == "identifier"), None
-            )
-            value = _text(raw, identifier)
-            if value:
-                names.add(value)
-    return names
+def _definition_parameters(node) -> bool:
+    """Only the defining function's parameters share its body scope.
+
+    Prototype and nested callback-declarator parameters have their own scopes.
+    """
+    ancestor = node.parent
+    while ancestor is not None:
+        if ancestor.type in {"declaration", "parameter_declaration", "type_definition"}:
+            return False
+        if ancestor.type == "function_definition":
+            declarator = ancestor.child_by_field_name("declarator")
+            defining = None
+            while declarator is not None:
+                if declarator.type == "function_declarator":
+                    defining = declarator
+                child = declarator.child_by_field_name("declarator")
+                if child is None and declarator.type == "parenthesized_declarator":
+                    child = next(iter(declarator.named_children), None)
+                declarator = child
+            return defining == node
+        ancestor = ancestor.parent
+    return False
+
+
+def _object_binding_name(raw: bytes, node) -> str | None:
+    """Follow only a declarator's binding spine, never initializer/argument names."""
+    while node is not None:
+        if node.type in {"identifier", "type_identifier"}:
+            return _text(raw, node)
+        child = node.child_by_field_name("declarator")
+        if child is None and node.type == "parenthesized_declarator":
+            child = next(iter(node.named_children), None)
+        node = child
+    return None
 
 
 def _text(raw: bytes, node) -> str | None:

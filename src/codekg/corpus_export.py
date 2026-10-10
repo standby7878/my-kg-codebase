@@ -386,6 +386,7 @@ _CORPUS_NODE_COLUMNS = {
         ("start_column", "start_column:int"),
         ("end_column", "end_column:int"),
         ("arity", "arity:int"),
+        ("out_arg_count", "out_arg_count:int"),
         ("library", "library"),
         ("entrypoint", "entrypoint"),
         ("body_hash", "body_hash"),
@@ -401,6 +402,8 @@ _CORPUS_NODE_COLUMNS = {
         ("name", "name"),
         ("path", "path"),
         ("origin", "origin"),
+        ("receiver_status", "receiver_status"),
+        ("routine_kind", "routine_kind"),
         ("start_line", "start_line:int"),
         ("start_column", "start_column:int"),
         ("end_line", "end_line:int"),
@@ -709,6 +712,11 @@ def _write_supplemental_graph(
                         if resolved
                         else "unresolved"
                     )
+                    if (
+                        fact.get("origin") == "python_execute"
+                        and fact.get("receiver_status") != "verified"
+                    ):
+                        status = "receiver_unverified"
                     owner_key = None
                     if fact.get("origin") == "native_call" and fact.get("owner_qname"):
                         owners = db.execute(
@@ -766,6 +774,8 @@ def _write_supplemental_graph(
                         "name": name,
                         "path": path,
                         "origin": fact.get("origin"),
+                        "receiver_status": fact.get("receiver_status"),
+                        "routine_kind": fact.get("routine_kind"),
                         "start_line": fact.get("start_line"),
                         "start_column": fact.get("start_column"),
                         "end_line": fact.get("end_line"),

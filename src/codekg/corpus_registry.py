@@ -20,7 +20,7 @@ from codekg.native_evidence import (
     parse_python_sql,
     parse_sql_source_evidence,
 )
-from codekg.native_ir import NativeFileFacts
+from codekg.native_ir import NativeFileFacts, routine_target_kinds
 from codekg.native_parser import parse_native_source
 from codekg.native_sql import parse_pg_proc_catalog, parse_routine_source
 
@@ -156,7 +156,7 @@ def snapshot_identity(
         ",".join(snapshot.dependencies),
         ",".join(dependency_identities),
         str(snapshot.max_file_bytes),
-        "corpus-extract-v6",
+        "corpus-extract-v7",
         sys.version,
         repr(versions),
     )
@@ -364,14 +364,27 @@ def resolve_corpus_facts(connection: sqlite3.Connection, corpus) -> None:
                 arity_filter = ""
                 params: list[object] = [*visible, name, schema]
                 if fact.get("arity") is not None:
+                    invocation_arity = (
+                        "(coalesce(json_extract(fact,'$.arity'),-1) + "
+                        "CASE WHEN json_extract(fact,'$.kind')='procedure' THEN "
+                        "coalesce(json_extract(fact,'$.out_arg_count'),0) ELSE 0 END)"
+                    )
                     arity_filter = (
-                        " AND (coalesce(json_extract(fact,'$.arity'),-1) - "
+                        f" AND ({invocation_arity} - "
                         "coalesce(json_extract(fact,'$.default_arg_count'),0) - "
                         "coalesce(json_extract(fact,'$.variadic_arg_count'),0)) <= ? "
                         "AND (coalesce(json_extract(fact,'$.variadic_arg_count'),0)>0 "
-                        "OR ? <= coalesce(json_extract(fact,'$.arity'),-1))"
+                        f"OR ? <= {invocation_arity})"
                     )
                     params.extend((fact["arity"], fact["arity"]))
+                target_kinds = routine_target_kinds(fact.get("routine_kind"))
+                if target_kinds:
+                    arity_filter += (
+                        " AND json_extract(fact,'$.kind') IN ("
+                        + ",".join("?" for _ in target_kinds)
+                        + ")"
+                    )
+                    params.extend(target_kinds)
                 params.append(snapshot.alias)
                 scoped = connection.execute(
                     f"WITH occurrences AS (SELECT snapshot_alias,path,ordinal,fact,"
@@ -407,11 +420,36 @@ def resolve_corpus_facts(connection: sqlite3.Connection, corpus) -> None:
                 if origin in {"markdown_mention", "markdown_sql"}
                 else "INVOKES_ROUTINE"
             )
-            exact = len(candidates) == 1 and len(candidates) <= 32
+            documentation = origin in {"markdown_mention", "markdown_sql"}
+            receiver_unverified = (
+                origin == "python_execute" and fact.get("receiver_status") != "verified"
+            )
+            selected_routine = json.loads(candidates[0][3]) if len(candidates) == 1 else None
+            exact = (
+                len(candidates) == 1
+                and (
+                    documentation
+                    or (
+                        fact.get("arity") is not None
+                        and fact.get("routine_kind") in {"function", "procedure"}
+                    )
+                )
+                and not receiver_unverified
+                and (
+                    fact.get("routine_kind") != "procedure"
+                    or (
+                        selected_routine.get("out_arg_count") is not None
+                        and not (
+                            selected_routine.get("out_arg_count")
+                            and selected_routine.get("default_arg_count")
+                        )
+                    )
+                )
+            )
             targets = candidates[:32]
             if exact:
                 candidate = targets[0]
-                routine = json.loads(candidate[3])
+                routine = selected_routine
                 target = node_key(candidate[0], candidate[1], "routines", candidate[2])
                 guards = tuple(
                     dict.fromkeys(
@@ -442,7 +480,11 @@ def resolve_corpus_facts(connection: sqlite3.Connection, corpus) -> None:
                         source,
                         target,
                         edge_kind,
-                        "ambiguous" if targets else "unresolved",
+                        "receiver_unverified"
+                        if receiver_unverified
+                        else "ambiguous"
+                        if targets
+                        else "unresolved",
                         path,
                         fact.get("start_line"),
                         fact.get("start_column"),

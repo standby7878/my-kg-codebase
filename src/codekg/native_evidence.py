@@ -47,6 +47,7 @@ def parse_python_sql(raw: bytes, path: str) -> NativeFileFacts:
                 ),
             )
         )
+    receiver_proofs = _python_receiver_proofs(tree)
     constants: dict[str, str] = {}
     module_stores = _scope_store_counts(tree.body)
     module_non_assignment_bindings: set[str] = set()
@@ -388,6 +389,7 @@ def parse_python_sql(raw: bytes, path: str) -> NativeFileFacts:
                             True,
                             None,
                             owner_line=owner_line,
+                            receiver_status=receiver_proofs.get(id(node), "unverified"),
                         )
                     )
                 else:
@@ -409,6 +411,8 @@ def parse_python_sql(raw: bytes, path: str) -> NativeFileFacts:
                             item.dynamic,
                             item.text,
                             item.text_hash,
+                            receiver_status=receiver_proofs.get(id(node), "unverified"),
+                            routine_kind=item.routine_kind,
                         )
                         for item in found
                     )
@@ -430,6 +434,300 @@ def parse_sql_source_evidence(raw: bytes, path: str) -> NativeFileFacts:
 
 def _imported_names(node: ast.Import | ast.ImportFrom) -> set[str]:
     return {alias.asname or alias.name.split(".", 1)[0] for alias in node.names}
+
+
+def _python_receiver_proofs(tree: ast.Module) -> dict[int, str]:
+    """Conservative local DB-API provenance; unsupported receivers remain evidence.
+
+    Recognize import-resolved factories and single-binding connections/cursors.
+    No identifier-name heuristics, arbitrary annotations or captured objects.
+    """
+    drivers = {"sqlite3", "psycopg", "psycopg2"}
+    results: dict[int, str] = {}
+    rebound_globals = _global_rebound_names(tree)
+    mutated_roots = set()
+    wildcard_import = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+            wildcard_import = True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"setattr", "delattr"}
+            and node.args
+        ):
+            mutated_roots.update(_target_names(node.args[0]))
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            # Indexed containers and chained attributes can reference the same
+            # aliased object. Taint their source names, not only bare receivers.
+            mutated_roots.update(_target_names(node.value))
+
+    # Mutating an alias mutates the same underlying module/connection object.
+    # Use a conservative alias graph across lexical scopes: false negatives
+    # are preferable to silently verifying a replaced factory or cursor.
+    aliases: dict[str, set[str]] = {}
+    module_aliases: dict[str, set[str]] = {}
+
+    def link(names):
+        if not names:
+            return
+        # Connectivity is sufficient for taint. A star keeps large tuple/list
+        # assignments linear in memory instead of constructing an alias clique.
+        representative = next(iter(names))
+        others = names - {representative}
+        aliases.setdefault(representative, set()).update(others)
+        for name in others:
+            aliases.setdefault(name, set()).add(representative)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                if item.name in drivers:
+                    module_aliases.setdefault(item.name, set()).add(item.asname or item.name)
+        elif isinstance(node, ast.Assign):
+            if isinstance(node.value, (ast.Name, ast.Tuple, ast.List, ast.Dict, ast.Set)):
+                link(
+                    _target_names(node.value)
+                    | set().union(*(_target_names(t) for t in node.targets))
+                )
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and isinstance(
+            node.value, (ast.Name, ast.Tuple, ast.List, ast.Dict, ast.Set)
+        ):
+            link(_target_names(node.target) | _target_names(node.value))
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+            link(_target_names(node.target) | _target_names(node.iter))
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    link(_target_names(item.optional_vars) | _target_names(item.context_expr))
+    for names in module_aliases.values():
+        link(names)
+    pending = list(mutated_roots)
+    while pending:
+        for name in aliases.get(pending.pop(), ()):
+            if name not in mutated_roots:
+                mutated_roots.add(name)
+                pending.append(name)
+
+    def counts_for(statements):
+        counts = _scope_store_counts(statements)
+
+        class ExtraBindings(ast.NodeVisitor):
+            def visit_Import(self, node):
+                counts.update(_imported_names(node))
+
+            visit_ImportFrom = visit_Import
+
+            def visit_FunctionDef(self, node):
+                counts[node.name] += 1
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+            visit_ClassDef = visit_FunctionDef
+
+            def visit_Lambda(self, node):
+                return
+
+            def visit_Name(self, node):
+                if isinstance(node.ctx, ast.Del):
+                    counts[node.id] += 1
+
+            def visit_ExceptHandler(self, node):
+                if node.name:
+                    counts[node.name] += 1
+                self.generic_visit(node)
+
+            def visit_Match(self, node):
+                counts.update(_match_capture_names(node))
+                self.generic_visit(node)
+
+        visitor = ExtraBindings()
+        for statement in statements:
+            visitor.visit(statement)
+        return counts
+
+    class Proofs(ast.NodeVisitor):
+        def __init__(self):
+            self.env = {}
+            self.counts = counts_for(tree.body)
+            self.module_imports = {}
+            self.guarded = 0
+            self.function_depth = 0
+
+        def stable(self, name):
+            return (
+                self.counts[name] == 1
+                and name not in mutated_roots
+                and name not in rebound_globals
+                and not wildcard_import
+            )
+
+        def value(self, node):
+            if isinstance(node, ast.Name):
+                return self.env.get(node.id)
+            if isinstance(node, ast.Call):
+                if self.value(node.func) == "factory":
+                    if (
+                        len(node.args) > 1
+                        or any(isinstance(arg, ast.Starred) for arg in node.args)
+                        or any(k.arg is None or k.arg.endswith("factory") for k in node.keywords)
+                    ):
+                        return None  # Custom/unpacked factories cannot establish receiver identity.
+                    return "connection"
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "cursor"
+                    and self.value(node.func.value) == "connection"
+                    and not node.args
+                    and not node.keywords
+                ):
+                    return "cursor"
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr == "connect"
+                and self.value(node.value) == "driver"
+            ):
+                return "factory"
+            return None
+
+        def visit_Import(self, node):
+            for alias in node.names:
+                name = alias.asname or alias.name.split(".")[0]
+                self.env.pop(name, None)
+                if not self.guarded and self.stable(name) and alias.name in drivers:
+                    self.env[name] = "driver"
+
+        def visit_ImportFrom(self, node):
+            for alias in node.names:
+                name = alias.asname or alias.name
+                self.env.pop(name, None)
+                if (
+                    not self.guarded
+                    and self.stable(name)
+                    and node.level == 0
+                    and node.module in drivers
+                    and alias.name == "connect"
+                ):
+                    self.env[name] = "factory"
+            if any(alias.name == "*" for alias in node.names):
+                self.env.clear()
+
+        def visit_Assign(self, node):
+            self.visit(node.value)
+            proof = self.value(node.value)
+            for target in node.targets:
+                for name in _target_names(target):
+                    self.env.pop(name, None)
+                if (
+                    isinstance(target, ast.Name)
+                    and self.stable(target.id)
+                    and not self.guarded
+                    and proof
+                ):
+                    self.env[target.id] = proof
+
+        def visit_AnnAssign(self, node):
+            if node.value:
+                self.visit_Assign(ast.Assign(targets=[node.target], value=node.value))
+
+        def visit_Call(self, node):
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {
+                "execute",
+                "executemany",
+            }:
+                results[id(node)] = (
+                    "verified"
+                    if self.value(node.func.value) in {"cursor", "connection"}
+                    else "unverified"
+                )
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node):
+            # Definition expressions run outside the new function scope.
+            for expression in [*node.decorator_list, *node.args.defaults, *node.args.kw_defaults]:
+                if expression:
+                    self.visit(expression)
+            saved = self.env, self.counts, self.guarded
+            bound, external = _scope_bindings(node.body)
+            params = {
+                arg.arg for arg in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
+            }
+            if node.args.vararg:
+                params.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                params.add(node.args.kwarg.arg)
+            imports = self.module_imports if self.function_depth == 0 else self.env
+            self.env = {
+                name: proof
+                for name, proof in imports.items()
+                if proof in {"driver", "factory"} and name not in bound | external | params
+            }
+            self.counts = counts_for(node.body)
+            self.guarded = 0
+            self.function_depth += 1
+            for statement in node.body:
+                self.visit(statement)
+            self.function_depth -= 1
+            self.env, self.counts, self.guarded = saved
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_ClassDef(self, node):
+            saved = self.env
+            self.env = {}
+            for statement in node.body:
+                self.visit(statement)
+            self.env = saved
+
+        def visit_With(self, node):
+            saved = self.env.copy()
+            for item in node.items:
+                self.visit(item.context_expr)
+                proof = self.value(item.context_expr)
+                if isinstance(item.optional_vars, ast.Name):
+                    name = item.optional_vars.id
+                    self.env.pop(name, None)
+                    if self.stable(name) and proof and not self.guarded:
+                        self.env[name] = proof
+            for statement in node.body:
+                self.visit(statement)
+            self.env = saved
+
+        visit_AsyncWith = visit_With
+
+        def visit_guarded(self, node):
+            saved = self.env.copy()
+            bound, _ = _scope_bindings([node])
+            for name in bound:
+                self.env.pop(name, None)
+            self.guarded += 1
+            self.generic_visit(node)
+            self.guarded -= 1
+            self.env = {name: proof for name, proof in saved.items() if name not in bound}
+
+        visit_If = visit_For = visit_AsyncFor = visit_While = visit_Try = visit_Match = (
+            visit_guarded
+        )
+
+        def visit_implicit_scope(self, node):
+            # These scopes can shadow/capture names; do not infer receiver types.
+            saved = self.env
+            self.env = {}
+            self.generic_visit(node)
+            self.env = saved
+
+        visit_Lambda = visit_ListComp = visit_SetComp = visit_GeneratorExp = visit_DictComp = (
+            visit_implicit_scope
+        )
+
+    visitor = Proofs()
+    # Only stable top-level driver imports are eligible for nested function use.
+    for statement in tree.body:
+        if isinstance(statement, (ast.Import, ast.ImportFrom)):
+            visitor.visit(statement)
+    visitor.module_imports = visitor.env.copy()
+    visitor.env.clear()
+    visitor.visit(tree)
+    return results
 
 
 def _declared_global_names(statements: list[ast.stmt]) -> set[str]:
@@ -713,6 +1011,7 @@ def _sql_evidence(
         )
         return found, diagnostics
     for item in statements:
+        procedure_call = item.stmt.funccall if isinstance(item.stmt, pgast.CallStmt) else None
         for node in _walk(item.stmt):
             if not isinstance(node, pgast.FuncCall):
                 continue
@@ -748,12 +1047,25 @@ def _sql_evidence(
                     False,
                     None,
                     text_hash,
+                    routine_kind="procedure" if node is procedure_call else "function",
                 )
             )
     return found, diagnostics
 
 
-def _evidence(origin, schema, name, owner, start, end, dynamic, text, arity=None, owner_line=None):
+def _evidence(
+    origin,
+    schema,
+    name,
+    owner,
+    start,
+    end,
+    dynamic,
+    text,
+    arity=None,
+    owner_line=None,
+    receiver_status=None,
+):
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest() if text is not None else None
     return SourceEvidenceIR(
         origin,
@@ -769,6 +1081,7 @@ def _evidence(origin, schema, name, owner, start, end, dynamic, text, arity=None
         dynamic,
         text,
         digest,
+        receiver_status=receiver_status,
     )
 
 
