@@ -1,58 +1,58 @@
-# CodeKG model: detailed specification
+# Модель CodeKG: подробная спецификация
 
-This describes the registry-enabled, independent-graph implementation in `src/codekg`. It documents emitted/static facts and request-time algorithms, not runtime behavior. “Exact” below is the implementation's resolution state; it must not be read as proof of runtime execution, SQL type dispatch, ABI compatibility, or installation state.
+Документ описывает реализацию независимых графов с реестром в `src/codekg`: извлекаемые статические факты и алгоритмы, выполняемые во время запроса, а не поведение программы при исполнении. Термин «точный» (`exact`) далее обозначает статус разрешения в этой реализации. Он не доказывает фактическое исполнение, выбор SQL-перегрузки по типам, совместимость ABI или состояние установленной системы.
 
-## 1. Graph and generation identity
+## 1. Идентичность графов и поколений
 
-A registry contains graph entries of kind `application` or `database`, each pointing to one frozen generation manifest and one Neo4j Community backend. A database graph represents one PostgreSQL version snapshot plus selected extension/dependency snapshots. A context explicitly binds one application graph to one database graph and supplies `application_database`, `visible_extensions` (snapshot aliases), and `search_path`.
+Реестр содержит записи графов вида `application` или `database`. Каждая запись указывает на один зафиксированный манифест поколения и одно хранилище Neo4j Community. Граф базы данных представляет снимок одной версии PostgreSQL и выбранные снимки расширений и зависимостей. Контекст явно связывает один граф приложения с одним графом базы данных и задаёт `application_database`, `visible_extensions` — алиасы снимков расширений — и `search_path`.
 
-The serving `GraphHandle` is pinned to `(graph_id, generation_id)`. Its backend must contain exactly one matching `CodeKGGeneration` marker. `EntityRef` is exactly `{graph_id, generation_id, local_key}`; a reference from another graph or generation is invalid for that selected handle. A federation response carries application and database graph/generation metadata and, for context-bound operations, `context_id`; the context has no separate revision field in the current response model. Pagination cursors are similarly scoped to selector/context and generation(s). The registry can simultaneously register multiple application and database generations; each `GraphContext` selects exactly one pair. Registry content is loaded once per MCP process; activating a changed registry requires process restart. Discovery metadata alone does not verify a backend; first query/request-boundary verification does.
+Обслуживающий объект `GraphHandle` привязан к паре `(graph_id, generation_id)`. Его хранилище должно содержать ровно один соответствующий маркер `CodeKGGeneration`. Ссылка `EntityRef` содержит строго `{graph_id, generation_id, local_key}`; ссылка из другого графа или поколения недопустима для выбранного объекта доступа. Ответ федерации содержит идентификаторы графов и поколений приложения и базы данных, а для операций с контекстом — `context_id`. Отдельного поля ревизии контекста в текущей модели ответа нет. Курсоры пагинации аналогично привязаны к селектору или контексту и поколениям. Реестр может одновременно регистрировать несколько поколений графов приложений и баз данных; каждый `GraphContext` выбирает ровно одну пару. Содержимое реестра загружается один раз на процесс MCP; после активации изменённого реестра процесс необходимо перезапустить. Получение только метаданных обнаружения не проверяет хранилище: проверка выполняется при первом запросе и на границах обслуживаемых запросов.
 
-Corpus extraction stages facts and opaque occurrence keys in a generation-local SQLite `corpus.sqlite`; the exporter projects graph facts/relationships to CSV for offline Neo4j import. The catalog serves bounded, immutable read-only lookup from SQLite. Neo4j holds searchable graph facts and imported relationships. Neither store has a cross-database application-to-database relationship. The source is authoritative for what is emitted; see [registry](../src/codekg/graph_registry.py), [catalog](../src/codekg/graph_catalog.py), [export](../src/codekg/corpus_export.py), and [corpus registry/resolution](../src/codekg/corpus_registry.py).
+При извлечении корпуса факты и непрозрачные ключи отдельных вхождений помещаются в SQLite-файл `corpus.sqlite`, локальный для поколения. Экспортёр проецирует факты и связи графа в CSV для автономного импорта в Neo4j. Каталог обеспечивает ограниченный поиск по неизменяемым SQLite-данным в режиме только чтения. Neo4j хранит доступные для поиска факты графа и импортированные связи. Ни в одном из хранилищ нет межбазовой связи от графа приложения к графу базы данных. Источником истины о создаваемых данных является код: см. [реестр](../src/codekg/graph_registry.py), [каталог](../src/codekg/graph_catalog.py), [экспорт](../src/codekg/corpus_export.py) и [реестр и разрешение фактов корпуса](../src/codekg/corpus_registry.py).
 
-### Ingestion and serving lifecycle
+### Жизненный цикл загрузки и обслуживания
 
-Within a selected source snapshot, extraction reads source files into ordinary repository/SQL facts and the supplemental native/routine/evidence staging tables in the same corpus SQLite workflow. The per-generation corpus catalog retains richer facts and resolution postings than the flattened graph columns. Offline composition resolves facts within that corpus, then emits Neo4j CSV nodes/relationships and a manifest with expected counts. Operators freeze the exported generation, import it into a fresh graph-specific Neo4j Community instance, apply schema, and verify imported counts plus the exact graph/generation marker. Only a validated registry is activated; an MCP restart is explicit and required to load that registry. App and database snapshots can be built/refreshed independently; ingestion does not eagerly compute a cross-KG dependency closure. Cross-KG resolution happens under a selected context at query time.
+В рамках выбранного снимка исходные файлы читаются для извлечения обычных фактов о репозитории и SQL, а также дополнительных фактов о нативных символах, подпрограммах и свидетельствах, помещаемых в промежуточные таблицы SQLite корпуса. Каталог поколения сохраняет более богатые факты и поисковые записи разрешения, чем плоские столбцы графа. Автономная композиция разрешает факты внутри этого корпуса, затем создаёт CSV узлов и связей Neo4j и манифест с ожидаемыми количествами. Оператор фиксирует экспортированное поколение, импортирует его в новый экземпляр Neo4j Community для конкретного графа, применяет схему и проверяет количества импортированных сущностей и точный маркер графа и поколения. Активируется только проверенный реестр; для его загрузки явно требуется перезапуск MCP. Снимки приложения и базы данных можно строить и обновлять независимо. Загрузка не вычисляет заранее полное транзитивное замыкание зависимостей между KG: межграфовое разрешение выполняется во время запроса в выбранном контексте.
 
-## 2. Stored entities and relationships
+## 2. Сохраняемые сущности и связи
 
-### Application graph
+### Граф приложения
 
-The ordinary application graph includes `Repository`, `File`, `Function`, `Method`, `ModuleInit`, `CallSite`, and, where relevant, `Type` and SQL-source labels such as `SqlArtifact`, `SqlStatement`, `Reference`, `Database`, and `SqlObject`. Repository/file and language-specific SQL edges are projected by the normal loaders. Important call relationships are:
+Обычный граф приложения содержит `Repository`, `File`, `Function`, `Method`, `ModuleInit`, `CallSite`, а при необходимости — `Type` и SQL-сущности `SqlArtifact`, `SqlStatement`, `Reference`, `Database`, `SqlObject`. Связи репозитория и файлов и языковые SQL-связи создаются обычными загрузчиками. Основные связи:
 
-| Stored relationship | Direction | Meaning |
+| Сохраняемая связь | Направление | Значение |
 | --- | --- | --- |
-| `CONTAINS` | `Repository -> File`; `File -> Function/Method/ModuleInit/Type` | Repository/source structure. |
-| `HAS_CALLSITE` | callable owner (`Function`, `Method`, `ModuleInit`) `-> CallSite` | Source-of-truth syntactic call occurrence. |
-| `RESOLVES_TO` | `CallSite -> Function/Method` | Stored exact call-site resolution, with strategy/confidence metadata. |
-| `CALLS` | caller `-> callee` | Compatibility projection of a resolved call; not the preferred traversal projection. |
-| `EXACT_CALLS` | caller `-> callee` | Stored bounded-traversal projection emitted only for exact current-snapshot call resolution. |
-| `CONSTRUCTS` | `CallSite -> Type` and compatibility projection callable owner `-> Type` | Resolved construction fact. |
-| `HAS_DATABASE` | repository `-> Database` | SQL database ownership. |
-| `HAS_OBJECT` | `Database -> SqlObject` | SQL object membership. |
-| `CONTAINS_SQL` | file/artifact/statement according to SQL projection | SQL source containment. |
-| `HAS_REFERENCE` | SQL artifact/statement `-> Reference` | SQL reference occurrence. |
-| `REFERS_TO` | `Reference -> SqlObject` | Stored SQL-name resolution. |
-| `DEFINES`, `READS_FROM`, `WRITES_TO`, `INVOKES_SQL`, `ALTERS`, `DROPS` | `SqlStatement -> SqlObject` | Role-specific SQL object use, with role/location metadata. |
+| `CONTAINS` | `Repository -> File`; `File -> Function/Method/ModuleInit/Type` | Структура репозитория и исходного кода. |
+| `HAS_CALLSITE` | Владелец вызова (`Function`, `Method`, `ModuleInit`) `-> CallSite` | Синтаксическое место вызова — первичный факт исходного кода. |
+| `RESOLVES_TO` | `CallSite -> Function/Method` | Сохранённое точное разрешение цели вызова с метаданными стратегии и уверенности. |
+| `CALLS` | Вызывающая сущность `->` вызываемая сущность | Проекция разрешённого вызова для совместимости; не предпочтительная проекция для обхода. |
+| `EXACT_CALLS` | Вызывающая сущность `->` вызываемая сущность | Проекция для ограниченного обхода, создаваемая только при точном разрешении вызова в текущем снимке. |
+| `CONSTRUCTS` | `CallSite -> Type`; также проекция для совместимости: владелец вызова `-> Type` | Разрешённый факт создания объекта. |
+| `HAS_DATABASE` | Репозиторий `-> Database` | Принадлежность SQL-базы данных репозиторию. |
+| `HAS_OBJECT` | `Database -> SqlObject` | Принадлежность SQL-объекта базе данных. |
+| `CONTAINS_SQL` | Файл, артефакт или инструкция согласно SQL-проекции | Структурное включение SQL-кода. |
+| `HAS_REFERENCE` | SQL-артефакт или инструкция `-> Reference` | Вхождение SQL-ссылки. |
+| `REFERS_TO` | `Reference -> SqlObject` | Сохранённое разрешение SQL-имени. |
+| `DEFINES`, `READS_FROM`, `WRITES_TO`, `INVOKES_SQL`, `ALTERS`, `DROPS` | `SqlStatement -> SqlObject` | Использование SQL-объекта согласно роли, с метаданными роли и расположения. |
 
-SQL source containment is `File -> SqlArtifact -> SqlStatement`, with nested `SqlStatement -> SqlStatement` containment; `SqlStatement -> Reference` is `HAS_REFERENCE`. The role-specific derived edges are emitted only for exact resolutions. See [loader](../src/codekg/loader.py) and [SQL projection](../src/codekg/sql_graph.py).
+Структурное включение SQL имеет вид `File -> SqlArtifact -> SqlStatement`; вложенные инструкции связаны как `SqlStatement -> SqlStatement`. Связь `SqlStatement -> Reference` называется `HAS_REFERENCE`. Производные связи согласно роли создаются только для точных разрешений. См. [загрузчик](../src/codekg/loader.py) и [SQL-проекцию](../src/codekg/sql_graph.py).
 
-### Database corpus graph
+### Граф корпуса базы данных
 
-The supplemental/database projection uses these principal labels and fields:
+Дополнительная проекция корпуса базы данных использует следующие основные метки и поля:
 
-| Label | Exported Neo4j properties (selected actual columns) |
+| Метка | Экспортируемые свойства Neo4j — выбранные фактические столбцы |
 | --- | --- |
 | `CorpusSnapshot` | `key`, `alias`, `logical_repo`, `version`, `role`, `git_commit`, `revision`, `source_digest`, `fingerprint`, `root_path` |
-| `File` | Ordinary file properties from the shared file schema; database-source file facts are represented by `File`. |
+| `File` | Обычные свойства файла из общей схемы; факты о файлах исходного кода базы данных представлены узлами `File`. |
 | `NativeSymbol` | `key`, `snapshot_alias`, `name`, `kind`, `logical_id`, `signature`, `language`, `path`, `start_line/end_line`, `start_column/end_column`, `static`, `declaration`, `condition`, `body_hash`, `return_type`, `definition_hash`, `coverage`, `comparison_primary` |
-| `Routine` | `key`, `snapshot_alias`, `name`, `kind`, `logical_id`, `signature`, `language`, `path`, location fields, `arity`, `library`, `entrypoint`, `body_hash`, `return_type`, `definition_hash`, `coverage`, `condition`, `comparison_primary` |
-| `SourceEvidence` | `key`, `snapshot_alias`, `name`, `path`, `origin`, location fields, `owner_key`, `status`, `dynamic`, `candidate_count`, `candidate_keys_json`, `condition` |
+| `Routine` | `key`, `snapshot_alias`, `name`, `kind`, `logical_id`, `signature`, `language`, `path`, поля расположения, `arity`, `library`, `entrypoint`, `body_hash`, `return_type`, `definition_hash`, `coverage`, `condition`, `comparison_primary` |
+| `SourceEvidence` | `key`, `snapshot_alias`, `name`, `path`, `origin`, поля расположения, `owner_key`, `status`, `dynamic`, `candidate_count`, `candidate_keys_json`, `condition` |
 | `CorpusDiagnostic` | `key`, `snapshot_alias`, `path`, `category`, `severity`, `line`, `column`, `message` |
 
-`CorpusDiagnostic` is an ingestion/extraction/resolution note, not a call or dependency. `HAS_CORPUS_DIAGNOSTIC` therefore means “this source file has a recorded diagnostic,” not “the file depends on the diagnostic.” Its `category`, `severity`, `message`, and optional `line`/`column` describe the note. A diagnostic can report incomplete coverage or a limit of available source metadata without indicating a bug in that source—for example, `MODULE_PATHNAME` may lack a concrete configured library identity, or a template/parser subset may not expose a body. Absence of a diagnostic is not itself a completeness guarantee.
+`CorpusDiagnostic` — сообщение диагностики загрузки, извлечения или разрешения, а не вызов или зависимость. Поэтому `HAS_CORPUS_DIAGNOSTIC` означает «для этого исходного файла записана диагностика», а не «файл зависит от диагностики». Сообщение описывают `category`, `severity`, `message` и необязательные `line`/`column`. Диагностика может указывать на неполное покрытие или ограниченность доступных метаданных, не означая ошибку исходного кода. Например, для `MODULE_PATHNAME` может отсутствовать конкретная настроенная библиотека, а шаблон или ограниченный парсер может не позволять извлечь тело подпрограммы. Само отсутствие диагностики не гарантирует полноту анализа.
 
-For example, a read-only Neo4j Browser query for unresolved extension library placeholders is:
+Пример запроса только для чтения в Neo4j Browser для поиска неразрешённых обозначений библиотек расширений:
 
 ```cypher
 MATCH (f:File)-[:HAS_CORPUS_DIAGNOSTIC]->(d:CorpusDiagnostic)
@@ -63,129 +63,129 @@ ORDER BY source_file, line
 LIMIT 100
 ```
 
-The catalog's SQLite `routines.fact` also carries fields such as `schema_name`, `default_arg_count`, and `variadic_arg_count`; these are not exported `Routine` Neo4j columns. SQLite evidence facts carry richer fields (`object_name`, `schema_name`, `arity`, `owner_qname`, `text`/hash, `dynamic`, etc.) than the selected flattened Neo4j `SourceEvidence` columns. Do not infer missing Neo4j properties from the SQLite fact schema or vice versa.
+Поле `routines.fact` каталога SQLite дополнительно содержит `schema_name`, `default_arg_count`, `variadic_arg_count` и другие поля; они не экспортируются как столбцы узла `Routine` в Neo4j. Факты свидетельств в SQLite богаче выбранных плоских столбцов `SourceEvidence` в Neo4j: они содержат `object_name`, `schema_name`, `arity`, `owner_qname`, `text` и его хеш, `dynamic` и другие данные. Нельзя выводить наличие свойств Neo4j из схемы фактов SQLite или наоборот.
 
-Relationships emitted in the corpus graph include:
+В графе корпуса создаются следующие связи:
 
-| Stored relationship | Direction | Meaning / relevant properties |
+| Сохраняемая связь | Направление | Значение и важные свойства |
 | --- | --- | --- |
-| `SNAPSHOT_OF` | `CorpusSnapshot -> Repository` | Snapshot-to-logical repository link. |
-| `DEPENDS_ON_SNAPSHOT` | `CorpusSnapshot -> CorpusSnapshot` | Explicit snapshot dependency. |
-| `HAS_NATIVE_SYMBOL` | `File -> NativeSymbol` | File contains a native fact; status/location/condition can be retained. |
-| `HAS_ROUTINE` | `File -> Routine` | File contains a routine definition/catalog fact. |
-| `HAS_EVIDENCE` | `File -> SourceEvidence` and, when uniquely established, owning `Function`/`Method`/`Routine`/`NativeSymbol -> SourceEvidence` | Evidence ownership. A file owner is the `File` node (not a separate `CorpusFile`). Owner edges retain status, location and condition. |
-| `HAS_CORPUS_DIAGNOSTIC` | `File -> CorpusDiagnostic` | Extractor/resolution diagnostic. |
-| `INVOKES_ROUTINE` | `SourceEvidence -> Routine` | Stored, within-corpus routine invocation only when emitted by resolution. |
-| `DOCUMENTS_ROUTINE` | `SourceEvidence -> Routine` | Documentation link, not executable invocation. |
-| `ROUTINE_CANDIDATE` | `SourceEvidence -> Routine` | Potential routine matches whose identity is not exact. |
-| `DESCRIBES_SQL_OBJECT` | `Routine -> SqlObject` | Exact kind/signature match between source routine and SQL object. |
-| `BINDS_TO_NATIVE` | `Routine -> NativeSymbol` | Unique allowed C/internal binding. |
-| `NATIVE_CANDIDATE` | `Routine -> NativeSymbol`, or native caller/evidence `-> NativeSymbol` | Candidate only; not an asserted path edge. |
-| `CALLS_NATIVE` | `NativeSymbol -> NativeSymbol` and, where occurrence identity exists, `SourceEvidence -> NativeSymbol` | Exact statically resolved C call. |
+| `SNAPSHOT_OF` | `CorpusSnapshot -> Repository` | Связь снимка с логическим репозиторием. |
+| `DEPENDS_ON_SNAPSHOT` | `CorpusSnapshot -> CorpusSnapshot` | Явная зависимость снимка. |
+| `HAS_NATIVE_SYMBOL` | `File -> NativeSymbol` | Файл содержит нативный факт; могут сохраняться статус, расположение и условие. |
+| `HAS_ROUTINE` | `File -> Routine` | Файл содержит определение подпрограммы или факт из каталога. |
+| `HAS_EVIDENCE` | `File -> SourceEvidence`; при однозначно установленном владельце также `Function`/`Method`/`Routine`/`NativeSymbol` `-> SourceEvidence` | Принадлежность свидетельства. Владелец-файл — узел `File`, а не отдельный `CorpusFile`. Связи владельца сохраняют статус, расположение и условие. |
+| `HAS_CORPUS_DIAGNOSTIC` | `File -> CorpusDiagnostic` | Диагностика извлечения или разрешения. |
+| `INVOKES_ROUTINE` | `SourceEvidence -> Routine` | Сохранённый вызов подпрограммы внутри корпуса, создаваемый разрешением. |
+| `DOCUMENTS_ROUTINE` | `SourceEvidence -> Routine` | Документационная ссылка, а не исполняемый вызов. |
+| `ROUTINE_CANDIDATE` | `SourceEvidence -> Routine` | Возможные соответствия подпрограмме без точного установления её идентичности. |
+| `DESCRIBES_SQL_OBJECT` | `Routine -> SqlObject` | Точное соответствие вида и сигнатуры исходной подпрограммы SQL-объекту. |
+| `BINDS_TO_NATIVE` | `Routine -> NativeSymbol` | Единственная допустимая привязка подпрограммы C/internal. |
+| `NATIVE_CANDIDATE` | `Routine -> NativeSymbol` либо нативный вызывающий символ или свидетельство `-> NativeSymbol` | Только кандидат, не подтверждённое ребро пути. |
+| `CALLS_NATIVE` | `NativeSymbol -> NativeSymbol`; при наличии идентичности вхождения также `SourceEvidence -> NativeSymbol` | Точный статически разрешённый C-вызов. |
 
-Other graph relationship kinds can occur in the regular application/SQL model. The table above focuses on cross-language/native corpus facts. Stored relationship provenance/status/condition is important: candidate relationships do not become exact merely by appearing in the graph.
+В обычной модели приложения и SQL могут встречаться и другие виды связей. Таблица выше сосредоточена на межъязыковых и нативных фактах корпуса. Важны происхождение, статус и условие сохранённой связи: само присутствие связи-кандидата в графе не делает её точной.
 
-### Identity and revision rules
+### Правила идентичности и ревизий
 
-- Each graph has its own `graph_id` and immutable `generation_id`; a fact reference is additionally keyed by an opaque, generation-local `local_key`.
-- Corpus snapshots have `alias`, repository/version/role metadata, source identity (`git_commit` when known), content/config `revision`, source digest and fingerprint. `revision` is not a Git commit.
-- A graph `generation_id` hashes the exact generation-manifest bytes together with the sorted `(snapshot alias, revision)` vector; its graph ID scopes that identity. The selected context contributes a context ID/configuration to federation selection, not another emitted generation/revision scalar.
-- Corpus fact keys derive from snapshot alias, revision, path, fact table and occurrence ordinal. Repeated same-name facts/calls remain distinct occurrences; logical IDs are comparison/grouping aids, not EntityRefs.
-- SQL and native evidence retains source path/line/column and may include a conditional guard. Revisions/generations are not unified across versions: compare tools compare scoped catalogs, they do not merge the graph versions.
+- У каждого графа собственные `graph_id` и неизменяемый `generation_id`; ссылка на факт дополнительно содержит непрозрачный `local_key`, локальный для поколения.
+- Снимки корпуса имеют `alias`, метаданные репозитория, версии и роли, идентичность исходников (`git_commit`, если известен), ревизию содержимого и конфигурации `revision`, дайджест исходников и отпечаток. `revision` — не Git-коммит.
+- `generation_id` графа вычисляется хешированием точных байтов манифеста поколения и отсортированного вектора `(алиас снимка, revision)`; идентификатор графа задаёт область этой идентичности. Выбранный контекст участвует в выборе через свой идентификатор и конфигурацию, но не создаёт отдельное возвращаемое поле поколения или ревизии.
+- Ключи фактов корпуса формируются из алиаса снимка, ревизии, пути, таблицы фактов и порядкового номера вхождения. Повторные одноимённые факты и вызовы остаются отдельными вхождениями; логические идентификаторы помогают сравнению и группировке, но не заменяют `EntityRef`.
+- SQL-свидетельства и нативные свидетельства сохраняют путь, строку и столбец и могут содержать условие. Ревизии и поколения разных версий не объединяются: инструменты сравнения сопоставляют выбранные каталоги, а не сливают версии графов.
 
-## 3. Evidence production and resolution
+## 3. Создание свидетельств и разрешение целей
 
-Current `SourceEvidenceIR` includes `origin`, optional schema/object name and arity, owner qname/line, source span, dynamic flag, optional text/hash, and condition. Implemented origins include:
+Текущий `SourceEvidenceIR` содержит `origin`, необязательные схему, имя объекта и число аргументов, квалифицированное имя и строку владельца, диапазон расположения в исходнике, признак динамичности, необязательные текст и хеш, а также условие. Реализованы следующие значения происхождения:
 
-- `python_execute`: literal/constant SQL passed to recognized Python database `execute` calls. Static string literals, safe module constants and locally tracked constants can be extracted; dynamic interpolation/runtime values are retained as dynamic evidence or omitted from exact-name resolution.
-- `sql_source`: statically recognized function references in selected SQL source files outside extracted routine bodies.
-- `routine_body`: SQL/PL/pgSQL function/procedure body call references found in selected `CREATE FUNCTION/PROCEDURE` source. SQL body evidence is emitted only where the established SQL parser can statically identify it.
-- `native_call`: C function-call occurrence parsed from selected native source; paired to a uniquely owned C function when possible.
-- `markdown_sql`: function calls from fenced SQL in Markdown; `markdown_mention`: explicitly qualified backticked routine mentions. These are documentation evidence; resolver reports `documentation` and does not assert invocation.
+- `python_execute`: SQL-литерал или константа, переданные распознанному Python-вызову базы данных `execute`. Можно извлекать статические строковые литералы, безопасные константы модуля и локально отслеживаемые константы. Динамическая интерполяция и значения времени исполнения сохраняются как динамические свидетельства либо исключаются из точного разрешения имени.
+- `sql_source`: статически распознанные ссылки на функции в выбранных SQL-файлах вне извлечённых тел подпрограмм.
+- `routine_body`: ссылки на вызовы из тела SQL- или PL/pgSQL-функции/процедуры, найденные в выбранных исходниках `CREATE FUNCTION/PROCEDURE`. Свидетельства тела создаются только там, где используемый SQL-парсер может статически их распознать.
+- `native_call`: вхождение вызова C-функции, разобранное из выбранного нативного кода; по возможности связывается с однозначно установленной C-функцией-владельцем.
+- `markdown_sql`: вызовы функций из блоков SQL-кода в Markdown; `markdown_mention`: упоминания подпрограмм с явно указанной схемой, заключённые в обратные кавычки. Это документационные свидетельства: разрешение возвращает `documentation` и не утверждает наличие вызова.
 
-C `NativeSymbol` facts are parsed from selected C files. Routine facts are extracted from selected SQL/`.sql.in` declarations and safely parsed `pg_proc.dat` records. Those parsers do not execute source/build/configure code. See [native IR](../src/codekg/native_ir.py), [Python/Markdown evidence](../src/codekg/native_evidence.py), and [routine/catalog extraction](../src/codekg/native_sql.py).
+Факты C-символов `NativeSymbol` извлекаются из выбранных C-файлов. Факты подпрограмм извлекаются из выбранных объявлений SQL/`.sql.in` и безопасно разбираемых записей `pg_proc.dat`. Парсеры не исполняют исходный код, сборку или конфигурационные сценарии. См. [нативное промежуточное представление](../src/codekg/native_ir.py), [свидетельства Python и Markdown](../src/codekg/native_evidence.py), [извлечение подпрограмм и каталога](../src/codekg/native_sql.py).
 
-### Contextual lookup order
+### Порядок контекстного поиска
 
-For a concrete non-documentation intent, resolution checks schema/name and evidence arity in the application graph's routine facts first for each schema in context search-path order (or the explicitly named schema). An application-local routine shadows a database routine of the same selected name in that scope. If none exists locally, it checks the selected PostgreSQL snapshot plus only aliases in `visible_extensions`, with database schema/search-path ordering. It does not search every database graph or every registered extension implicitly.
+Для конкретного недокументационного свидетельства обращения сначала проверяются схема, имя и число аргументов в фактах подпрограмм графа приложения — для каждой схемы в порядке поиска контекста либо для явно указанной схемы. Локальная подпрограмма приложения затеняет подпрограмму базы данных с тем же выбранным именем в этой области. Если локального соответствия нет, проверяются выбранный снимок PostgreSQL и только алиасы из `visible_extensions`, с учётом схем и порядка поиска. Все зарегистрированные графы баз данных и расширения автоматически не перебираются.
 
-The current `_signature_known` check accepts a unique unguarded candidate when the evidence arity is compatible with candidate arity/default/variadic counts and no argument-type evidence is present. It explicitly does **not** prove PostgreSQL overload selection by argument types. Candidate truncation prevents exact status.
+Текущая проверка `_signature_known` принимает единственного кандидата без условия, когда число аргументов свидетельства совместимо с числом аргументов кандидата, параметрами по умолчанию и вариативными параметрами, а сведения о типах аргументов отсутствуют. Она явно **не** доказывает выбор перегрузки PostgreSQL по типам аргументов. Усечение списка кандидатов исключает статус точного разрешения.
 
-### Resolution states
+### Статусы разрешения
 
-- `exact`: one candidate selected by this static/contextual algorithm, with no relevant condition and no candidate overflow. Treat as a statically resolved source relation, not runtime proof.
-- `ambiguous`: multiple candidates or insufficient static signature evidence to establish one.
-- `conditional`: a unique candidate or source is guarded by an unevaluated condition/template/control context; not an unconditional path assertion.
-- `candidate_overflow`: candidate list exceeded the bounded lookup cap; resolution is incomplete.
-- `dynamic`: evidence has a dynamic name/value and no static target is asserted.
-- `unresolved`: concrete name has no visible candidate or cannot be resolved.
-- `documentation`: Markdown mention/snippet; descriptive evidence, not an invocation.
+- `exact`: статический контекстный алгоритм выбрал одного кандидата без соответствующего условия и без переполнения списка кандидатов. Это статически разрешённая связь исходного кода, не доказательство исполнения.
+- `ambiguous`: несколько кандидатов либо недостаточно статических сведений о сигнатуре для однозначного выбора.
+- `conditional`: единственный кандидат или исходное свидетельство ограничены невычисленным условием, шаблоном или контекстом управляющих конструкций; безусловный путь не утверждается.
+- `candidate_overflow`: список кандидатов превысил ограничение поиска; разрешение неполное.
+- `dynamic`: имя или значение динамические, статическая цель не утверждается.
+- `unresolved`: для конкретного имени нет видимого кандидата либо цель невозможно разрешить.
+- `documentation`: упоминание или фрагмент Markdown; описательное свидетельство, а не вызов.
 
-Corpus export can also summarize evidence's stored local status as `exact`, `conditional`, `ambiguous`, `dynamic`, or `unresolved` with candidate count/key list. This projection is not the same as a fresh context-specific federation result. Federation responses may additionally return API statuses including `ok`, `not_found`, `invalid_reference`, `invalid_arguments`, `context_required`, `deadline_exceeded`, and `invalid_cursor`.
+Экспорт корпуса также может сохранять обобщённый локальный статус свидетельства: `exact`, `conditional`, `ambiguous`, `dynamic` или `unresolved`, с количеством и списком ключей кандидатов. Эта проекция не равнозначна новому результату федерации для выбранного контекста. Ответы федерации дополнительно могут возвращать статусы API: `ok`, `not_found`, `invalid_reference`, `invalid_arguments`, `context_required`, `deadline_exceeded`, `invalid_cursor`.
 
-## 4. Native binding and analysis limits
+## 4. Привязка к нативному коду и ограничения анализа
 
-For SQL `LANGUAGE c`, extraction interprets `AS` values as library then C entrypoint (default entrypoint is the routine name when absent). For `LANGUAGE internal`, `AS` supplies the internal entrypoint. Selected PostgreSQL dependency snapshots provide possible native definitions. A `BINDS_TO_NATIVE` edge is emitted only when binding is allowed and exactly one selected non-static native function matches the entrypoint; otherwise matches are `NATIVE_CANDIDATE`, or an unresolved-binding diagnostic is recorded. Internal binding is explicitly limited to selected dependencies. A concrete extension library/control-file identity must be available to permit a definite C binding; a placeholder such as `MODULE_PATHNAME` is not magically resolved from a configure/build environment.
+Для SQL `LANGUAGE c` извлечение трактует значения `AS` как библиотеку и затем точку входа C; если имя точки входа отсутствует, используется имя подпрограммы. Для `LANGUAGE internal` значение `AS` задаёт внутреннюю точку входа. Выбранные снимки зависимостей PostgreSQL предоставляют возможные нативные определения. Ребро `BINDS_TO_NATIVE` создаётся только тогда, когда привязка допустима и точке входа соответствует ровно одна выбранная нестатическая нативная функция. Иначе соответствия представлены как `NATIVE_CANDIDATE` либо записывается диагностика неразрешённой привязки. Внутренняя привязка явно ограничена выбранными зависимостями. Для определённой привязки C требуется конкретная идентичность библиотеки расширения и его управляющего файла; обозначение `MODULE_PATHNAME` не разрешается автоматически из окружения конфигурации или сборки.
 
-Native C calls are exact only when source parsing yields a concrete callee, owner resolves uniquely, one preferred target remains, and no visible macro/condition makes the target uncertain. Dynamic/indirect calls do not receive asserted target edges. Macro uncertainty and unresolved/ambiguous ownership are diagnostics/candidates rather than exact edges.
+Нативный C-вызов считается точным, только если разбор исходника даёт конкретную вызываемую функцию, её владелец установлен однозначно, остаётся одна предпочтительная цель и видимые макросы или условия не делают эту цель неопределённой. Динамические и косвенные вызовы не получают подтверждённых рёбер к целям. Неопределённость макросов и неразрешённый или неоднозначный владелец отражаются диагностикой и кандидатами, а не точными рёбрами.
 
-For `.sql.in`, preprocessor directives are masked, not evaluated. Template guards survive as conditions; unresolved tokens or unsupported attributes generate diagnostics and can reduce coverage. No preprocessor configuration matrix or configured output is synthesized.
+В `.sql.in` директивы препроцессора маскируются, а не вычисляются. Условия шаблонов сохраняются как условия; неразрешённые токены или неподдерживаемые атрибуты создают диагностику и могут снижать покрытие. Матрица конфигураций препроцессора и результаты конфигурирования не синтезируются.
 
-## 5. SQL and PL body coverage
+## 5. Покрытие тел SQL и процедурных языков
 
-- `LANGUAGE sql` and `LANGUAGE plpgsql` declarations are recorded. The implementation reuses the established SQL parser for statically analyzable routine bodies and emits body evidence for concrete function references (including dynamic references as dynamic evidence). Parse diagnostics can downgrade body coverage to `body_partial`.
-- A known body hash/coverage marker describes extracted source availability, not full semantic interpretation or execution. C/internal routines are declaration/binding facts, not parsed SQL bodies.
-- Other languages are recorded as declaration-only with an unsupported-language diagnostic.
-- PostgreSQL `pg_proc.dat` parsing handles a deliberately restricted quoted key/value record subset without evaluating Perl. Unsupported/malformed records are diagnostics; catalog mapping facts do not imply executable/runtime availability.
-- External SQL evidence is not a complete SQL dependency model: current cross-language bridge evidence emphasizes function calls. Full SQL statement object semantics are represented separately by the regular SQL graph parser.
+- Объявления `LANGUAGE sql` и `LANGUAGE plpgsql` сохраняются. Для статически анализируемых тел используется существующий SQL-парсер; из конкретных ссылок на функции создаются свидетельства тела, а динамические ссылки представлены динамическими свидетельствами. Диагностика разбора может снизить покрытие тела до `body_partial`.
+- Известный хеш тела и маркер покрытия описывают доступность извлечённых исходников, а не полную семантическую интерпретацию или исполнение. Подпрограммы C/internal представлены фактами объявления и привязки, а не разобранными SQL-телами.
+- Для остальных языков сохраняются только объявления и диагностика неподдерживаемого языка.
+- Разбор PostgreSQL `pg_proc.dat` обрабатывает намеренно ограниченное подмножество записей «ключ — значение» со строками в кавычках, без исполнения Perl. Неподдерживаемые или некорректные записи отражаются диагностикой. Факты сопоставления каталога не доказывают доступность сущности во время исполнения.
+- Свидетельства внешнего SQL не являются полной моделью SQL-зависимостей: текущий межъязыковой мост сосредоточен на вызовах функций. Полная объектная семантика SQL-инструкций представлена отдельно обычным парсером SQL-графа.
 
-## 6. Forward and reverse federation
+## 6. Прямая и обратная федерация
 
-The public MCP federation surface is implemented in [federation.py](../src/codekg/federation.py) and registered in [server.py](../src/codekg/mcp/server.py):
+Публичные инструменты федерации MCP реализованы в [federation.py](../src/codekg/federation.py) и зарегистрированы в [server.py](../src/codekg/mcp/server.py):
 
-- `list_knowledge_graphs`: metadata-only graph/context inventory; backend verification is deferred until query.
-- `list_database_intents`: bounded/paged app-side intent discovery by owner path, owner qname, or exact evidence key.
-- `resolve_database_intent`: resolve one generation-scoped app evidence reference under a named context.
-- `trace_application_database_path`: forward composition from exactly one evidence ref, owner path/qname, or selected entry ref to an optional database target. It follows app `EXACT_CALLS`, evidence ownership, context-bound intent-to-routine resolution and bounded stored database relationships. Application-local SQL routine body evidence is followed one level before switching to a database routine only when an explicit database target is provided. Without that target, a locally resolved path ends at the application-local routine. Only one app/database boundary is supported; callbacks and repeated crossings are outside coverage.
-- `find_application_database_usages`: reverse from one database-generation target through stored database ancestors to bounded same-name app evidence postings, then re-resolves postings in context. Qualified and unqualified names are candidate postings, not proof; ambiguous/conditional hits are marked candidate-only.
-- `compare_knowledge_graphs`: compare two selected database graph generations by logical repository with bounded catalog work; no graph merge.
+- `list_knowledge_graphs`: перечень графов и контекстов только по метаданным; проверка хранилища отложена до запроса.
+- `list_database_intents`: ограниченное постраничное получение свидетельств обращения к базе данных на стороне приложения — по пути владельца, квалифицированному имени владельца или точному ключу свидетельства.
+- `resolve_database_intent`: разрешение одной ссылки на свидетельство приложения, привязанной к поколению, в именованном контексте.
+- `trace_application_database_path`: прямая сборка пути от ровно одного свидетельства, пути или квалифицированного имени владельца либо выбранной ссылки на входную сущность — к необязательной цели в базе данных. Используются `EXACT_CALLS` приложения, принадлежность свидетельств, контекстное разрешение обращения к подпрограмме и ограниченный обход сохранённых связей базы данных. Свидетельства тела локальной SQL-подпрограммы приложения обходятся на один уровень перед переходом к подпрограмме базы данных только при явно указанной цели в базе данных. Без такой цели локально разрешённый путь заканчивается на локальной подпрограмме приложения. Поддерживается только один переход через границу «приложение — база данных»; обратные вызовы и повторные переходы находятся вне покрытия.
+- `find_application_database_usages`: обратный поиск от одной цели выбранного поколения базы данных через сохранённые предшествующие узлы к ограниченному набору поисковых записей одноимённых свидетельств приложения; затем эти свидетельства заново разрешаются в контексте. Имена со схемой и без схемы создают кандидатов поиска, а не доказательство вызова; неоднозначные и условные результаты помечаются как кандидаты.
+- `compare_knowledge_graphs`: сравнение двух выбранных поколений графов базы данных по логическому репозиторию с ограниченной работой над каталогами; без объединения графов.
 
-Bounds are part of semantics. Trace clamps deadline to at most 10 seconds, depth to 1–32, output limit to at most 5 paths, Python reachable-owner walk and evidence collection are capped, and database traversal keeps visited/edge budgets. Reverse usage has a 10-second deadline, at most 1,000 returned usages, an incoming database walk capped at 1,000 visited facts/10,000 examined edges and a 1,000-posting work cap. Results expose truncation/coverage; incomplete work must not be represented as complete. Continuations bind context, both graph generations, target and depth; an incomplete ancestor walk cannot be resumed as if complete.
+Ограничения являются частью семантики. Прямая трассировка ограничивает время максимумом 10 секунд, глубину диапазоном 1–32, результат — максимумом 5 путей. Обход достижимых Python-владельцев и сбор свидетельств также ограничены; для обхода базы данных действуют лимиты посещённых узлов и просмотренных рёбер. Обратный поиск имеет предел 10 секунд, возвращает не более 1 000 использований, ограничивает входящий обход базы данных 1 000 посещённых фактов и 10 000 просмотренных рёбер, а обработку поисковых записей — 1 000 записями. Результаты отражают усечение и покрытие; неполную работу нельзя представлять как полную. Курсоры продолжения привязаны к контексту, поколениям обоих графов, цели и глубине. Неполный обход предшествующих узлов нельзя продолжать так, будто он уже завершён.
 
-The response serializes virtual steps with relationship names such as `INVOKES` and `INVOKES_LOCAL_ROUTINE`. These are path-segment labels, not persisted graph relationship types. The persisted relation on the database side, if any, remains its actual type such as `INVOKES_ROUTINE`, `BINDS_TO_NATIVE`, or `CALLS_NATIVE`.
+Ответ сериализует виртуальные шаги с именами связей `INVOKES`, `INVOKES_LOCAL_ROUTINE` и другими. Это метки сегментов пути, а не сохраняемые типы связей графа. Сохранённая связь на стороне базы данных, если она есть, сохраняет фактический тип, например `INVOKES_ROUTINE`, `BINDS_TO_NATIVE` или `CALLS_NATIVE`.
 
-## 7. Demonstrated example (static only)
+## 7. Проверенный пример — только статический анализ
 
-The live demo includes a fixture path:
+В демонстрационном окружении есть путь из тестового примера:
 
 ```text
 Python run
   --EXACT_CALLS--> inspect_cron
-  --HAS_EVIDENCE--> Python SQL intent for cron.schedule
-  --(virtual INVOKES under python-on-pg18 context)--> pg_cron Routine cron.schedule
+  --HAS_EVIDENCE--> свидетельство SQL-вызова cron.schedule из Python
+  --(виртуальный INVOKES в контексте python-on-pg18)--> pg_cron Routine cron.schedule
   --BINDS_TO_NATIVE--> pg_cron NativeSymbol cron_schedule
   --CALLS_NATIVE--> PostgreSQL NativeSymbol errmsg
 ```
 
-The PostgreSQL/pg_cron native implementation reached through `cron_schedule` contains a branch-specific error call to PostgreSQL `errmsg`; the path is extracted C source evidence and does not claim that the branch runs. The Python fixture itself only calls `cron.schedule`. More generally, trace tests establish source-to-source resolution against pinned snapshots, not that a live service executed the statement. The [demo report](federated-kg-demo.md) documents additional examples and explicitly distinguishes static evidence from runtime assertions.
+Нативная реализация PostgreSQL/pg_cron, достигаемая через `cron_schedule`, содержит вызов PostgreSQL `errmsg` в ветке обработки ошибки. Путь представляет извлечённые свидетельства C-кода и не утверждает, что эта ветка выполняется. Сам Python-пример только вызывает `cron.schedule`. В целом проверки трассировки устанавливают разрешение связей между исходниками зафиксированных снимков, а не исполнение инструкции работающим сервисом. [Отчёт о демонстрационном окружении](federated-kg-demo.md) содержит дополнительные примеры и явно разделяет статические свидетельства и утверждения о фактическом исполнении.
 
-## 8. Supported behavior versus future/generalized scope
+## 8. Реализованное поведение и границы обобщения
 
-| Implemented behavior | Not implied / not currently supported generally |
+| Реализованное поведение | Что не подразумевается и в общем случае пока не поддерживается |
 | --- | --- |
-| Explicit Python literal/constant SQL evidence; selected SQL/PL routine-body evidence; selected C calls and PostgreSQL/extension routine-to-native bindings. | Arbitrary language plugins, arbitrary framework/database APIs, runtime string evaluation, reflective/dynamic dispatch, or universal multilingual interprocedural analysis. |
-| Explicit context selects DB graph, visible extension aliases and search path; local routines shadow DB candidates. | Automatic discovery of installed extensions, dependency compatibility, extension build outputs or ambient configure flags. |
-| Version-scoped generations and bounded forward/reverse source paths. | Persisted cross-database relationships, graph-wide union across versions, unbounded path completeness, repeated database crossings or callbacks. |
-| SQL/PL and C/native extraction with diagnostics and coverage fields. | Full template/preprocessor evaluation, execution, complete control-flow/path conditions, ABI verification or proof of runtime behavior. |
+| Явные свидетельства SQL-литералов и констант Python, выбранные свидетельства тел SQL/PL-подпрограмм, выбранные C-вызовы и привязки подпрограмм PostgreSQL/расширений к нативному коду. | Произвольные языковые плагины и API фреймворков или баз данных, вычисление строк во время исполнения, рефлексия и динамическая диспетчеризация, универсальный многоязычный межпроцедурный анализ. |
+| Явный контекст выбирает граф базы данных, алиасы видимых расширений и порядок поиска; локальные подпрограммы затеняют кандидатов базы данных. | Автоматическое обнаружение установленных расширений, совместимости зависимостей, результатов сборки расширений или окружающих параметров конфигурации. |
+| Поколения, ограниченные версией, и ограниченные прямые и обратные пути по исходникам. | Сохраняемые межбазовые связи, объединение графов разных версий, полнота неограниченного поиска путей, повторные переходы к базе данных и обратные вызовы. |
+| Извлечение SQL/PL и нативного C-кода с диагностикой и полями покрытия. | Полное вычисление шаблонов и препроцессора, исполнение, полный анализ потока управления и условий путей, проверка ABI или доказательство поведения во время исполнения. |
 
-## Source map
+## Карта исходного кода
 
-- [Registry and generation references](../src/codekg/graph_registry.py)
-- [Federation and virtual path construction](../src/codekg/federation.py)
-- [Generation catalog](../src/codekg/graph_catalog.py)
-- [Offline corpus graph export](../src/codekg/corpus_export.py)
-- [Fact extraction and in-corpus resolution](../src/codekg/corpus_registry.py)
-- [Native/routine IR](../src/codekg/native_ir.py)
-- [SQL routine and `pg_proc.dat` extraction](../src/codekg/native_sql.py)
-- [Python SQL and Markdown evidence](../src/codekg/native_evidence.py)
-- [Existing graph operations and demo](independent-graph-operations.md), [federated demo](federated-kg-demo.md)
+- [Реестр и ссылки на поколения](../src/codekg/graph_registry.py)
+- [Федерация и построение виртуальных путей](../src/codekg/federation.py)
+- [Каталог поколения](../src/codekg/graph_catalog.py)
+- [Автономный экспорт графа корпуса](../src/codekg/corpus_export.py)
+- [Извлечение фактов и разрешение внутри корпуса](../src/codekg/corpus_registry.py)
+- [Промежуточное представление нативных символов и подпрограмм](../src/codekg/native_ir.py)
+- [Извлечение SQL-подпрограмм и `pg_proc.dat`](../src/codekg/native_sql.py)
+- [Свидетельства SQL из Python и Markdown](../src/codekg/native_evidence.py)
+- [Операции с независимыми графами](independent-graph-operations.md), [демонстрационное окружение федерации](federated-kg-demo.md)

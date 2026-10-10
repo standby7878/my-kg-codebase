@@ -1,64 +1,64 @@
-# CodeKG model overview
+# Обзор модели CodeKG
 
-CodeKG is a static, generation-pinned source model with a request-time federation layer. It can connect facts from different source languages when the extractors can produce a concrete call/reference and the selected context can resolve it. It is **not** a general multilingual runtime call graph.
+CodeKG — статическая модель исходного кода, привязанная к конкретному поколению графа, со слоем федерации, работающим во время запроса. Она связывает факты из разных языков, если экстракторы могут выделить конкретный вызов или ссылку, а выбранный контекст позволяет разрешить её цель. Это **не** универсальный многоязычный граф вызовов времени исполнения.
 
-## Two separately served graphs
+## Два независимо обслуживаемых графа
 
-The current demo uses two independently exported and served Neo4j Community graphs, one of each kind:
+В текущем демонстрационном окружении используются два независимо экспортируемых и обслуживаемых графа Neo4j Community — по одному каждого вида:
 
-- **Application graph** — application/repository source, including Python `Function`/`Method` entities, call sites, and SQL source facts.
-- **Database graph** — a PostgreSQL source snapshot plus only the explicitly selected extension snapshots/dependency view, with SQL `Routine` declarations and C `NativeSymbol` facts.
+- **Граф приложения** — исходный код приложения и его репозиториев, включая Python-сущности `Function`/`Method`, места вызовов и факты из SQL-кода.
+- **Граф базы данных** — снимок исходного кода PostgreSQL и только явно выбранные снимки расширений с их зависимостями; содержит объявления SQL-подпрограмм `Routine` и факты о C-символах `NativeSymbol`.
 
-The registry can hold multiple version-scoped database graphs at once (and multiple application graphs); each graph has its own corpus generation, Neo4j instance/data volume, endpoint and `CodeKGGeneration` marker. A `GraphContext` selects one application/database pair and names the application database, visible extension snapshot aliases, and SQL `search_path`; these are request-time selection rules, not graph-wide links. There are no stored Neo4j edges crossing between graph databases. Federation results identify both graph generations and the context ID; there is no separate context-revision field. The process pins the registry and verifies each backend's graph/generation marker before federation work. See [independent graph operations](independent-graph-operations.md) and the [validated federation demo](federated-kg-demo.md).
+Реестр может одновременно содержать несколько графов базы данных для разных версий, а также несколько графов приложений. Каждый граф имеет собственное поколение корпуса, экземпляр Neo4j, том данных, адрес подключения и маркер `CodeKGGeneration`. Объект `GraphContext` выбирает одну пару «приложение — база данных» и задаёт базу данных приложения, алиасы видимых снимков расширений и SQL-параметр `search_path`. Это правила выбора во время запроса, а не связи между всеми узлами графов. Сохраняемых рёбер Neo4j между разными базами графов нет. Результаты федерации указывают поколения обоих графов и идентификатор контекста; отдельного поля ревизии контекста нет. Процесс фиксирует реестр и перед выполнением федеративных запросов проверяет маркер графа и поколения в каждом хранилище. См. [операции с независимыми графами](independent-graph-operations.md) и [проверенное демонстрационное окружение федерации](federated-kg-demo.md).
 
-## Language switches are composed from evidence
+## Переходы между языками собираются из свидетельств исходного кода
 
-A representative path is:
+Типичный путь выглядит так:
 
-1. Python source contains a statically recognized function call, represented by an application-graph `EXACT_CALLS` edge.
-2. A Python DB-API `execute` argument that is statically available as literal/constant SQL produces a `SourceEvidence` occurrence (origin `python_execute`). Statically extracted calls in SQL source use origin `sql_source`.
-3. The selected context resolves its SQL name in order: application-local routine first; otherwise PostgreSQL plus the context's visible extensions under schema/search-path rules. This binding is virtual and computed at request time.
-4. If the selected target is a SQL-language or analyzable PL/pgSQL routine, its extracted body references can resolve onward to another `Routine` in the database graph. For a C-language routine, `BINDS_TO_NATIVE` can connect the database `Routine` to a matching C `NativeSymbol`; a static native call may then continue along `CALLS_NATIVE`.
+1. Исходный Python-код содержит статически распознанный вызов функции, представленный ребром `EXACT_CALLS` в графе приложения.
+2. Аргумент Python DB-API-вызова `execute`, доступный статически как SQL-литерал или константа, создаёт отдельный факт `SourceEvidence` с происхождением `python_execute`. Статически выделенные вызовы в SQL-файлах имеют происхождение `sql_source`.
+3. Выбранный контекст разрешает SQL-имя: сначала проверяется локальная подпрограмма приложения, затем — PostgreSQL и видимые в контексте расширения, с учётом схем и порядка поиска. Эта привязка виртуальная и вычисляется во время запроса.
+4. Если целью является SQL-подпрограмма или анализируемая подпрограмма PL/pgSQL, извлечённые ссылки из её тела могут вести к другой `Routine` в графе базы данных. Для подпрограммы на C связь `BINDS_TO_NATIVE` может соединить `Routine` с соответствующим C-символом `NativeSymbol`; далее статический нативный вызов может продолжить путь по `CALLS_NATIVE`.
 
-The app/database boundary is therefore a *composed result*, not a persisted edge. Dashed arrows below denote request-time composition; solid arrows denote stored relationships. A `SourceEvidence` occurrence is persisted in its owning graph, but its contextual binding is not.
+Таким образом, переход через границу «приложение — база данных» — это *составной результат запроса*, а не сохранённое ребро. Пунктирные стрелки ниже обозначают сборку пути во время запроса, сплошные — сохранённые связи. Сам факт `SourceEvidence` хранится в своём графе, но его контекстная привязка не сохраняется.
 
 ```mermaid
 flowchart LR
-  subgraph A[Application Neo4j — one generation]
+  subgraph A[Neo4j приложения — одно поколение]
     P[Python Function / Method]
     E["SourceEvidence<br/>origin=python_execute"]
-    LR[Application-local SQL Routine]
-    P -->|EXACT_CALLS — stored| P2[Python callee]
-    P2 -->|HAS_EVIDENCE — stored| E
+    LR[Локальная SQL Routine приложения]
+    P -->|EXACT_CALLS — сохранённая связь| P2[Вызываемая Python-функция]
+    P2 -->|HAS_EVIDENCE — сохранённая связь| E
   end
-  subgraph D[Database Neo4j — independent generation]
-    R[PostgreSQL or visible extension Routine]
-    BE[Routine-body SourceEvidence]
-    R2[Routine reached from SQL body]
+  subgraph D[Neo4j базы данных — независимое поколение]
+    R[Routine PostgreSQL или видимого расширения]
+    BE[SourceEvidence из тела подпрограммы]
+    R2[Routine, вызываемая из SQL-тела]
     C[NativeSymbol]
-    R -->|HAS_EVIDENCE — stored| BE
-    BE -->|INVOKES_ROUTINE — stored| R2
-    R -->|BINDS_TO_NATIVE — stored| C
-    C -->|CALLS_NATIVE — stored exact source call| C2[Native callee]
+    R -->|HAS_EVIDENCE — сохранённая связь| BE
+    BE -->|INVOKES_ROUTINE — сохранённая связь| R2
+    R -->|BINDS_TO_NATIVE — сохранённая связь| C
+    C -->|CALLS_NATIVE — сохранённый точный вызов| C2[Вызываемый нативный символ]
   end
-  E -.->|contextual resolution: INVOKES| R
-  E -.->|contextual local shadow: INVOKES_LOCAL_ROUTINE| LR
+  E -.->|Контекстное разрешение: INVOKES| R
+  E -.->|Локальное затенение: INVOKES_LOCAL_ROUTINE| LR
 ```
 
-The dashed arrows are result segments only. `INVOKES` means a request-time intent-to-routine binding in the database graph; `INVOKES_LOCAL_ROUTINE` means the same kind of binding to an application-local routine. Neither is a Neo4j relationship. Stored `INVOKES_ROUTINE` edges are different: they originate from `SourceEvidence` within their owning corpus/graph (including application-local SQL), not across graph databases, and represent extracted invocation evidence/resolution.
+Пунктирные стрелки существуют только как сегменты результата. `INVOKES` обозначает вычисленную во время запроса привязку свидетельства SQL-вызова к подпрограмме в графе базы данных. `INVOKES_LOCAL_ROUTINE` обозначает аналогичную привязку к локальной подпрограмме приложения. Ни то ни другое не является связью Neo4j. Сохранённые рёбра `INVOKES_ROUTINE` устроены иначе: они исходят из `SourceEvidence` внутри своего корпуса/графа, включая локальный SQL приложения, а не пересекают границы баз графов; они представляют извлечённые свидетельства вызова и результат разрешения его цели.
 
-## What this model promises
+## Что предоставляет модель
 
-- Source-oriented facts, locations, signatures/arity where available, provenance, generation IDs, and explicit resolution status.
-- Context-aware selection of the database version, visible extensions, application-local shadowing, and schema search path.
-- Bounded, read-only forward and reverse investigations that return exact paths separately from ambiguous, conditional, dynamic, or otherwise unresolved evidence.
-- Independent application and database refreshes. Changing only a bridge context does not combine, rewrite, or re-import the graph generations.
+- Факты об исходном коде, расположение в файлах, сигнатуры и число аргументов, если они известны, происхождение данных, идентификаторы поколений и явный статус разрешения.
+- Выбор версии базы данных, видимых расширений, локального затенения подпрограмм и порядка поиска по схемам с учётом контекста.
+- Ограниченный прямой и обратный анализ без изменения данных: точные пути возвращаются отдельно от неоднозначных, условных, динамических и иных неразрешённых свидетельств.
+- Независимое обновление графов приложения и базы данных. Изменение только контекста соединения не объединяет, не переписывает и не импортирует заново поколения графов.
 
-## What it does not promise
+## Чего модель не гарантирует
 
-- Runtime execution, actual installed extension compatibility, PostgreSQL ABI correctness, or that a conditional branch is taken.
-- Arbitrary language-to-language call inference. The current cross-boundary evidence producers are specific extractors for Python SQL, SQL/PL bodies, selected Markdown evidence, PostgreSQL routine definitions/catalog data, and C source facts.
-- Exact overload dispatch by SQL argument types: the current Python-to-routine evidence generally has arity but no argument types. A unique, compatible-arity, unguarded candidate can be reported as `exact`; that label is not a type-resolution proof.
-- A complete execution graph across callbacks, dynamic names, repeated app/database boundary crossings, generated templates, or all preprocess/build configurations.
+- Фактического исполнения, совместимости реально установленных расширений, корректности ABI PostgreSQL или выполнения условной ветки.
+- Произвольного вывода вызовов между любыми языками. Текущие свидетельства переходов создаются конкретными экстракторами: SQL из Python, тела SQL/PL-подпрограмм, выбранные фрагменты Markdown, определения и каталог подпрограмм PostgreSQL, факты из C-кода.
+- Точного выбора SQL-перегрузки по типам аргументов: у свидетельств перехода из Python обычно известно число аргументов, но не их типы. Единственный кандидат с совместимым числом аргументов и без условия может получить статус `exact`; этот статус не доказывает корректность разрешения по типам.
+- Полного графа исполнения с обратными вызовами, динамическими именами, повторными переходами между приложением и базой данных, сгенерированными шаблонами или всеми конфигурациями препроцессора и сборки.
 
-For source-level facts and constraints see the [detailed model specification](kg-model-detailed-spec.md). The existing [legacy corpus query model](../src/codekg/queries/corpus.py) describes stored intra-corpus relationships, not the virtual federation arrows above.
+Факты исходного уровня и ограничения описаны в [подробной спецификации модели](kg-model-detailed-spec.md). Существующая [модель запросов к корпусу прежней архитектуры](../src/codekg/queries/corpus.py) описывает сохранённые связи внутри корпуса, а не виртуальные стрелки федерации выше.
