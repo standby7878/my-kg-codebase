@@ -128,6 +128,64 @@ def test_candidate_failure_cleans_its_container_and_preserves_active_registry(tm
     assert "--max-memory=2G" not in import_call
 
 
+@pytest.mark.parametrize(
+    ("http_port", "bolt_port", "expected_advertised"),
+    [
+        (17474, None, "NEO4J_server_http_advertised__address=localhost:17474"),
+        (None, 17687, "NEO4J_server_bolt_advertised__address=localhost:17687"),
+        (
+            18474,
+            18687,
+            "NEO4J_server_http_advertised__address=localhost:18474",
+        ),
+        (
+            18474,
+            18687,
+            "NEO4J_server_bolt_advertised__address=localhost:18687",
+        ),
+    ],
+)
+def test_candidate_advertises_published_host_ports(
+    tmp_path, http_port, bolt_port, expected_advertised
+):
+    registry = GraphRegistry.load(_make_registry(tmp_path))
+    env_file = tmp_path / "neo4j.env"
+    env_file.write_text("NEO4J_AUTH=none\n")
+    runner = DockerRunner()
+
+    prepare_graph_candidate(
+        registry,
+        "app",
+        env_file=env_file,
+        runner=runner,
+        candidate_token="a1b2c3d4",
+        http_port=http_port,
+        bolt_port=bolt_port,
+    )
+
+    server_call = next(call for call in runner.calls if "--detach" in call)
+    assert expected_advertised in server_call
+
+
+def test_internal_only_candidate_keeps_default_advertised_addresses(tmp_path):
+    registry = GraphRegistry.load(_make_registry(tmp_path))
+    env_file = tmp_path / "neo4j.env"
+    env_file.write_text("NEO4J_AUTH=none\n")
+    runner = DockerRunner()
+
+    candidate = prepare_graph_candidate(
+        registry,
+        "app",
+        env_file=env_file,
+        runner=runner,
+        candidate_token="a1b2c3d4",
+    )
+
+    server_call = next(call for call in runner.calls if "--detach" in call)
+    assert not any("advertised__address" in argument for argument in server_call)
+    assert candidate.bolt_uri.startswith("bolt://codekg-app-")
+
+
 def test_candidate_import_uses_exported_large_field_buffer_and_immutable_files(tmp_path):
     path = _make_registry(tmp_path, max_csv=5_300_007)
     registry = GraphRegistry.load(path)

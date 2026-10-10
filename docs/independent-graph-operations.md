@@ -88,6 +88,13 @@ view. Export each on its own cadence.
    page cache. Adjust with `--import-memory`, `--heap-max`, and `--pagecache` if
    the host budget permits. A prepared container is a candidate, not active.
 
+   When `--http-port` is published, Neo4j Browser uses the server's advertised
+   Bolt address for its database connection. `graph prepare` advertises the
+   matching localhost Bolt port when `--bolt-port` is supplied, so Browser
+   discovery does not point at the container's internal port. The Browser
+   connection form displays credential fields; when authentication is enabled,
+   enter the configured database username and password.
+
 5. Set the registry's endpoint and credential environment variables through
    the MCP deployment's secret/configuration mechanism. Bootstrap validates the
    imported per-label and per-relationship counts against the frozen manifest,

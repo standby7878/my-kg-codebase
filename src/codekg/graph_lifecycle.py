@@ -193,8 +193,14 @@ def prepare_graph_candidate(
         ]
         if http_port is not None:
             run_args.extend(["--publish", f"127.0.0.1:{http_port}:7474"])
+            run_args.extend(
+                ["--env", f"NEO4J_server_http_advertised__address=localhost:{http_port}"]
+            )
         if bolt_port is not None:
             run_args.extend(["--publish", f"127.0.0.1:{bolt_port}:7687"])
+            run_args.extend(
+                ["--env", f"NEO4J_server_bolt_advertised__address=localhost:{bolt_port}"]
+            )
         run_args.append(NEO4J_COMMUNITY_IMAGE)
         container_id = _docker_output(run_args, runner)
         if not container_id:

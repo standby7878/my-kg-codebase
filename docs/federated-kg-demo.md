@@ -89,22 +89,34 @@ separate Community instances:
 
 ### Current local authentication mode
 
-Both demo Neo4j containers now use `NEO4J_AUTH=none` and explicit
-`NEO4J_dbms_security_auth__enabled=false`. The MCP environment sets
-`CODEKG_APP_NEO4J_AUTH=none` and `CODEKG_PG18_NEO4J_AUTH=none`; all three
-containers have no password environment variables. Select **No authentication**
-when connecting in Neo4j Browser. Endpoints, volumes, generation markers, and
-node/relationship counts are unchanged; neither KG was rebuilt.
+Authentication has been re-enabled for both demo Neo4j containers with
+`NEO4J_dbms_security_auth__enabled=true`. The bundled local profile and both
+instances use the user-requested demonstration login `neo4j` / `password`.
+MCP uses authenticated graph-specific clients again. These are local demo
+credentials, not a production configuration.
 
-The switch was verified with unauthenticated Bolt clients, direct lifecycle
-clients, `cypher-shell`, HTTP transaction requests without an Authorization
+Browser discovery now advertises the actual published Bolt ports: `17687` for
+Python and `27687` for PG18, rather than the container-internal `7687` default.
+HTTP endpoints, volumes, generation markers, and node/relationship counts are
+unchanged; neither KG was rebuilt. Open `http://localhost:17474/browser/` or
+`http://localhost:27474/browser/` and enter the configured credentials.
+
+The earlier no-auth switch was verified with unauthenticated Bolt clients,
+direct lifecycle clients, `cypher-shell`, HTTP transaction requests without an Authorization
 header, and all 19 live MCP assertions. The auth change's full unit suite passed
 505 tests, and Sol approved its review. The legacy authenticated Compose path
 also remains supported. See the [no-auth operator recipe](independent-graph-operations.md#local-no-auth-demo)
 for the explicit per-graph mode and how to retain existing volumes.
 
+After re-enabling authentication, both instances accepted the requested login
+and rejected missing/incorrect credentials. Authenticated graph/lifecycle
+clients verified the original markers and counts, and all 19 live MCP checks
+passed again. The full unit suite, including advertised-port regressions,
+passed 510 tests.
+
 Runtime manifests, registries, logs, and private env files live under the
-ignored `.codekg-corpus/federated-demo/` directory. Credentials are not tracked.
+ignored `.codekg-corpus/federated-demo/` directory. Private runtime files are
+not tracked; the requested demonstration login is recorded in the local profile.
 The active registry is `config/active.toml`; manifests are frozen `serving.json`
 files inside the graph-specific generation directories. These local services
 and large generated artifacts are not distributed by a Git push.
