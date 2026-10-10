@@ -23,9 +23,12 @@ from codekg.native_evidence import (
 from codekg.native_ir import NativeFileFacts, routine_target_kinds
 from codekg.native_parser import parse_native_source
 from codekg.native_sql import parse_pg_proc_catalog, parse_routine_source
+from codekg.sqlite_cli import SqliteCsvImporter
 
 _SUFFIXES = {".py", ".sql", ".in", ".c", ".h", ".md", ".control"}
 _CHUNK = 1024 * 1024
+_MAX_NATIVE_BATCH_FILES = 128
+_MAX_NATIVE_BATCH_SOURCE_BYTES = 32 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,73 @@ class SnapshotIdentity:
     source_digest: str
     fingerprint: str
     revision: str
+
+
+class _NativeImporterBatches:
+    """Rotate CLI streams at bounded file-count/source-byte boundaries."""
+
+    def __init__(self, database: Path, tables: dict[str, tuple[str, ...]]) -> None:
+        self.database = database
+        self.tables = tables
+        self.current: SqliteCsvImporter | None = None
+        self.files = 0
+        self.source_bytes = 0
+        self.closed = False
+        self._file_estimate = 0
+
+    def start_file(self, source_bytes: int) -> None:
+        if self.closed:
+            raise ValueError("native import batches are closed")
+        if self.current is not None and (
+            self.files >= _MAX_NATIVE_BATCH_FILES
+            or self.source_bytes + source_bytes > _MAX_NATIVE_BATCH_SOURCE_BYTES
+        ):
+            self.current.finish()
+            self.current = None
+        if self.current is None:
+            self.current = SqliteCsvImporter(
+                self.database,
+                self.tables,
+                replace_tables=("files",),
+                ignore_tables=("control_modules",),
+            )
+            self.files = 0
+            self.source_bytes = 0
+        self.files += 1
+        self.source_bytes += source_bytes
+        self._file_estimate = source_bytes
+
+    def finish_file(self, accepted_bytes: int) -> None:
+        self.source_bytes += accepted_bytes - self._file_estimate
+        self._file_estimate = 0
+
+    def write(self, table: str, row) -> None:
+        if self.current is None:
+            raise RuntimeError("start_file must be called before writing native facts")
+        self.current.write(table, row)
+
+    def finish(self) -> None:
+        if self.closed:
+            return
+        if self.current is not None:
+            self.current.finish()
+            self.current = None
+        self.closed = True
+
+    def abort(self) -> None:
+        if self.current is not None:
+            self.current.abort()
+            self.current = None
+        self.closed = True
+
+    def __enter__(self) -> _NativeImporterBatches:
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if exc_type is None:
+            self.finish()
+        else:
+            self.abort()
 
 
 def git_commit(root: Path) -> str | None:
@@ -173,6 +243,7 @@ def create_native_registry(path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA journal_mode=DELETE")
     connection.execute("PRAGMA cache_size=-8192")
     connection.executescript("""
+        BEGIN IMMEDIATE;
         CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS files (
             snapshot_alias TEXT, path TEXT, language TEXT, loc INTEGER,
@@ -263,6 +334,7 @@ def create_native_registry(path: Path) -> sqlite3.Connection:
             ON symbols(snapshot_alias,json_extract(fact,'$.name'),json_extract(fact,'$.static'));
         CREATE INDEX IF NOT EXISTS idx_sqlobjects_identity
             ON sqlobjects(snapshot_alias,schema_name,object_name,kind,signature);
+        COMMIT;
     """)
     return connection
 
@@ -852,6 +924,12 @@ def extract_snapshot_facts(
     on_source=None,
 ) -> dict[str, int]:
     """Parse selected files sequentially; retain only normalized facts on disk."""
+    if connection.in_transaction:
+        raise RuntimeError("native registry connection has an uncommitted caller transaction")
+    database_row = connection.execute("PRAGMA database_list").fetchone()
+    database_path = Path(database_row[2]) if database_row and database_row[2] else None
+    if database_path is None or str(database_path) == ":memory:":
+        raise RuntimeError("native registry streaming requires a file-backed SQLite database")
     counts = {
         "files": 0,
         "symbols": 0,
@@ -861,176 +939,186 @@ def extract_snapshot_facts(
         "oversized": 0,
     }
     config = effective_sql_config(snapshot)
-    for file_path in selected_paths(snapshot, output):
-        relative = file_path.relative_to(snapshot.path).as_posix()
-        counts["files"] += 1
-        normalized_name = file_path.name.lower()
-        suffix = file_path.suffix.lower()
-        language = (
-            "sql"
-            if normalized_name.endswith(".sql.in")
-            else {
-                ".py": "python",
-                ".sql": "sql",
-                ".in": "unknown",
-                ".c": "c",
-                ".h": "c_header",
-                ".md": "markdown",
-                ".dat": "catalog",
-                ".control": "control",
-            }.get(
-                suffix,
-                "control" if normalized_name.endswith((".control", ".control.in")) else "unknown",
+    tables = {
+        "files": ("snapshot_alias", "path", "language", "loc"),
+        "symbols": ("snapshot_alias", "path", "ordinal", "fact"),
+        "routines": ("snapshot_alias", "path", "ordinal", "fact"),
+        "evidence": ("snapshot_alias", "path", "ordinal", "fact"),
+        "diagnostics": ("snapshot_alias", "path", "ordinal", "fact"),
+        "calls": ("snapshot_alias", "path", "ordinal", "fact"),
+        "control_modules": ("snapshot_alias", "path", "control_name", "module_path"),
+    }
+    with _NativeImporterBatches(database_path, tables) as importer:
+        for file_path in selected_paths(snapshot, output):
+            try:
+                estimated_size = file_path.stat().st_size
+            except OSError:
+                estimated_size = 0
+            if estimated_size > snapshot.max_file_bytes:
+                estimated_size = 0
+            importer.start_file(max(0, estimated_size))
+            relative = file_path.relative_to(snapshot.path).as_posix()
+            counts["files"] += 1
+            normalized_name = file_path.name.lower()
+            suffix = file_path.suffix.lower()
+            language = (
+                "sql"
+                if normalized_name.endswith(".sql.in")
+                else {
+                    ".py": "python",
+                    ".sql": "sql",
+                    ".in": "unknown",
+                    ".c": "c",
+                    ".h": "c_header",
+                    ".md": "markdown",
+                    ".dat": "catalog",
+                    ".control": "control",
+                }.get(
+                    suffix,
+                    "control"
+                    if normalized_name.endswith((".control", ".control.in"))
+                    else "unknown",
+                )
             )
-        )
-        if normalized_name.endswith((".control", ".control.in")):
-            language = "control"
-        raw = None
-        connection.execute(
-            "INSERT OR REPLACE INTO files VALUES (?,?,?,?)",
-            (snapshot.alias, relative, language, 0),
-        )
-        try:
-            if file_path.stat().st_size > snapshot.max_file_bytes:
-                counts["oversized"] += 1
-                if on_source is not None:
-                    on_source(file_path, None, language, "file_too_large")
-                _insert_facts(connection, snapshot.alias, relative, NativeFileFacts(diagnostics=()))
-                connection.execute(
-                    "INSERT INTO diagnostics VALUES (?,?,?,?)",
+            if normalized_name.endswith((".control", ".control.in")):
+                language = "control"
+            raw = None
+            importer.write("files", (snapshot.alias, relative, language, 0))
+            try:
+                if file_path.stat().st_size > snapshot.max_file_bytes:
+                    counts["oversized"] += 1
+                    if on_source is not None:
+                        on_source(file_path, None, language, "file_too_large")
+                    importer.write(
+                        "diagnostics",
+                        (
+                            snapshot.alias,
+                            relative,
+                            0,
+                            json.dumps(
+                                {
+                                    "category": "file_too_large",
+                                    "severity": "warning",
+                                    "line": None,
+                                    "column": None,
+                                    "message": (
+                                        f"source exceeds {snapshot.max_file_bytes} byte "
+                                        "corpus limit"
+                                    ),
+                                },
+                                sort_keys=True,
+                            ),
+                        ),
+                    )
+                    counts["diagnostics"] += 1
+                    importer.finish_file(0)
+                    continue
+                with file_path.open("rb") as source:
+                    raw = source.read(snapshot.max_file_bytes + 1)
+                if len(raw) > snapshot.max_file_bytes:
+                    counts["oversized"] += 1
+                    if on_source is not None:
+                        on_source(file_path, None, language, "file_too_large")
+                    importer.write(
+                        "diagnostics",
+                        (
+                            snapshot.alias,
+                            relative,
+                            0,
+                            json.dumps(
+                                {
+                                    "category": "file_too_large",
+                                    "severity": "warning",
+                                    "line": None,
+                                    "column": None,
+                                    "message": (
+                                        f"source exceeds {snapshot.max_file_bytes} byte "
+                                        "corpus limit"
+                                    ),
+                                },
+                                sort_keys=True,
+                            ),
+                        ),
+                    )
+                    counts["diagnostics"] += 1
+                    importer.finish_file(0)
+                    continue
+            except OSError as error:
+                importer.write(
+                    "diagnostics",
                     (
                         snapshot.alias,
                         relative,
                         0,
                         json.dumps(
                             {
-                                "category": "file_too_large",
+                                "category": "unreadable_file",
                                 "severity": "warning",
                                 "line": None,
                                 "column": None,
-                                "message": (
-                                    f"source exceeds {snapshot.max_file_bytes} byte corpus limit"
-                                ),
+                                "message": str(error),
                             },
                             sort_keys=True,
                         ),
                     ),
                 )
                 counts["diagnostics"] += 1
-                continue
-            with file_path.open("rb") as source:
-                raw = source.read(snapshot.max_file_bytes + 1)
-            if len(raw) > snapshot.max_file_bytes:
-                counts["oversized"] += 1
                 if on_source is not None:
-                    on_source(file_path, None, language, "file_too_large")
-                _insert_facts(connection, snapshot.alias, relative, NativeFileFacts(diagnostics=()))
-                connection.execute(
-                    "INSERT INTO diagnostics VALUES (?,?,?,?)",
-                    (
-                        snapshot.alias,
-                        relative,
-                        0,
-                        json.dumps(
-                            {
-                                "category": "file_too_large",
-                                "severity": "warning",
-                                "line": None,
-                                "column": None,
-                                "message": (
-                                    f"source exceeds {snapshot.max_file_bytes} byte corpus limit"
-                                ),
-                            },
-                            sort_keys=True,
-                        ),
-                    ),
-                )
-                counts["diagnostics"] += 1
+                    on_source(file_path, None, language, "unreadable_file")
+                importer.finish_file(0)
                 continue
-        except OSError as error:
-            connection.execute(
-                "INSERT INTO diagnostics VALUES (?,?,?,?)",
-                (
-                    snapshot.alias,
-                    relative,
-                    0,
-                    json.dumps(
-                        {
-                            "category": "unreadable_file",
-                            "severity": "warning",
-                            "line": None,
-                            "column": None,
-                            "message": str(error),
-                        },
-                        sort_keys=True,
-                    ),
-                ),
-            )
-            counts["diagnostics"] += 1
             if on_source is not None:
-                on_source(file_path, None, language, "unreadable_file")
-            continue
-        if on_source is not None:
-            on_source(file_path, raw, language, None)
-        connection.execute(
-            "UPDATE files SET loc=? WHERE snapshot_alias=? AND path=?",
-            (raw.count(b"\n"), snapshot.alias, relative),
-        )
-        facts = NativeFileFacts()
-        suffix = file_path.suffix.lower()
-        if suffix in {".c", ".h"}:
-            facts = parse_native_source(raw, relative)
-        elif file_path.name == "pg_proc.dat":
-            facts = parse_pg_proc_catalog(raw, relative)
-        elif normalized_name.endswith((".control", ".control.in")):
-            module_path = _control_module_path(raw)
-            if module_path:
-                control_name = _control_name(relative)
-                connection.execute(
-                    "INSERT OR IGNORE INTO control_modules VALUES (?,?,?,?)",
-                    (snapshot.alias, relative, control_name, module_path),
+                on_source(file_path, raw, language, None)
+            importer.write("files", (snapshot.alias, relative, language, raw.count(b"\n")))
+            facts = NativeFileFacts()
+            suffix = file_path.suffix.lower()
+            if suffix in {".c", ".h"}:
+                facts = parse_native_source(raw, relative)
+            elif file_path.name == "pg_proc.dat":
+                facts = parse_pg_proc_catalog(raw, relative)
+            elif normalized_name.endswith((".control", ".control.in")):
+                module_path = _control_module_path(raw)
+                if module_path:
+                    control_name = _control_name(relative)
+                    importer.write(
+                        "control_modules", (snapshot.alias, relative, control_name, module_path)
+                    )
+            elif suffix == ".py":
+                facts = parse_python_sql(raw, relative)
+            elif suffix == ".md":
+                facts = parse_markdown_evidence(raw, relative)
+            elif suffix == ".sql" or normalized_name.endswith(".sql.in"):
+                routines = parse_routine_source(raw, relative, config)
+                sql_evidence = parse_sql_source_evidence(raw, relative)
+                facts = NativeFileFacts(
+                    routines=routines.routines,
+                    evidence=(*routines.evidence, *sql_evidence.evidence),
+                    diagnostics=(*routines.diagnostics, *sql_evidence.diagnostics),
                 )
-        elif suffix == ".py":
-            facts = parse_python_sql(raw, relative)
-        elif suffix == ".md":
-            facts = parse_markdown_evidence(raw, relative)
-        elif suffix == ".sql" or normalized_name.endswith(".sql.in"):
-            routines = parse_routine_source(raw, relative, config)
-            sql_evidence = parse_sql_source_evidence(raw, relative)
-            facts = NativeFileFacts(
-                routines=routines.routines,
-                evidence=(*routines.evidence, *sql_evidence.evidence),
-                diagnostics=(*routines.diagnostics, *sql_evidence.diagnostics),
-            )
-        _insert_facts(connection, snapshot.alias, relative, facts)
-        counts["symbols"] += len(facts.symbols)
-        counts["routines"] += len(facts.routines)
-        counts["evidence"] += len(facts.evidence)
-        counts["evidence"] += len(facts.calls)
-        counts["diagnostics"] += len(facts.diagnostics)
-        if counts["files"] % 64 == 0:
-            connection.commit()
-    connection.commit()
+            _write_fact_rows(importer, snapshot.alias, relative, facts)
+            counts["symbols"] += len(facts.symbols)
+            counts["routines"] += len(facts.routines)
+            counts["evidence"] += len(facts.evidence)
+            counts["evidence"] += len(facts.calls)
+            counts["diagnostics"] += len(facts.diagnostics)
+            importer.finish_file(len(raw))
     return counts
 
 
-def _insert_facts(db: sqlite3.Connection, alias: str, path: str, facts: NativeFileFacts) -> None:
+def _write_fact_rows(
+    importer: SqliteCsvImporter, alias: str, path: str, facts: NativeFileFacts
+) -> None:
     for table, values in (
         ("symbols", facts.symbols),
         ("routines", facts.routines),
         ("evidence", facts.evidence),
         ("diagnostics", facts.diagnostics),
     ):
-        db.executemany(
-            f"INSERT INTO {table} VALUES (?,?,?,?)",
-            (
-                (alias, path, index, json.dumps(value.__dict__, sort_keys=True))
-                for index, value in enumerate(values)
-            ),
-        )
-    db.executemany(
-        "INSERT INTO calls VALUES (?,?,?,?)",
-        (
+        for index, value in enumerate(values):
+            importer.write(table, (alias, path, index, json.dumps(value.__dict__, sort_keys=True)))
+    for index, call in enumerate(facts.calls):
+        importer.write(
+            "calls",
             (
                 alias,
                 path,
@@ -1039,13 +1127,10 @@ def _insert_facts(db: sqlite3.Connection, alias: str, path: str, facts: NativeFi
                     {**call.__dict__, "evidence_ordinal": len(facts.evidence) + index},
                     sort_keys=True,
                 ),
-            )
-            for index, call in enumerate(facts.calls)
-        ),
-    )
-    db.executemany(
-        "INSERT INTO evidence VALUES (?,?,?,?)",
-        (
+            ),
+        )
+        importer.write(
+            "evidence",
             (
                 alias,
                 path,
@@ -1067,10 +1152,8 @@ def _insert_facts(db: sqlite3.Connection, alias: str, path: str, facts: NativeFi
                     },
                     sort_keys=True,
                 ),
-            )
-            for index, call in enumerate(facts.calls)
-        ),
-    )
+            ),
+        )
 
 
 def _control_module_path(raw: bytes) -> str | None:

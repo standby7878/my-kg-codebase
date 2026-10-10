@@ -18,10 +18,10 @@ from codekg.ir import (
     SymbolIR,
 )
 from codekg.sql_ir import SqlArtifactIR, SqlObjectRefIR, SqlStatementIR
+from codekg.sqlite_cli import SqliteCsvImporter
 
 SPOOL_SCHEMA_VERSION = 3
 _LEGACY_SPOOL_SCHEMA_VERSION = 1
-_WRITE_BATCH_SIZE = 64
 _SQLITE_CACHE_KIB = -8192
 
 
@@ -42,42 +42,53 @@ class SpoolWriter:
         self.connection = sqlite3.connect(self.partial)
         self.count = 0
         self.closed = False
+        self.importer: SqliteCsvImporter | None = None
         try:
             _configure(self.connection)
             _create_normalized_schema(self.connection, include_symbol_keys=False)
-            self.connection.execute(
-                "INSERT INTO metadata VALUES ('schema_version', ?)",
-                (str(SPOOL_SCHEMA_VERSION),),
-            )
-        except BaseException:
             self.connection.close()
-            self.partial.unlink(missing_ok=True)
+            self.connection = None
+            self.importer = SqliteCsvImporter(self.partial, _SPOOL_TARGETS)
+        except BaseException:
+            if self.connection is not None:
+                self.connection.close()
+            if self.importer is not None:
+                self.importer.abort()
+            _remove_spool_partial(self.partial)
             self.closed = True
             raise
 
     def write(self, file: FileIR) -> None:
         if self.closed:
             raise ValueError("cannot write to a closed spool")
-        _insert_file(self.connection, file, self.count)
-        self.count += 1
-        if self.count % _WRITE_BATCH_SIZE == 0:
-            self.connection.commit()
+        try:
+            _write_file(self.importer, file, self.count)
+            self.count += 1
+        except BaseException:
+            self.close(publish=False)
+            raise
 
     def close(self, *, publish: bool = True) -> None:
         if self.closed:
             return
         try:
             if publish:
-                self.connection.commit()
+                self.importer.finish()
             else:
-                self.connection.rollback()
+                self.importer.abort()
+        except BaseException:
+            if self.importer is not None:
+                self.importer.abort()
+            _remove_spool_partial(self.partial)
+            raise
         finally:
-            self.connection.close()
+            if self.connection is not None:
+                self.connection.close()
             self.closed = True
         if publish:
             self.partial.replace(self.path)
         else:
-            self.partial.unlink(missing_ok=True)
+            _remove_spool_partial(self.partial)
 
     def __enter__(self) -> SpoolWriter:
         return self
@@ -123,10 +134,6 @@ def build_registry(path: Path, spool_paths: Iterable[Path], *, repo_prefix: str)
     try:
         _configure(connection)
         _create_normalized_schema(connection, include_symbol_keys=True)
-        connection.execute(
-            "INSERT INTO metadata VALUES ('schema_version', ?)",
-            (str(SPOOL_SCHEMA_VERSION),),
-        )
         file_ordinal = 0
         for spool_path in spool_paths:
             source_path = Path(spool_path).resolve()
@@ -177,6 +184,7 @@ def _create_normalized_schema(connection: sqlite3.Connection, *, include_symbol_
     symbol_key = ", key TEXT PRIMARY KEY" if include_symbol_keys else ""
     connection.executescript(
         f"""
+        BEGIN IMMEDIATE;
         CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE files (
             ordinal INTEGER PRIMARY KEY,
@@ -308,18 +316,123 @@ def _create_normalized_schema(connection: sqlite3.Connection, *, include_symbol_
             value TEXT NOT NULL,
             PRIMARY KEY (path, ref_ordinal, ordinal)
         );
+        INSERT INTO metadata VALUES ('schema_version', '{SPOOL_SCHEMA_VERSION}');
+        COMMIT;
         """
     )
 
 
-def _insert_file(connection: sqlite3.Connection, file: FileIR, ordinal: int) -> None:
-    connection.execute(
-        "INSERT INTO files VALUES (?, ?, ?, ?, ?, ?)",
+def _remove_spool_partial(path: Path) -> None:
+    for candidate in (
+        path,
+        Path(f"{path}-journal"),
+        Path(f"{path}-wal"),
+        Path(f"{path}-shm"),
+    ):
+        candidate.unlink(missing_ok=True)
+
+
+_SPOOL_TARGETS = {
+    "files": ("ordinal", "path", "language", "loc", "module_qname", "parse_status"),
+    "moduleinit": ("path", "qname", "start_line", "end_line"),
+    "symbols": (
+        "path",
+        "ordinal",
+        "kind",
+        "name",
+        "qname",
+        "signature",
+        "start_line",
+        "end_line",
+        "cyclomatic",
+        "parent_qname",
+        "docstring",
+        "return_annotation",
+    ),
+    "imports": ("path", "ordinal", "module", "name", "alias"),
+    "inheritance": ("path", "ordinal", "type_qname", "base_name", "base_qname"),
+    "calls": (
+        "path",
+        "row_ordinal",
+        "owner_qname",
+        "raw_callee",
+        "callee_name",
+        "callee_qname_hint",
+        "receiver_kind",
+        "start_line",
+        "start_column",
+        "end_line",
+        "end_column",
+        "ordinal",
+    ),
+    "localbindings": (
+        "path",
+        "ordinal",
+        "owner_qname",
+        "target_name",
+        "value_kind",
+        "value_name",
+        "value_qname_hint",
+        "annotation",
+        "start_line",
+        "start_column",
+        "guarded",
+    ),
+    "diagnostics": ("path", "ordinal", "category", "severity", "line", "column", "message"),
+    "sqlartifacts": (
+        "path",
+        "ordinal",
+        "origin",
+        "dialect",
+        "text",
+        "text_hash",
+        "start_line",
+        "start_column",
+        "end_line",
+        "end_column",
+    ),
+    "sqlstatements": (
+        "path",
+        "ordinal",
+        "artifact_ordinal",
+        "kind",
+        "parent_ordinal",
+        "control_context",
+        "start_line",
+        "start_column",
+        "end_line",
+        "end_column",
+    ),
+    "sqlrefs": (
+        "path",
+        "ordinal",
+        "artifact_ordinal",
+        "statement_ordinal",
+        "role",
+        "raw_name",
+        "database_name",
+        "schema_name",
+        "object_name",
+        "object_kind_hint",
+        "signature_hint",
+        "start_line",
+        "start_column",
+        "end_line",
+        "end_column",
+        "dynamic",
+    ),
+    "sqlref_search_path": ("path", "ref_ordinal", "ordinal", "value"),
+}
+
+
+def _write_file(importer: SqliteCsvImporter, file: FileIR, ordinal: int) -> None:
+    importer.write(
+        "files",
         (ordinal, file.path, file.language, file.loc, file.module_qname, file.parse_status),
     )
     if file.module_init is not None:
-        connection.execute(
-            "INSERT INTO moduleinit VALUES (?, ?, ?, ?)",
+        importer.write(
+            "moduleinit",
             (
                 file.path,
                 file.module_init.qname,
@@ -327,9 +440,9 @@ def _insert_file(connection: sqlite3.Connection, file: FileIR, ordinal: int) -> 
                 file.module_init.end_line,
             ),
         )
-    connection.executemany(
-        "INSERT INTO symbols VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
+    for index, value in enumerate(file.symbols):
+        importer.write(
+            "symbols",
             (
                 file.path,
                 index,
@@ -343,27 +456,17 @@ def _insert_file(connection: sqlite3.Connection, file: FileIR, ordinal: int) -> 
                 value.parent_qname,
                 value.docstring,
                 value.return_annotation,
-            )
-            for index, value in enumerate(file.symbols)
-        ),
-    )
-    connection.executemany(
-        "INSERT INTO imports VALUES (?, ?, ?, ?, ?)",
-        (
-            (file.path, index, value.module, value.name, value.alias)
-            for index, value in enumerate(file.imports)
-        ),
-    )
-    connection.executemany(
-        "INSERT INTO inheritance VALUES (?, ?, ?, ?, ?)",
-        (
-            (file.path, index, value.type_qname, value.base_name, value.base_qname)
-            for index, value in enumerate(file.inheritance)
-        ),
-    )
-    connection.executemany(
-        "INSERT INTO calls VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
+            ),
+        )
+    for index, value in enumerate(file.imports):
+        importer.write("imports", (file.path, index, value.module, value.name, value.alias))
+    for index, value in enumerate(file.inheritance):
+        importer.write(
+            "inheritance", (file.path, index, value.type_qname, value.base_name, value.base_qname)
+        )
+    for index, value in enumerate(file.calls):
+        importer.write(
+            "calls",
             (
                 file.path,
                 index,
@@ -377,13 +480,11 @@ def _insert_file(connection: sqlite3.Connection, file: FileIR, ordinal: int) -> 
                 value.end_line,
                 value.end_column,
                 value.ordinal,
-            )
-            for index, value in enumerate(file.calls)
-        ),
-    )
-    connection.executemany(
-        "INSERT INTO localbindings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
+            ),
+        )
+    for index, value in enumerate(file.local_bindings):
+        importer.write(
+            "localbindings",
             (
                 file.path,
                 index,
@@ -396,13 +497,11 @@ def _insert_file(connection: sqlite3.Connection, file: FileIR, ordinal: int) -> 
                 value.start_line,
                 value.start_column,
                 int(value.guarded),
-            )
-            for index, value in enumerate(file.local_bindings)
-        ),
-    )
-    connection.executemany(
-        "INSERT INTO diagnostics VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (
+            ),
+        )
+    for index, value in enumerate(file.diagnostics):
+        importer.write(
+            "diagnostics",
             (
                 file.path,
                 index,
@@ -411,13 +510,11 @@ def _insert_file(connection: sqlite3.Connection, file: FileIR, ordinal: int) -> 
                 value.line,
                 value.column,
                 value.message,
-            )
-            for index, value in enumerate(file.diagnostics)
-        ),
-    )
-    connection.executemany(
-        "INSERT INTO sqlartifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
+            ),
+        )
+    for value in file.sql_artifacts:
+        importer.write(
+            "sqlartifacts",
             (
                 file.path,
                 value.ordinal,
@@ -429,13 +526,11 @@ def _insert_file(connection: sqlite3.Connection, file: FileIR, ordinal: int) -> 
                 value.start_column,
                 value.end_line,
                 value.end_column,
-            )
-            for value in file.sql_artifacts
-        ),
-    )
-    connection.executemany(
-        "INSERT INTO sqlstatements VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
+            ),
+        )
+    for value in file.sql_statements:
+        importer.write(
+            "sqlstatements",
             (
                 file.path,
                 value.ordinal,
@@ -447,13 +542,11 @@ def _insert_file(connection: sqlite3.Connection, file: FileIR, ordinal: int) -> 
                 value.start_column,
                 value.end_line,
                 value.end_column,
-            )
-            for value in file.sql_statements
-        ),
-    )
-    connection.executemany(
-        "INSERT INTO sqlrefs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
+            ),
+        )
+    for value in file.sql_object_refs:
+        importer.write(
+            "sqlrefs",
             (
                 file.path,
                 value.ordinal,
@@ -471,18 +564,10 @@ def _insert_file(connection: sqlite3.Connection, file: FileIR, ordinal: int) -> 
                 value.end_line,
                 value.end_column,
                 int(value.dynamic),
-            )
-            for value in file.sql_object_refs
-        ),
-    )
-    connection.executemany(
-        "INSERT INTO sqlref_search_path VALUES (?, ?, ?, ?)",
-        (
-            (file.path, value.ordinal, index, search_path)
-            for value in file.sql_object_refs
-            for index, search_path in enumerate(value.search_path)
-        ),
-    )
+            ),
+        )
+        for index, search_path in enumerate(value.search_path):
+            importer.write("sqlref_search_path", (file.path, value.ordinal, index, search_path))
 
 
 def _copy_attached_spool(connection: sqlite3.Connection, repo_prefix: str, file_offset: int) -> int:

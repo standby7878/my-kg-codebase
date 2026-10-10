@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import codekg.sqlite_cli as sqlite_cli_module
 from codekg.bulk_projection import project_repository
 from codekg.bulk_spool import build_registry, create_spool, iter_spool_files
 from codekg.ir import (
@@ -248,3 +249,40 @@ def test_v3_spool_is_normalized_and_has_no_file_payload(tmp_path: Path) -> None:
         ).fetchone() == ("3",)
     finally:
         connection.close()
+
+
+def test_spool_writer_abort_discards_partial_database(tmp_path: Path) -> None:
+    from codekg.bulk_spool import SpoolWriter
+
+    spool = tmp_path / "aborted.sqlite"
+    writer = SpoolWriter(spool)
+    writer.write(FileIR(path="partial.py", language="python", loc=1, module_qname="partial"))
+
+    writer.close(publish=False)
+
+    assert not spool.exists()
+    assert not spool.with_suffix(".sqlite.partial").exists()
+
+
+def test_large_single_spool_uses_one_sqlite_child(tmp_path: Path, monkeypatch) -> None:
+    original_popen = sqlite_cli_module.subprocess.Popen
+    sqlite_children = []
+
+    def counted_popen(command, *args, **kwargs):
+        if Path(command[0]).name == "sqlite3":
+            sqlite_children.append(command)
+        return original_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite_cli_module.subprocess, "Popen", counted_popen)
+    spool = tmp_path / "many.sqlite"
+    create_spool(
+        spool,
+        (
+            FileIR(path=f"file-{index}.py", language="python", loc=1, module_qname="m")
+            for index in range(130)
+        ),
+    )
+
+    assert len(sqlite_children) == 1
+    with sqlite3.connect(spool) as connection:
+        assert connection.execute("SELECT count(*) FROM files").fetchone() == (130,)

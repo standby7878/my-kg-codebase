@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
+import pytest
+
+import codekg.sqlite_cli as sqlite_cli_module
 from codekg.corpus_config import CorpusSnapshotConfig
 from codekg.corpus_registry import create_native_registry, extract_snapshot_facts, snapshot_identity
 from codekg.sql_config import SqlConfig
@@ -81,6 +85,50 @@ def test_identity_changes_when_selected_source_changes(tmp_path):
     second = snapshot_identity(snapshot, tmp_path / "out")
     assert first.source_digest != second.source_digest
     assert first.revision != second.revision
+
+
+def test_extract_rejects_caller_owned_pending_transaction(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    snapshot = CorpusSnapshotConfig("pg", "postgres", "18", "postgres", root)
+    db = create_native_registry(tmp_path / "pending.sqlite")
+    db.execute("INSERT INTO metadata VALUES ('caller_work', 'uncommitted')")
+
+    try:
+        with pytest.raises(RuntimeError, match="uncommitted caller transaction"):
+            extract_snapshot_facts(db, snapshot, tmp_path / "out")
+        assert db.execute("SELECT value FROM metadata WHERE key='caller_work'").fetchone() == (
+            "uncommitted",
+        )
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_native_import_rotates_sqlite_children_at_file_bound(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    for index in range(256):
+        (root / f"source_{index}.c").write_text(f"int api_{index}(void) {{ return 0; }}\n")
+    original_popen = sqlite_cli_module.subprocess.Popen
+    sqlite_children = []
+
+    def counted_popen(command, *args, **kwargs):
+        if Path(command[0]).name == "sqlite3":
+            sqlite_children.append(command)
+        return original_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite_cli_module.subprocess, "Popen", counted_popen)
+    snapshot = CorpusSnapshotConfig("pg", "postgres", "18", "postgres", root)
+    db = create_native_registry(tmp_path / "registry.sqlite")
+    try:
+        counts = extract_snapshot_facts(db, snapshot, tmp_path / "output")
+        assert counts["files"] == 256
+        assert db.execute("SELECT count(*) FROM files").fetchone() == (256,)
+    finally:
+        db.close()
+
+    assert len(sqlite_children) == 2
 
 
 def test_identity_tracks_unreadable_sources_and_readability_transitions(tmp_path, monkeypatch):

@@ -7,6 +7,30 @@ generation marker. Never point two graph IDs at the same Neo4j data volume.
 
 ## Prepare and activate a candidate
 
+Bulk ingestion requires the `sqlite3` command-line executable on `PATH`
+(SQLite 3.38 or newer), GNU `sort`, and a POSIX environment with `/dev/fd`.
+The application Docker image includes these tools; for a host installation,
+install your operating system's SQLite CLI and GNU coreutils packages as well
+as the Python dependencies. The exporter incrementally dumps tagged CSV to a
+private temporary directory beside the destination database, runs GNU `sort`,
+and loads the sorted file with `.import --csv`. Data is not sent through stdin.
+Sorting uses the C locale, a 32 MiB buffer, and a stable table-name key: rows
+within each table retain their arrival order, including duplicate-key updates.
+The private directory also holds external-sort scratch files; allow disk space
+for both dumps and sorting scratch space. Files are removed on success or failure.
+The CLI uses a private disk-backed SQLite staging table and set-based inserts
+to preserve SQL NULL, empty strings, Unicode, and multiline content. A validated
+completion record prevents a truncated producer dump from being published.
+An index on the staging table's tag avoids a full scan for each target table.
+After CSV ingestion, a separate anonymous control pipe supplies the final SQL
+only after the parent accepts the CLI diagnostics at a READY barrier. Thus
+CSV warnings cannot be discovered only after target rows have committed.
+Schema DDL is grouped into a transaction instead of syncing each table
+creation separately; rollback journaling remains enabled.
+Missing tools, sorting errors, or import errors fail the export; there is no
+Python row-insertion fallback. Existing Neo4j CSV artifacts remain part of the
+offline import format.
+
 The following recipe applies independently to the application and database
 corpora. The application export contains the app source; a database export
 contains exactly one PostgreSQL snapshot and its selected extension dependency

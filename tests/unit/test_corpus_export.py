@@ -3,10 +3,65 @@ from __future__ import annotations
 import csv
 import io
 import json
+import sqlite3
 
 import pytest
 
 from codekg.corpus_export import _bounded_csv_reader, export_corpus
+
+
+def test_sqlite_snapshot_copies_preserve_values_and_detach_after_failure(tmp_path):
+    from codekg.corpus_export import _import_python_owners, _import_sql_objects
+    from codekg.corpus_registry import create_native_registry
+
+    snapshot = tmp_path / "snapshot '?# Ю"
+    registry = snapshot / ".building" / "resolver.sqlite"
+    registry.parent.mkdir(parents=True)
+    with sqlite3.connect(registry) as source:
+        source.execute(
+            "CREATE TABLE sqlobjects (key,schema_name,kind,object_name,signature,owner_path)"
+        )
+        source.execute(
+            "INSERT INTO sqlobjects VALUES (?,?,?,?,?,?)",
+            ("k", "public", "function", 'f,"\nЮ', None, "odd\tpath.sql"),
+        )
+    search = snapshot / "search.sqlite"
+    with sqlite3.connect(search) as source:
+        source.execute("CREATE TABLE documents (key,path,qname,start_line)")
+        source.execute("INSERT INTO documents VALUES (?,?,?,?)", ("p", "app.py", "app.run", 7))
+    with create_native_registry(tmp_path / "corpus.sqlite") as destination:
+        destination.execute(
+            "INSERT INTO python_owners VALUES (?,?,?,?,?)", ("app", "p", "old.py", "old", 1)
+        )
+        destination.commit()
+        _import_sql_objects(destination, "pg", snapshot)
+        _import_python_owners(destination, "app", search)
+        assert destination.execute("SELECT * FROM sqlobjects").fetchall() == [
+            ("pg", "k", "public", "function", 'f,"\nЮ', None, "odd\tpath.sql")
+        ]
+        assert destination.execute("SELECT * FROM python_owners").fetchall() == [
+            ("app", "p", "app.py", "app.run", 7)
+        ]
+        assert len(destination.execute("PRAGMA database_list").fetchall()) == 1
+        with sqlite3.connect(search) as source:
+            source.execute("INSERT INTO documents VALUES (NULL,'bad.py','bad',1)")
+        with pytest.raises(sqlite3.IntegrityError):
+            _import_python_owners(destination, "app", search)
+        assert destination.execute("SELECT count(*) FROM python_owners").fetchone()[0] == 1
+        assert len(destination.execute("PRAGMA database_list").fetchall()) == 1
+
+
+def test_sqlite_snapshot_copy_does_not_commit_caller_transaction(tmp_path):
+    from codekg.corpus_export import _import_python_owners
+    from codekg.corpus_registry import create_native_registry
+
+    with create_native_registry(tmp_path / "corpus.sqlite") as destination:
+        destination.execute("INSERT INTO metadata VALUES ('uncommitted','value')")
+        with pytest.raises(ValueError, match="committed destination"):
+            _import_python_owners(destination, "app", tmp_path / "unused.sqlite")
+        assert destination.in_transaction
+        destination.rollback()
+        assert destination.execute("SELECT count(*) FROM metadata").fetchone()[0] == 0
 
 
 def _config(tmp_path):

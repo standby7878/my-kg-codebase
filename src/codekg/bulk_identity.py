@@ -16,6 +16,7 @@ from codekg.ingest import (
     iter_markdown_files,
 )
 from codekg.sql_config import SqlConfig
+from codekg.sqlite_cli import import_rows
 
 _READ_CHUNK_SIZE = 1024 * 1024
 
@@ -35,8 +36,11 @@ def content_hash(root: Path, *, sql_config: SqlConfig | None = None) -> str:
         try:
             connection.create_collation("PATH_ORDER", _compare_paths)
             connection.execute("CREATE TABLE paths (path TEXT NOT NULL)")
-            connection.executemany(
-                "INSERT INTO paths(path) VALUES (?)",
+            connection.commit()
+            import_rows(
+                database_path,
+                "paths",
+                ("path",),
                 (
                     (relative_path,)
                     for relative_path in _relative_paths(root, sql_config=sql_config)

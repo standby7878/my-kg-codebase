@@ -136,15 +136,14 @@ def export_corpus(
             identity_seconds += time.perf_counter() - identity_started
             if identity_before != identity_after:
                 raise RuntimeError(f"source identity changed during extraction: {snapshot.alias}")
-            database.executemany(
-                "INSERT OR REPLACE INTO metadata VALUES (?,?)",
-                (
-                    (f"{snapshot.alias}.git_commit", identity_after.git_commit or ""),
-                    (f"{snapshot.alias}.source_digest", identity_after.source_digest),
-                    (f"{snapshot.alias}.fingerprint", identity_after.fingerprint),
-                    (f"{snapshot.alias}.revision", identity_after.revision),
-                ),
-            )
+            for key, value in (
+                (f"{snapshot.alias}.git_commit", identity_after.git_commit or ""),
+                (f"{snapshot.alias}.source_digest", identity_after.source_digest),
+                (f"{snapshot.alias}.fingerprint", identity_after.fingerprint),
+                (f"{snapshot.alias}.revision", identity_after.revision),
+            ):
+                database.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)", (key, value))
+            database.commit()
             bulk_started = time.perf_counter()
             result, _, snapshot_projection_workers = finalize_corpus_snapshot(
                 snapshot.path,
@@ -302,39 +301,54 @@ def _corpus_identities(corpus: CorpusConfig, output: Path) -> dict:
 
 def _import_sql_objects(database: sqlite3.Connection, alias: str, snapshot_output: Path) -> None:
     """Copy normalized SQL object identities from the existing resolver stage."""
+    if database.in_transaction:
+        raise ValueError("SQL object import requires a committed destination")
     registry_path = snapshot_output / ".building" / "resolver.sqlite"
     if not registry_path.is_file():
         return
-    source = sqlite3.connect(f"file:{registry_path.resolve()}?mode=ro&immutable=1", uri=True)
+    database.execute(
+        "ATTACH DATABASE ? AS snapshot_source",
+        (registry_path.resolve().as_uri() + "?mode=ro&immutable=1",),
+    )
     try:
-        rows = source.execute(
-            "SELECT key,schema_name,kind,object_name,signature,owner_path FROM sqlobjects "
-            "ORDER BY key"
-        )
-        database.executemany(
-            "INSERT OR REPLACE INTO sqlobjects VALUES (?,?,?,?,?,?,?)",
-            ((alias, *row) for row in rows),
+        database.execute(
+            "INSERT OR REPLACE INTO main.sqlobjects "
+            "SELECT ?,key,schema_name,kind,object_name,signature,owner_path "
+            "FROM snapshot_source.sqlobjects ORDER BY key",
+            (alias,),
         )
         database.commit()
     except sqlite3.OperationalError as error:
+        database.rollback()
         # Python-only single-root exports do not create the SQL resolver schema.
-        if "no such table" not in str(error):
+        if str(error) != "no such table: snapshot_source.sqlobjects":
             raise
+    except BaseException:
+        database.rollback()
+        raise
     finally:
-        source.close()
+        database.execute("DETACH DATABASE snapshot_source")
 
 
 def _import_python_owners(database: sqlite3.Connection, alias: str, search_stage: Path) -> None:
-    source = sqlite3.connect(f"file:{search_stage.resolve()}?mode=ro&immutable=1", uri=True)
+    if database.in_transaction:
+        raise ValueError("Python owner import requires a committed destination")
+    database.execute(
+        "ATTACH DATABASE ? AS snapshot_source",
+        (search_stage.resolve().as_uri() + "?mode=ro&immutable=1",),
+    )
     try:
-        rows = source.execute("SELECT key,path,qname,start_line FROM documents ORDER BY key")
-        database.executemany(
-            "INSERT OR REPLACE INTO python_owners VALUES (?,?,?,?,?)",
-            ((alias, *row) for row in rows),
+        database.execute(
+            "INSERT OR REPLACE INTO main.python_owners "
+            "SELECT ?,key,path,qname,start_line FROM snapshot_source.documents ORDER BY key",
+            (alias,),
         )
         database.commit()
+    except BaseException:
+        database.rollback()
+        raise
     finally:
-        source.close()
+        database.execute("DETACH DATABASE snapshot_source")
 
 
 _CORPUS_NODE_COLUMNS = {
@@ -1061,32 +1075,40 @@ def _merge_search_stages(records: list[dict], generation: Path) -> int:
 
     stage_path = generation / "search.sqlite"
     partial, destination = _new_stage(stage_path)
+    destination.commit()
     count = 0
     try:
         for record in records:
             exported = load_bulk_export(generation.parent.parent / record["bulk_manifest"])
             if exported.search_stage is None:
                 raise ValueError(f"snapshot {record['alias']} has no search stage")
-            source = sqlite3.connect(
-                f"file:{exported.search_stage.resolve()}?mode=ro&immutable=1", uri=True
+            destination.execute(
+                "ATTACH DATABASE ? AS snapshot_source",
+                (exported.search_stage.resolve().as_uri() + "?mode=ro&immutable=1",),
             )
             try:
-                repositories = source.execute(
-                    "SELECT repo,commit_value FROM repositories"
+                repositories = destination.execute(
+                    "SELECT repo,commit_value FROM snapshot_source.repositories"
                 ).fetchall()
                 if repositories != [(record["alias"], record["revision"])]:
                     raise ValueError(f"search-stage identity mismatch for {record['alias']}")
-                destination.executemany("INSERT INTO repositories VALUES (?,?)", repositories)
-                rows = source.execute(
+                destination.execute(
+                    "INSERT INTO main.repositories SELECT repo,commit_value "
+                    "FROM snapshot_source.repositories"
+                )
+                cursor = destination.execute(
+                    "INSERT INTO main.documents "
                     "SELECT key,repo,commit_value,path,qname,kind,signature,start_line,end_line,"
                     "text "
-                    "FROM documents ORDER BY key"
+                    "FROM snapshot_source.documents ORDER BY key"
                 )
-                for row in rows:
-                    destination.execute("INSERT INTO documents VALUES (?,?,?,?,?,?,?,?,?,?)", row)
-                    count += 1
+                count += cursor.rowcount
+                destination.commit()
+            except BaseException:
+                destination.rollback()
+                raise
             finally:
-                source.close()
+                destination.execute("DETACH DATABASE snapshot_source")
         _publish_stage(stage_path, partial, destination, count)
     except BaseException:
         _abort_stage(destination, partial)
